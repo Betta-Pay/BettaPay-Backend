@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "zod": "^3.22.4",
-    "@bettapay/validation": "workspace:*"
+    "@bettapay/validation": "workspace:*",
+    "@fastify/rate-limit": "^10.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

@@ -11,6 +11,7 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import {
   validateEnv,
@@ -38,6 +39,18 @@ const fastify = Fastify({
 
 fastify.register(cors, { 
   origin: env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) 
+});
+
+// Global rate limit: 1000 requests per minute
+await fastify.register(rateLimit, {
+  global: true,
+  max: 1000,
+  timeWindow: '1 minute',
+  errorResponseBuilder: (_req, context) => ({
+    statusCode: 429,
+    error: 'Too Many Requests',
+    message: `Rate limit exceeded. Retry after ${context.after}.`,
+  }),
 });
 
 const redisConnection = new URL(env.REDIS_URL);
@@ -85,7 +98,17 @@ fastify.get('/api/settlements', async (request, reply) => {
   return { settlements, total: settlements.length };
 });
 
-fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', async (request, reply) => {
+fastify.post<{ Body: CreateSettlementRouteBody }>(
+  '/api/settlements',
+  {
+    config: {
+      rateLimit: {
+        max: 60,
+        timeWindow: '1 minute',
+      },
+    },
+  },
+  async (request, reply) => {
   try {
     const d = CreateSettlementBody.parse(request.body);
     const gross = parseFloat(d.amount ?? '0');
@@ -122,7 +145,8 @@ fastify.post<{ Body: CreateSettlementRouteBody }>('/api/settlements', async (req
   } catch (error) {
     return reply.code(400).send({ error: 'Invalid request payload' });
   }
-});
+  },
+);
 
 const start = async () => {
   try {
