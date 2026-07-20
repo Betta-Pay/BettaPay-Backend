@@ -42,6 +42,7 @@ import {
   buildIndexerHealthResponse,
   readServiceVersion,
   createAuditLogger,
+  registerGracefulShutdown,
 } from '@bettapay/validation';
 import type { EventType } from '@bettapay/validation';
 
@@ -106,8 +107,6 @@ const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, 
     warn: (obj, msg) => fastify.log.warn(obj, msg),
     error: (obj, msg) => fastify.log.error(obj, msg),
   },
-});
-
 });
 
 const redisHealth = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
@@ -543,12 +542,17 @@ const start = async () => {
   }
 };
 
-process.on('SIGTERM', async () => {
-  await prisma.$disconnect();
-  await webhookQueue.close();
-  await webhookWorker.close();
-  await fastify.close();
-  process.exit(0);
+// Graceful shutdown — delegated to the shared helper in @bettapay/validation.
+// It closes resources in the canonical order (server → worker → queue → prisma)
+// and now also wires up SIGINT, which the previous inline handler omitted.
+// The Redis health client is released via the server's onClose hook.
+registerGracefulShutdown({
+  fastify,
+  prisma,
+  bullmq: {
+    worker: webhookWorker,
+    queues: [webhookQueue],
+  },
 });
 
 if (process.env.NODE_ENV !== 'test') {

@@ -49,6 +49,7 @@ import {
   registerTracing,
   buildSettlementEngineHealthResponse,
   readServiceVersion,
+  registerGracefulShutdown,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
@@ -600,73 +601,19 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 // ============================================================================
 // GRACEFUL SHUTDOWN
 // ============================================================================
+//
+// Delegated to the shared helper in @bettapay/validation. It enforces the
+// canonical close order (server → workers → queues → redis → prisma) and a
+// 30s force-exit timeout, replacing the previous hand-rolled implementation.
 
-let isShuttingDown = false;
-
-async function gracefulShutdown(signal: string): Promise<void> {
-  // Prevent multiple shutdown attempts
-  if (isShuttingDown) {
-    fastify.log.warn({ signal }, 'Shutdown already in progress, ignoring duplicate signal');
-    return;
-  }
-  
-  isShuttingDown = true;
-  fastify.log.info({ signal }, 'Received shutdown signal, starting graceful shutdown');
-
-  // Set a timeout to force exit if shutdown hangs
-  const forceExitTimeout = setTimeout(() => {
-    fastify.log.error('Graceful shutdown timed out after 30 seconds, forcing exit');
-    process.exit(1);
-  }, 30000);
-
-  try {
-    // 1. Close Fastify server (stops accepting new connections)
-    fastify.log.info('Closing Fastify server...');
-    await fastify.close();
-    fastify.log.info('Fastify server closed');
-
-    // 2. Close BullMQ worker (drain and close gracefully)
-    fastify.log.info('Closing BullMQ worker...');
-    await worker.close();
-    fastify.log.info('BullMQ worker closed');
-
-    // 3. Close BullMQ queues
-    fastify.log.info('Closing BullMQ queues...');
-    await settlementQueue.close();
-    await settlementDLQ.close();
-    await webhookWorker.close();
-    await webhookQueue.close();
-    fastify.log.info('BullMQ queues closed');
-
-    // 4. Close Redis connection
-    fastify.log.info('Closing Redis connection...');
-    await redis.quit();
-    fastify.log.info('Redis connection closed');
-
-    // 5. Disconnect Prisma
-    fastify.log.info('Disconnecting Prisma...');
-    await prisma.$disconnect();
-    fastify.log.info('Prisma disconnected');
-
-    // Clear the force exit timeout
-    clearTimeout(forceExitTimeout);
-
-    fastify.log.info({ signal }, 'Graceful shutdown completed successfully');
-    process.exit(0);
-  } catch (error) {
-    fastify.log.error({ error, signal }, 'Error during graceful shutdown');
-    clearTimeout(forceExitTimeout);
-    process.exit(1);
-  }
-}
-
-// Register shutdown handlers for SIGTERM and SIGINT
-process.on('SIGTERM', () => {
-  void gracefulShutdown('SIGTERM');
-});
-
-process.on('SIGINT', () => {
-  void gracefulShutdown('SIGINT');
+registerGracefulShutdown({
+  fastify,
+  prisma,
+  redis,
+  bullmq: {
+    worker: [worker, webhookWorker],
+    queues: [settlementQueue, settlementDLQ, webhookQueue],
+  },
 });
 
 // ============================================================================

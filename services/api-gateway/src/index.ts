@@ -28,7 +28,7 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, registerGracefulShutdown } from '@bettapay/validation';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
 import {
@@ -944,27 +944,10 @@ fastify.get('/api/quote', async (request, reply) => {
   return proxyFxUpstream(request, reply, path);
 });
 
-// Graceful shutdown
-let shuttingDown = false;
-
-async function shutdown(signal: string) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-
-  try {
-    await fastify.close();
-    await prisma.$disconnect();
-    process.exit(0);
-  } catch (err) {
-    fastify.log.error(err, 'Error during shutdown');
-    process.exit(1);
-  }
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Graceful shutdown — delegated to the shared helper in @bettapay/validation.
+// It closes the HTTP server first, then disconnects Prisma, exiting 0 on
+// success or 1 on failure. A 30s force-exit timeout guards against a hang.
+registerGracefulShutdown({ fastify, prisma });
 
 const start = async () => {
   try {

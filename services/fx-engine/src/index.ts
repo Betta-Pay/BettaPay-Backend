@@ -30,6 +30,7 @@ import {
   CurrencyCode,
   buildFxEngineHealthResponse,
   readServiceVersion,
+  registerGracefulShutdown,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -167,7 +168,6 @@ const fastify = Fastify({
 registerRequestId(fastify);
 redis = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
 redis.on('error', (err) => fastify.log.warn({ err: err.message }, 'Redis error in fx-engine'));
-fastify.addHook('onClose', async () => { await redis.quit().catch(() => {}); });
 
 fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS,
@@ -472,25 +472,10 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
-let shuttingDown = false;
-
-async function shutdown(signal: string) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-
-  try {
-    await fastify.close();
-    process.exit(0);
-  } catch (err) {
-    fastify.log.error(err, 'Error during shutdown');
-    process.exit(1);
-  }
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Graceful shutdown — delegated to the shared helper in @bettapay/validation.
+// The shared helper closes the HTTP server, then quits Redis, and now enforces
+// a 30s force-exit timeout (previously the FX engine had none).
+registerGracefulShutdown({ fastify, redis });
 
 const start = async () => {
   try {
