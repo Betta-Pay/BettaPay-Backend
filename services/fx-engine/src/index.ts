@@ -28,6 +28,8 @@ import {
   createLoggerOptions,
   registerTracing,
   CurrencyCode,
+  createMetricsRegistry,
+  registerMetricsEndpoint,
 } from '@bettapay/validation';
 
 const env = validateEnv(process.env);
@@ -173,6 +175,10 @@ fastify.register(rateLimit, { max: 200, timeWindow: 60 * 1000 });
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
+
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
 
 fastify.get('/api/health', async (_request, _reply) => {
   return {

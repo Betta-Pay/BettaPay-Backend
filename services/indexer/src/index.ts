@@ -39,7 +39,10 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
+  createMetricsRegistry,
+  registerMetricsEndpoint,
 } from '@bettapay/validation';
+import { Counter, Gauge, Histogram } from 'prom-client';
 import type { EventType } from '@bettapay/validation';
 
 export const env = validateEnv(process.env);
@@ -67,6 +70,32 @@ registerErrorHandler(fastify);
 registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+const eventsIndexedTotal = new Counter({
+  name: 'bettapay_events_indexed_total',
+  help: 'Total number of events indexed by type',
+  registers: [metricsRegistry],
+  labelNames: ['type', 'contractName'],
+});
+
+const bullmqQueueDepth = new Gauge({
+  name: 'bullmq_queue_depth',
+  help: 'Current BullMQ queue depth (waiting + active + delayed)',
+  registers: [metricsRegistry],
+  labelNames: ['queue'],
+});
+
+const bullmqJobDuration = new Histogram({
+  name: 'bullmq_job_duration_seconds',
+  help: 'Duration of BullMQ jobs in seconds',
+  registers: [metricsRegistry],
+  labelNames: ['queue', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60],
+});
+
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
 
 fastify.register(rateLimit, {
   max: 500,
@@ -100,9 +129,21 @@ const webhookQueue = new Queue('indexer-webhooks', {
   },
 });
 
+// Periodically update BullMQ queue depth metrics every 15 seconds
+setInterval(async () => {
+  try {
+    const counts = await webhookQueue.getJobCounts();
+    const depth = (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0);
+    bullmqQueueDepth.set({ queue: 'indexer-webhooks' }, depth);
+  } catch {
+    // Queue not ready yet — skip this interval
+  }
+}, 15_000).unref();
+
 const webhookWorker = new Worker<{ url: string; event: Record<string, unknown> }>(
   'indexer-webhooks',
   async (job) => {
+    const endTimer = bullmqJobDuration.startTimer({ queue: 'indexer-webhooks' });
     const { url, event } = job.data;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -116,8 +157,10 @@ const webhookWorker = new Worker<{ url: string; event: Record<string, unknown> }
       clearTimeout(timeoutId);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       fastify.log.info({ url, jobId: job.id }, '[Indexer] Webhook delivered');
+      endTimer({ status: 'success' });
     } catch (err) {
       clearTimeout(timeoutId);
+      endTimer({ status: 'error' });
       throw err;
     }
   },
@@ -211,6 +254,7 @@ async function persistEvent(
     },
   });
 
+  eventsIndexedTotal.inc({ type, contractName });
   fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
   const subs = await prisma.webhookSubscription.findMany();

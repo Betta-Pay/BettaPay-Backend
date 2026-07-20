@@ -14,6 +14,7 @@ export * from './fastify-plugins.js';
 export * from './logger.js';
 export * from './envAwareSchema.js';
 export * from './webhookSchema.js';
+export * from './metrics.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {

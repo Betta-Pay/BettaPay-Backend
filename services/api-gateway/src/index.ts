@@ -27,7 +27,8 @@ import fastifyJwt from '@fastify/jwt';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'crypto';
 import { z } from 'zod';
-import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing } from '@bettapay/validation';
+import { validateEnv, getPrismaLogLevels, setupPrismaQueryLogging, buildPrismaConnectionUrl, connectWithRetry, registerRequestId, createLoggerOptions, registerTracing, createMetricsRegistry, registerMetricsEndpoint } from '@bettapay/validation';
+import { Counter } from 'prom-client';
 import { createFxClient } from './clients/fx-client.js';
 import { createIndexerClient } from './clients/indexer-client.js';
 import {
@@ -323,6 +324,17 @@ fastify.register(fastifyJwt, {
     expiresIn: env.JWT_EXPIRES_IN
   }
 });
+
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+const paymentsTotal = new Counter({
+  name: 'bettapay_payments_total',
+  help: 'Total number of payments created',
+  registers: [metricsRegistry],
+  labelNames: ['asset', 'status'],
+});
+
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
 
 // Rate limiting: global default and route overrides
 fastify.register(rateLimit, {
@@ -668,6 +680,8 @@ fastify.post<{ Body: CreatePaymentRouteBody }>('/api/payments', {
         idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
       },
     });
+
+    paymentsTotal.inc({ asset: d.asset, status: 'initiated' });
 
     request.log.info(
       { idempotencyKey, paymentId: payment.id },

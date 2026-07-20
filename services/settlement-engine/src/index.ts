@@ -45,7 +45,10 @@ import {
   connectWithRetry,
   createLoggerOptions,
   registerTracing,
+  createMetricsRegistry,
+  registerMetricsEndpoint,
 } from "@bettapay/validation";
+import { Counter, Gauge, Histogram } from 'prom-client';
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
 interface CreateSettlementRouteBody {
@@ -110,6 +113,17 @@ fastify.register(rateLimit, {
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
+
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+const settlementsTotal = new Counter({
+  name: 'bettapay_settlements_total',
+  help: 'Total number of settlements processed',
+  registers: [metricsRegistry],
+  labelNames: ['asset', 'status'],
+});
+
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
 
 const redisConnection = new URL(env.REDIS_URL);
 const connectionParams = {
@@ -188,7 +202,34 @@ const settlementQueue = new Queue('settlements', {
 });
 const settlementDLQ = new Queue('settlements-dlq', { connection: connectionParams });
 
+// ── BullMQ queue metrics (depth + job duration) ────────────────────────────
+const settlementQueueDepth = new Gauge({
+  name: 'bullmq_queue_depth',
+  help: 'Current BullMQ queue depth (waiting + active + delayed)',
+  registers: [metricsRegistry],
+  labelNames: ['queue'],
+});
+
+const settlementJobDuration = new Histogram({
+  name: 'bullmq_job_duration_seconds',
+  help: 'Duration of BullMQ jobs in seconds',
+  registers: [metricsRegistry],
+  labelNames: ['queue', 'status'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
+});
+
+setInterval(async () => {
+  try {
+    const counts = await settlementQueue.getJobCounts();
+    const depth = (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0);
+    settlementQueueDepth.set({ queue: 'settlements' }, depth);
+  } catch {
+    // Queue not ready yet — skip this interval
+  }
+}, 15_000).unref();
+
 const worker = new Worker('settlements', async job => {
+  const endTimer = settlementJobDuration.startTimer({ queue: 'settlements' });
   const settlementId = job.data.id;
   
   if (job.attemptsMade > 0) {
@@ -213,11 +254,13 @@ const worker = new Worker('settlements', async job => {
   });
 
   if (!settlement) {
+    endTimer({ status: 'error' });
     throw new Error(`Settlement ${settlementId} not found`);
   }
 
   // If already in a terminal state, we just make sure the webhook is delivered
   if (settlement.status === 'completed' || settlement.status === 'failed') {
+    endTimer({ status: 'success' });
     fastify.log.info({ settlementId, status: settlement.status }, 'Settlement already processed, sending webhook');
     if (settlement.webhookUrl) {
       await sendWebhookWithRetries(settlement.webhookUrl, {
@@ -247,7 +290,9 @@ const worker = new Worker('settlements', async job => {
         data: updatedSettlement,
       });
     }
+    endTimer({ status: 'success' });
   } catch (error) {
+    endTimer({ status: 'error' });
     fastify.log.error({ error, settlementId }, 'Settlement processing failed');
 
     const updatedSettlement = await prisma.settlement.update({
@@ -622,6 +667,8 @@ fastify.post<{ Body: CreateSettlementRouteBody }>(
     };
 
     await settlementQueue.add('process-settlement', jobData);
+
+    settlementsTotal.inc({ asset: d.asset, status: 'pending' });
 
     if (idempotencyKey) {
       // 24-hour TTL (24 * 60 * 60 = 86400 seconds)
