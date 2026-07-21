@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@bettapay/stellar-utils": "workspace:^",
+    "prom-client": "^15.1.3",
     "zod": "^3.22.4"
   }
 }

@@ -15,15 +15,16 @@
     "@bettapay/webhook-delivery": "workspace:*",
     "@bettapay/validation": "workspace:*",
     "@fastify/cors": "*",
+    "@fastify/helmet": "*",
     "@fastify/rate-limit": "^11.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "*",
     "@stellar/stellar-sdk": "*",
     "bullmq": "*",
     "fastify": "*",
-    "@fastify/helmet": "*",
     "ioredis": "*",
     "pg": "^8.22.0",
+    "prom-client": "^15.1.3",
     "zod": "^3.22.4"
   },
   "devDependencies": {

@@ -50,6 +50,7 @@ import {
   buildSettlementEngineHealthResponse,
   readServiceVersion,
 } from "@bettapay/validation";
+import { Counter, Gauge, Histogram } from 'prom-client';
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 
 
@@ -112,6 +113,17 @@ registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
 
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+const settlementsTotal = new Counter({
+  name: 'bettapay_settlements_total',
+  help: 'Total number of settlements processed',
+  registers: [metricsRegistry],
+  labelNames: ['asset', 'status'],
+});
+
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
+
 const redisConnection = new URL(env.REDIS_URL);
 const connectionParams = {
   host: redisConnection.hostname,
@@ -162,6 +174,7 @@ const webhookWorker = createWebhookWorker('settlement-webhooks', connectionParam
 // ── Settlement processor ───────────────────────────────────────────────────────
 
 const worker = new Worker('settlements', async job => {
+  const endTimer = settlementJobDuration.startTimer({ queue: 'settlements' });
   const settlementId = job.data.id;
 
   if (job.attemptsMade > 0) {
@@ -183,6 +196,7 @@ const worker = new Worker('settlements', async job => {
 
   const settlement = await prisma.settlement.findUnique({ where: { id: settlementId } });
   if (!settlement) {
+    endTimer({ status: 'error' });
     throw new Error(`Settlement ${settlementId} not found`);
   }
 
@@ -213,7 +227,9 @@ const worker = new Worker('settlements', async job => {
         event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
+    endTimer({ status: 'success' });
   } catch (error) {
+    endTimer({ status: 'error' });
     fastify.log.error({ error, settlementId }, 'Settlement processing failed');
 
     const updatedSettlement = await prisma.settlement.update({
@@ -588,6 +604,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     };
 
     await settlementQueue.add('process-settlement', jobData);
+
+    settlementsTotal.inc({ asset: d.asset, status: 'pending' });
 
     if (idempotencyKey) {
       // 24-hour TTL (24 * 60 * 60 = 86400 seconds)

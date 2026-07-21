@@ -43,6 +43,7 @@ import {
   readServiceVersion,
   createAuditLogger,
 } from '@bettapay/validation';
+import { Counter, Gauge, Histogram } from 'prom-client';
 import type { EventType } from '@bettapay/validation';
 
 export const env = validateEnv(process.env);
@@ -73,6 +74,32 @@ registerErrorHandler(fastify);
 registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+
+// ── Prometheus metrics (Issue #255) ────────────────────────────────────────
+const metricsRegistry = createMetricsRegistry();
+const eventsIndexedTotal = new Counter({
+  name: 'bettapay_events_indexed_total',
+  help: 'Total number of events indexed by type',
+  registers: [metricsRegistry],
+  labelNames: ['type', 'contractName'],
+});
+
+const bullmqQueueDepth = new Gauge({
+  name: 'bullmq_queue_depth',
+  help: 'Current BullMQ queue depth (waiting + active + delayed)',
+  registers: [metricsRegistry],
+  labelNames: ['queue'],
+});
+
+const bullmqJobDuration = new Histogram({
+  name: 'bullmq_job_duration_seconds',
+  help: 'Duration of BullMQ jobs in seconds',
+  registers: [metricsRegistry],
+  labelNames: ['queue', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60],
+});
+
+registerMetricsEndpoint(fastify, metricsRegistry, env.INTER_SERVICE_SECRET);
 
 fastify.register(rateLimit, {
   max: 500,
@@ -206,6 +233,7 @@ async function persistEvent(
     },
   });
 
+  eventsIndexedTotal.inc({ type, contractName });
   fastify.log.info({ id, type, contractName, ledger }, '[Indexer] Event indexed');
 
   const subs = await prisma.webhookSubscription.findMany();
