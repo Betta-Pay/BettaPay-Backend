@@ -21,7 +21,7 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter api-gateway test"
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

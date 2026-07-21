@@ -58,20 +58,22 @@ model Payment {
 }
 
 model Settlement {
-  id          String           @id
-  merchantId  String
-  merchant    Merchant         @relation(fields: [merchantId], references: [id])
-  totalAmount String
-  grossAmount String
-  feeAmount   String
-  netAmount   String
-  feeBps      Int
-  asset       String
-  status      SettlementStatus @default(pending)
-  webhookUrl  String?
-  batchId     String?
-  initiatedAt DateTime         @default(now())
-  completedAt DateTime?
+  id                      String           @id
+  merchantId              String
+  merchant                Merchant         @relation(fields: [merchantId], references: [id])
+  totalAmount             String
+  grossAmount             String
+  feeAmount               String
+  netAmount               String
+  feeBps                  Int
+  asset                   String
+  status                  SettlementStatus @default(pending)
+  webhookUrl              String?
+  batchId                 String?
+  initiatedAt             DateTime         @default(now())
+  completedAt             DateTime?
+  idempotencyKey          String?          @unique
+  idempotencyKeyExpiresAt DateTime?
 }
 
 model IndexedEvent {
@@ -89,10 +91,30 @@ model IndexedEvent {
   @@index([ledger])
   @@index([type])
   @@index([contractId])
+  @@index([indexedAt])
 }
 
 model WebhookSubscription {
-  id        String   @id
-  url       String
-  createdAt DateTime @default(now())
+  id            String   @id
+  url           String
+  createdAt     DateTime @default(now())
+  signingSecret String?
+  merchantId    String?
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  entityType String
+  entityId   String
+  actorId    String?
+  actorType  String?
+  changes    Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType])
+  @@index([action])
+  @@index([createdAt])
+  @@index([entityId])
 }

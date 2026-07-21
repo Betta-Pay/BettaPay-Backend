@@ -12,6 +12,7 @@
     "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts"
   },
   "dependencies": {
+    "@bettapay/webhook-delivery": "workspace:*",
     "@bettapay/validation": "workspace:*",
     "@fastify/cors": "*",
     "@fastify/helmet": "*",

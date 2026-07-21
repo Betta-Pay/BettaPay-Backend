@@ -2,6 +2,14 @@
 
 import type { ErrorResponse } from '@bettapay/validation';
 export * from '@bettapay/validation';
+export type {
+  HealthStatus,
+  DependencyConnectionStatus,
+  DependencyHealth,
+  HealthResponse,
+  ServiceHealthSnapshot,
+  AggregatedHealthResponse,
+} from '@bettapay/validation';
 
 export type Json = string | number | boolean | null | { [key: string]: Json } | Json[];
 export type ID = string;

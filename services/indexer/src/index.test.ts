@@ -68,7 +68,7 @@ test('Indexer rate limiting - requests below the limit succeed', async (t) => {
     });
     t.equal(res.statusCode, 200, 'Requests below limit should succeed (200)');
     const body = JSON.parse(res.body);
-    t.equal(body.status, 'ok', 'Should return ok status');
+    t.ok(['healthy', 'degraded', 'unhealthy'].includes(body.status), 'Should return a valid health status');
   } catch (err: any) {
     t.fail(err);
   } finally {

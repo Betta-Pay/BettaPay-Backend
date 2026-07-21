@@ -63,7 +63,8 @@ pnpm indexer:dev
 
 | Method | Path                     | Description              |
 |--------|--------------------------|--------------------------|
-| GET    | /api/health              | Liveness probe           |
+| GET    | /api/health              | Dependency and upstream health probe |
+| GET    | /api/health/all          | Aggregated health across all services |
 | POST   | /api/merchants           | Register merchant        |
 | GET    | /api/merchants/:id       | Fetch merchant           |
 | POST   | /api/payments            | Initiate payment session |

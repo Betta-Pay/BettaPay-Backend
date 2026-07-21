@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsc",
     "type-check": "tsc --noEmit",
-    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm cors.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm prisma.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm genReqId.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm plugins.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm tracing.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm logger.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm schemas.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm envAwareSchema.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm metrics.test.ts"
+    "pretest": "pnpm -F @bettapay/stellar-utils build",
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm health.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm cors.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm prisma.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm genReqId.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm plugins.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm tracing.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm logger.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm schemas.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm envAwareSchema.test.ts"
   },
   "dependencies": {
     "@bettapay/stellar-utils": "workspace:^",

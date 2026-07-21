@@ -244,11 +244,51 @@ export type WebhookUrl = z.infer<typeof WebhookUrlSchema>;
 export const HealthStatus = z.enum(['healthy', 'degraded', 'unhealthy']);
 export type HealthStatus = z.infer<typeof HealthStatus>;
 
+export const DependencyConnectionStatus = z.enum(['connected', 'disconnected']);
+export type DependencyConnectionStatus = z.infer<typeof DependencyConnectionStatus>;
+
+export const DependencyHealth = z.object({
+  name: z.string(),
+  status: DependencyConnectionStatus,
+  latencyMs: z.number().optional(),
+  details: z.record(z.unknown()).optional(),
+});
+export type DependencyHealth = z.infer<typeof DependencyHealth>;
+
 export const HealthResponse = z.object({
   status: HealthStatus,
-  uptime: z.number().optional(),
+  service: z.string(),
+  version: z.string(),
+  uptime: z.number(),
+  lastDependencyCheck: z.string(),
+  dependencies: z.array(DependencyHealth),
+  upstream: z.array(DependencyHealth).optional(),
 });
 export type HealthResponse = z.infer<typeof HealthResponse>;
+
+export const ServiceHealthSnapshot = z.object({
+  status: HealthStatus,
+  service: z.string().optional(),
+  version: z.string().optional(),
+  uptime: z.number().optional(),
+  lastDependencyCheck: z.string().optional(),
+  dependencies: z.array(DependencyHealth).optional(),
+  upstream: z.array(DependencyHealth).optional(),
+  error: z.string().optional(),
+});
+export type ServiceHealthSnapshot = z.infer<typeof ServiceHealthSnapshot>;
+
+export const AggregatedHealthResponse = z.object({
+  status: HealthStatus,
+  service: z.literal('api-gateway'),
+  version: z.string(),
+  uptime: z.number(),
+  lastDependencyCheck: z.string(),
+  dependencies: z.array(DependencyHealth),
+  upstream: z.array(DependencyHealth).optional(),
+  services: z.record(ServiceHealthSnapshot),
+});
+export type AggregatedHealthResponse = z.infer<typeof AggregatedHealthResponse>;
 
 // ─── Request Body Schemas (used by API Gateway route handlers) ────────────────
 
@@ -273,7 +313,7 @@ export type MerchantSettings = z.infer<typeof MerchantSettings>;
 export const CreateMerchantBody = z.object({
   id: z.string().min(1, 'id is required'),
   name: z.string().min(1, 'name is required'),
-  ownerId: z.string().min(1, 'ownerId is required'),
+  ownerId: StellarAddressSchema, // validated Stellar public key
   settings: MerchantSettings.optional(),
   secret: z.string().optional(),
 });
@@ -289,7 +329,7 @@ export const CreatePaymentBody = z.object({
 });
 
 export const CreateSettlementBody = z.object({
-  merchantId: StellarAddressSchema,
+  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/,"Invalid merchantId"),
   amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a numeric string').optional(),
   asset: CurrencyCode.optional(),
   items: z.array(z.object({

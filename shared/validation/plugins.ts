@@ -41,7 +41,7 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
  * early-exit timing. Returns false for length mismatches (after a same-length
  * compare to keep timing uniform).
  */
-function timingSafeStrEqual(a: string, b: string): boolean {
+export function timingSafeStrEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, 'utf8');
   const bb = Buffer.from(b, 'utf8');
   if (ab.length !== bb.length) {

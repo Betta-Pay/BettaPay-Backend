@@ -10,14 +10,14 @@
  *   POST /api/webhooks            — register a webhook URL subscription
  *   GET  /api/webhooks            — list all webhook subscriptions
  *   DELETE /api/webhooks/:id      — unsubscribe a webhook
- *   GET  /api/health              — liveness probe
+ *   GET  /api/health              — dependency and upstream health probe
  */
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import crypto from 'crypto';
 import { Redis } from 'ioredis';
-import { Queue, Worker } from 'bullmq';
+import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
 import { PrismaClient } from '@prisma/client';
 import { rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
 import pg from 'pg';
@@ -39,14 +39,17 @@ import {
   setupPrismaQueryLogging,
   registerTracing,
   genReqId,
-  createMetricsRegistry,
-  registerMetricsEndpoint,
+  buildIndexerHealthResponse,
+  readServiceVersion,
+  createAuditLogger,
 } from '@bettapay/validation';
 import { Counter, Gauge, Histogram } from 'prom-client';
 import type { EventType } from '@bettapay/validation';
 
 export const env = validateEnv(process.env);
 const PORT = Number(process.env.PORT ?? '3000');
+const startTime = Date.now();
+const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -62,6 +65,7 @@ const pool = new pg.Pool({
 const prismaAdapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter: prismaAdapter, log: getPrismaLogLevels() });
 setupPrismaQueryLogging(prisma, fastify.log);
+const logAuditEvent = createAuditLogger(prisma as unknown as Parameters<typeof createAuditLogger>[0], fastify.log);
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 fastify.register(helmet, { contentSecurityPolicy: false });
@@ -102,8 +106,6 @@ fastify.register(rateLimit, {
   timeWindow: '1 minute'
 });
 
-// In-memory event ring buffer (50 events max)
-export const events: any[] = [];
 let latestLedgerCursor: number | undefined = undefined;
 let latestLedgerSequence: number | undefined = undefined;
 const BASE_BACKOFF = 1000;
@@ -119,53 +121,27 @@ const connectionParams = {
   maxRetriesPerRequest: 3,
 };
 
-const webhookQueue = new Queue('indexer-webhooks', {
-  connection: connectionParams,
-  defaultJobOptions: {
-    attempts: 5,
-    backoff: { type: 'exponential', delay: 1000 },
-    removeOnComplete: { count: 100 },
-    removeOnFail: { count: 500 },
+// ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+//
+// Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
+// previous inline implementation are picked up without data loss (migration
+// safety — see shared/webhook-delivery/index.ts for details).
+const webhookQueue = createWebhookQueue('indexer-webhooks', connectionParams);
+const webhookWorker = createWebhookWorker('indexer-webhooks', connectionParams, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
   },
 });
 
-// Periodically update BullMQ queue depth metrics every 15 seconds
-setInterval(async () => {
-  try {
-    const counts = await webhookQueue.getJobCounts();
-    const depth = (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0);
-    bullmqQueueDepth.set({ queue: 'indexer-webhooks' }, depth);
-  } catch {
-    // Queue not ready yet — skip this interval
-  }
-}, 15_000).unref();
+});
 
-const webhookWorker = new Worker<{ url: string; event: Record<string, unknown> }>(
-  'indexer-webhooks',
-  async (job) => {
-    const endTimer = bullmqJobDuration.startTimer({ queue: 'indexer-webhooks' });
-    const { url, event } = job.data;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      fastify.log.info({ url, jobId: job.id }, '[Indexer] Webhook delivered');
-      endTimer({ status: 'success' });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      endTimer({ status: 'error' });
-      throw err;
-    }
-  },
-  { connection: connectionParams, concurrency: 10 }
-);
+const redisHealth = new Redis(env.REDIS_URL, { enableOfflineQueue: false });
+redisHealth.on('error', (err) => fastify.log.warn({ err: err.message }, '[Indexer] Redis health client error'));
+fastify.addHook('onClose', async () => {
+  await redisHealth.quit().catch(() => {});
+});
 
 webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, '[Indexer] Webhook worker error');
@@ -200,6 +176,9 @@ const CONTRACT_NAMES: Record<string, string> = (() => {
 function getContractName(contractId: string): string {
   return CONTRACT_NAMES[contractId] ?? 'unknown';
 }
+
+// ── Stellar RPC client ────────────────────────────────────────────────────────
+const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
@@ -267,11 +246,21 @@ async function persistEvent(
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
-fastify.get('/api/health', async () => {
-  const lag = latestLedgerSequence !== undefined && latestLedgerCursor !== undefined
-    ? latestLedgerSequence - latestLedgerCursor
-    : 0;
-  return { status: 'ok', latestLedgerCursor, lag };
+fastify.get('/api/health', async (_request, reply) => {
+  const health = await buildIndexerHealthResponse({
+    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    pingRedis: () => redisHealth.ping(),
+    getQueueJobCounts: () => webhookQueue.getJobCounts(),
+    getLatestLedger: () => server.getLatestLedger(),
+    latestLedgerCursor,
+    latestLedgerSequence,
+    lagWarnThreshold: env.INDEXER_LAG_WARN_THRESHOLD,
+    startTime,
+    service: 'indexer',
+    version: SERVICE_VERSION,
+  });
+  const statusCode = health.status === 'unhealthy' ? 503 : 200;
+  return reply.code(statusCode).send(health);
 });
 
 // Issue #67 — paginated events endpoint with { total, limit, offset, hasMore }
@@ -404,8 +393,12 @@ const WebhookBody = z.object({
 
 fastify.post('/api/webhooks', async (request, reply) => {
   const { url } = WebhookBody.parse(request.body);
-  const sub = await prisma.webhookSubscription.create({
-    data: { id: 'wh_' + crypto.randomUUID().replace(/-/g, ''), url },
+  const sub = await prisma.$transaction(async (tx) => {
+    const created = await tx.webhookSubscription.create({
+      data: { id: 'wh_' + crypto.randomUUID().replace(/-/g, ''), url },
+    });
+    await logAuditEvent('webhook.registered', 'webhook', created.id, { before: null, after: created }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+    return created;
   });
   return reply.code(201).send(sub);
 });
@@ -422,12 +415,14 @@ fastify.delete<{ Params: { id: string } }>('/api/webhooks/:id', async (request, 
       error: { code: 'NOT_FOUND', message: `Webhook subscription ${id} not found` },
     });
   }
-  await prisma.webhookSubscription.delete({ where: { id } });
+  await prisma.$transaction(async (tx) => {
+    await tx.webhookSubscription.delete({ where: { id } });
+    await logAuditEvent('webhook.deleted', 'webhook', id, { before: existing, after: null }, request, tx as unknown as Parameters<typeof logAuditEvent>[5]);
+  });
   return reply.code(204).send();
 });
 
 // ── Stellar RPC polling loop ──────────────────────────────────────────────────
-const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
 
 async function pollEvents() {
   // On each poll, fetch the latest Stellar ledger to track lag
@@ -499,49 +494,37 @@ async function pollEvents() {
   }
 }
 
-export function cleanupOldEvents(): number {
-  const retentionDays = env.EVENT_RETENTION_DAYS;
-  if (retentionDays <= 0) {
-    return 0;
-  }
-
-  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-  let totalDeleted = 0;
-  const batchSize = 1000;
-
-  while (true) {
-    const toDeleteIndices: number[] = [];
-    for (let i = 0; i < events.length; i++) {
-      const indexedAt = events[i].indexedAt;
-      if (indexedAt) {
-        const date = new Date(indexedAt);
-        if (!isNaN(date.getTime()) && date < cutoff) {
-          toDeleteIndices.push(i);
-          if (toDeleteIndices.length === batchSize) {
-            break;
-          }
-        }
-      }
-    }
-
-    if (toDeleteIndices.length === 0) {
-      break;
-    }
-
-    // Delete matching records from the events array (back to front to preserve correct indices during deletion)
-    for (let i = toDeleteIndices.length - 1; i >= 0; i--) {
-      events.splice(toDeleteIndices[i], 1);
-    }
-
-    totalDeleted += toDeleteIndices.length;
-  }
-
-  return totalDeleted;
+/**
+ * Builds the Prisma `where` clause for the DB cleanup query.
+ * Extracted as a pure function so it can be unit-tested without a DB connection.
+ *
+ * @internal exported for testing only
+ */
+export function buildCleanupWhere(retentionDays: number, now: Date): { indexedAt: { lt: Date } } | null {
+  if (retentionDays <= 0) return null;
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+  return { indexedAt: { lt: cutoff } };
 }
 
-export function runCleanupJob(): void {
+/**
+ * Deletes IndexedEvent rows from the database that are older than
+ * `EVENT_RETENTION_DAYS`. Returns the number of rows deleted.
+ *
+ * When `EVENT_RETENTION_DAYS` is 0 (the default), cleanup is disabled and the
+ * function returns 0 immediately.
+ */
+export async function cleanupOldEvents(): Promise<number> {
+  const retentionDays = env.EVENT_RETENTION_DAYS;
+  const where = buildCleanupWhere(retentionDays, new Date());
+  if (!where) return 0;
+
+  const { count } = await prisma.indexedEvent.deleteMany({ where });
+  return count;
+}
+
+export async function runCleanupJob(): Promise<void> {
   try {
-    const deletedCount = cleanupOldEvents();
+    const deletedCount = await cleanupOldEvents();
     fastify.log.info({
       retentionDays: env.EVENT_RETENTION_DAYS,
       deletedCount,
@@ -558,16 +541,16 @@ export function runCleanupJob(): void {
 
 let cleanupInterval: NodeJS.Timeout | undefined = undefined;
 
-export function startCleanupScheduler() {
+export function startCleanupScheduler(): void {
   if (env.EVENT_RETENTION_DAYS > 0) {
-    // Run once during startup
-    runCleanupJob();
-    // Schedule every 24 hours
-    cleanupInterval = setInterval(runCleanupJob, 24 * 60 * 60 * 1000);
+    // Run once during startup, then every 24 hours.
+    // Fire-and-forget: errors are caught and logged inside runCleanupJob().
+    void runCleanupJob();
+    cleanupInterval = setInterval(() => void runCleanupJob(), 24 * 60 * 60 * 1000);
   }
 }
 
-export function stopCleanupScheduler() {
+export function stopCleanupScheduler(): void {
   if (cleanupInterval) {
     clearInterval(cleanupInterval);
     cleanupInterval = undefined;
