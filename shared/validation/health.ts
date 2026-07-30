@@ -1,10 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import type { AggregatedHealthResponse, DependencyHealth, HealthResponse, HealthStatus } from './schemas.js';
 
 export const HEALTH_CHECK_TIMEOUT_MS = 3_000;
 export const UPSTREAM_HEALTH_TIMEOUT_MS = 5_000;
+export const POSTGRESQL_DEGRADED_LATENCY_MS = 1000;
 
 export function readServiceVersion(importMetaUrl: string): string {
   const serviceDir = dirname(fileURLToPath(importMetaUrl));
@@ -39,7 +41,7 @@ export async function withLatency<T>(
   fn: () => Promise<T>,
   timeoutMs: number,
 ): Promise<{ ok: true; latencyMs: number; value: T } | { ok: false; latencyMs: number; error: unknown }> {
-  const start = Date.now();
+  const start = performance.now();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
   try {
@@ -49,23 +51,58 @@ export async function withLatency<T>(
         timeoutId = setTimeout(() => reject(new Error('Health check timed out')), timeoutMs);
       }),
     ]);
-    return { ok: true, latencyMs: Date.now() - start, value };
+    return { ok: true, latencyMs: Math.round(performance.now() - start), value };
   } catch (error) {
-    return { ok: false, latencyMs: Date.now() - start, error };
+    return { ok: false, latencyMs: Math.round(performance.now() - start), error };
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
 }
 
+function extractPostgresqlServerVersion(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const row = Array.isArray(raw) ? raw[0] : raw;
+  if (!row || typeof row !== 'object') return null;
+
+  const versionValue = (row as Record<string, unknown>)['serverVersion'];
+  if (versionValue instanceof Date) {
+    return versionValue.toISOString();
+  }
+  if (typeof versionValue === 'string') {
+    return versionValue;
+  }
+
+  return null;
+}
+
 export async function checkPostgresql(
   queryFn: () => Promise<unknown>,
   timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
-): Promise<DependencyHealth> {
+): Promise<DependencyHealth & { healthy: boolean; serverVersion: string | null }> {
   const result = await withLatency(queryFn, timeoutMs);
+  const serverVersion = result.ok ? extractPostgresqlServerVersion(result.value) : null;
+
   if (result.ok) {
-    return { name: 'postgresql', status: 'connected', latencyMs: result.latencyMs };
+    return {
+      name: 'postgresql',
+      status: 'connected',
+      latencyMs: result.latencyMs,
+      healthy: true,
+      serverVersion,
+      details: serverVersion ? { serverVersion } : undefined,
+    };
   }
-  return { name: 'postgresql', status: 'disconnected', latencyMs: result.latencyMs };
+
+  return {
+    name: 'postgresql',
+    status: 'disconnected',
+    latencyMs: result.latencyMs,
+    healthy: false,
+    serverVersion: null,
+    details: {
+      error: result.error instanceof Error ? result.error.message : String(result.error),
+    },
+  };
 }
 
 export async function checkRedisPing(
@@ -214,9 +251,20 @@ export function buildHealthResponse(params: {
   criticalDependencyNames?: string[];
 }): HealthResponse {
   const combined = [...params.dependencies, ...(params.upstream ?? [])];
-  const status = computeOverallStatus(combined, {
+  let status = computeOverallStatus(combined, {
     criticalNames: params.criticalDependencyNames ?? params.dependencies.map((dep) => dep.name),
   });
+
+  const postgresLatencyExceeded = combined.some((dep) =>
+    dep.name === 'postgresql' &&
+    dep.status === 'connected' &&
+    typeof dep.latencyMs === 'number' &&
+    dep.latencyMs > POSTGRESQL_DEGRADED_LATENCY_MS,
+  );
+
+  if (status === 'healthy' && postgresLatencyExceeded) {
+    status = 'degraded';
+  }
 
   return {
     status,

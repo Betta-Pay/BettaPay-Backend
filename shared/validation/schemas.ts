@@ -253,6 +253,8 @@ export const DependencyHealth = z.object({
   name: z.string(),
   status: DependencyConnectionStatus,
   latencyMs: z.number().optional(),
+  healthy: z.boolean().optional(),
+  serverVersion: z.string().nullable().optional(),
   details: z.record(z.unknown()).optional(),
 });
 export type DependencyHealth = z.infer<typeof DependencyHealth>;

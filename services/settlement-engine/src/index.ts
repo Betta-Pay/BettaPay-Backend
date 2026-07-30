@@ -386,7 +386,7 @@ webhookWorker.on('error', (err) => {
 
 fastify.get('/api/health', async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
     getQueueIsPaused: () => settlementQueue.isPaused(),

@@ -5,6 +5,7 @@ import {
   buildHealthResponse,
   buildSettlementEngineHealthResponse,
   checkBullMQ,
+  checkPostgresql,
   computeOverallStatus,
 } from './health.js';
 import type { DependencyHealth, HealthResponse } from './schemas.js';
@@ -188,4 +189,55 @@ test('aggregateAllHealth returns healthy when gateway and downstream services ar
 
   assert.equal(aggregated.status, 'healthy');
   assert.equal(Object.keys(aggregated.services).length, 2);
+});
+
+test('checkPostgresql returns healthy with latency and optional serverVersion', async () => {
+  const dependency = await checkPostgresql(async () => [
+    { '?column?': 1, serverVersion: new Date().toISOString() },
+  ]);
+
+  assert.equal(dependency.status, 'connected');
+  assert.equal(dependency.healthy, true);
+  assert.equal(typeof dependency.latencyMs, 'number');
+  assert.ok(dependency.latencyMs < 1000);
+  assert.equal(typeof dependency.serverVersion, 'string');
+});
+
+test('buildHealthResponse marks degraded when database latency exceeds threshold', () => {
+  const response = buildHealthResponse({
+    service: 'db-service',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [
+      {
+        name: 'postgresql',
+        status: 'connected',
+        latencyMs: 1500,
+        healthy: true,
+        serverVersion: null,
+      } as any,
+    ],
+  });
+
+  assert.equal(response.status, 'degraded');
+});
+
+test('checkPostgresql measures slow latency as degraded in buildHealthResponse', async () => {
+  const dependency = await checkPostgresql(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1105));
+    return [{ '?column?': 1, serverVersion: new Date().toISOString() }];
+  });
+
+  assert.equal(dependency.status, 'connected');
+  assert.equal(dependency.healthy, true);
+  assert.ok(dependency.latencyMs > 1000);
+
+  const response = buildHealthResponse({
+    service: 'db-service',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [dependency as any],
+  });
+
+  assert.equal(response.status, 'degraded');
 });

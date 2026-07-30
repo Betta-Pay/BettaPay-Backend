@@ -737,7 +737,7 @@ export async function persistEvent(
 
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildIndexerHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redisHealth.ping(),
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),

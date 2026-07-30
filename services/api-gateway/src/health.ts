@@ -37,7 +37,7 @@ export async function buildGatewayHealthResponse(
   } = options;
 
   const [postgresql, fxEngine, settlementEngine, indexer] = await Promise.all([
-    checkPostgresql(() => prisma.$queryRaw`SELECT 1`),
+    checkPostgresql(() => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`),
     checkUpstreamServiceHealth(env.FX_ENGINE_URL, 'fx-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.SETTLEMENT_ENGINE_URL, 'settlement-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
