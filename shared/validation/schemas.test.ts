@@ -12,6 +12,8 @@ import {
   PositiveAmountString,
   StellarAddressSchema,
   UpdateMerchantSettingsBody,
+  MerchantSettings,
+  CurrencyCode,
   merchantSchema,
   paymentSchema,
   walletSchema,
@@ -474,5 +476,89 @@ test('StellarAddressSchema validation', async (t) => {
       status: 'initiated',
       createdAt: new Date().toISOString(),
     }).merchantId, VALID_STELLAR_PUBLIC_KEY);
+  });
+});
+
+test('MerchantSettings and UpdateMerchantSettingsBody validation', async (t) => {
+  await t.test('accepts valid merchant settings and does not modify clean fields', () => {
+    const validPayload = {
+      businessName: 'Valid Merchant LLC',
+      supportEmail: 'support@valid.com',
+      supportAddress: '123 Main St, Springfield',
+      tier: 'premium',
+      feeBps: 150,
+      autoSettle: true,
+      preferredAsset: 'USDC',
+    };
+
+    const parsed = UpdateMerchantSettingsBody.parse(validPayload);
+    assert.strictEqual(parsed.businessName, 'Valid Merchant LLC');
+    assert.strictEqual(parsed.supportEmail, 'support@valid.com');
+    assert.strictEqual(parsed.supportAddress, '123 Main St, Springfield');
+    assert.strictEqual(parsed.tier, 'premium');
+    assert.strictEqual(parsed.feeBps, 150);
+    assert.strictEqual(parsed.autoSettle, true);
+    assert.strictEqual(parsed.preferredAsset, 'USDC');
+  });
+
+  await t.test('escapes HTML in free-text fields to prevent XSS', () => {
+    const maliciousPayload = {
+      businessName: '<script>alert("xss")</script> Name',
+      supportAddress: '<img src=x onerror=alert(1)> Address',
+      tier: '<b>bold</b> tier',
+    };
+
+    const parsed = UpdateMerchantSettingsBody.parse(maliciousPayload);
+    assert.strictEqual(parsed.businessName, '&lt;script&gt;alert(&quot;xss&quot;)&lt;&#x2F;script&gt; Name');
+    assert.strictEqual(parsed.supportAddress, '&lt;img src=x onerror=alert(1)&gt; Address');
+    assert.strictEqual(parsed.tier, '&lt;b&gt;bold&lt;&#x2F;b&gt; tier');
+  });
+
+  await t.test('rejects invalid email formats', () => {
+    assert.throws(
+      () => UpdateMerchantSettingsBody.parse({ supportEmail: 'not-an-email' }),
+      /Invalid supportEmail format/
+    );
+  });
+
+  await t.test('rejects values exceeding length caps', () => {
+    const longName = 'A'.repeat(101);
+    const longAddress = 'B'.repeat(256);
+    const longTier = 'C'.repeat(51);
+    const longEmail = 'D'.repeat(250) + '@example.com';
+
+    assert.throws(
+      () => UpdateMerchantSettingsBody.parse({ businessName: longName }),
+      /businessName must be at most 100 characters/
+    );
+
+    assert.throws(
+      () => UpdateMerchantSettingsBody.parse({ supportAddress: longAddress }),
+      /supportAddress must be at most 255 characters/
+    );
+
+    assert.throws(
+      () => UpdateMerchantSettingsBody.parse({ tier: longTier }),
+      /tier must be at most 50 characters/
+    );
+
+    assert.throws(
+      () => UpdateMerchantSettingsBody.parse({ supportEmail: longEmail }),
+      /supportEmail must be at most 255 characters/
+    );
+  });
+
+  await t.test('MerchantSettings behaves similarly with validation, length caps and escaping', () => {
+    const maliciousPayload = {
+      businessName: '<h1>Company</h1>',
+      supportEmail: 'support@company.com',
+      supportAddress: '<div class="addr">123 Lane</div>',
+      tier: '<script>tier</script>',
+    };
+
+    const parsed = MerchantSettings.parse(maliciousPayload);
+    assert.strictEqual(parsed.businessName, '&lt;h1&gt;Company&lt;&#x2F;h1&gt;');
+    assert.strictEqual(parsed.supportAddress, '&lt;div class=&quot;addr&quot;&gt;123 Lane&lt;&#x2F;div&gt;');
+    assert.strictEqual(parsed.tier, '&lt;script&gt;tier&lt;&#x2F;script&gt;');
   });
 });

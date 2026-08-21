@@ -1,8 +1,18 @@
 import { z } from 'zod';
 import { CurrencyCode } from './currency.js';
+export { CurrencyCode };
 import { validateStellarAddress } from '@bettapay/stellar-utils';
 import { WebhookUrlSchema } from './webhookSchema.js';
 
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;');
+}
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -311,11 +321,15 @@ export const MerchantSettings = z.object({
   maxFeeBps: z.number().int().min(0).max(10000).optional(),
   maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
-  preferredAsset: z.string().optional(),
+  preferredAsset: CurrencyCode.optional(),
   autoSettle: z.boolean().optional(),
   maxSettlementAmount: z.number().positive().optional(),
   minSettlementAmount: z.number().positive().optional(),
   dailySettlementLimit: z.number().positive().optional(),
+  businessName: z.string().max(100, 'businessName must be at most 100 characters').transform(escapeHtml).optional(),
+  supportEmail: z.string().email('Invalid supportEmail format').max(255, 'supportEmail must be at most 255 characters').optional(),
+  supportAddress: z.string().max(255, 'supportAddress must be at most 255 characters').transform(escapeHtml).optional(),
+  tier: z.string().max(50, 'tier must be at most 50 characters').transform(escapeHtml).optional(),
 });
 
 export type MerchantSettings = z.infer<typeof MerchantSettings>;
@@ -442,11 +456,16 @@ export const UpdateMerchantSettingsBody = z.object({
   feeBps: z.number().int().min(0).max(10000).optional(),
   maxFeeBps: z.number().int().min(0).max(10000).optional(),
   maxFeeThreshold: z.string().regex(/^\d+(\.\d+)?$/, 'maxFeeThreshold must be a numeric string').optional(),
-  tier: z.string().optional(),
+  tier: z.string().max(50, 'tier must be at most 50 characters').transform(escapeHtml).optional(),
   minSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'minSettlementAmount must be a numeric string').optional(),
   maxSettlementAmount: z.string().regex(/^\d+(\.\d+)?$/, 'maxSettlementAmount must be a numeric string').optional(),
   dailySettlementLimit: z.string().regex(/^\d+(\.\d+)?$/, 'dailySettlementLimit must be a numeric string').optional(),
   webhookUrl: WebhookUrlSchema.optional(),
+  preferredAsset: CurrencyCode.optional(),
+  autoSettle: z.boolean().optional(),
+  businessName: z.string().max(100, 'businessName must be at most 100 characters').transform(escapeHtml).optional(),
+  supportEmail: z.string().email('Invalid supportEmail format').max(255, 'supportEmail must be at most 255 characters').optional(),
+  supportAddress: z.string().max(255, 'supportAddress must be at most 255 characters').transform(escapeHtml).optional(),
 });
 
 export const UpdateMerchantNameBody = z.object({
