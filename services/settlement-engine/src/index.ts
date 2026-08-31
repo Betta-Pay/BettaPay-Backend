@@ -632,7 +632,16 @@ fastify.post<{ Params: { id: string } }>(
       },
     });
 
-    // Mark original as superseded
+    // Mark original as superseded. Guard against a self-reference (#626): a
+    // settlement must never supersede itself (a 1-row loop that would break
+    // chain unwinding). The DB has a CHECK constraint as a backstop
+    // (Settlement_supersededById_no_self), but catch it here for a clean 409.
+    if (id === newSettlementId) {
+      return reply.code(409).send(createErrorResponse(
+        ErrorCodes.CONFLICT,
+        'Settlement cannot supersede itself',
+      ));
+    }
     await prisma.settlement.update({
       where: { id },
       data: { supersededById: newSettlementId },
