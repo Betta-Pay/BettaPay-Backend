@@ -246,17 +246,17 @@ const FALLBACK_WARNING_INTERVAL_MS = 5 * 60 * 1000;
 //
 // States:
 //   CLOSED   — normal operation; failures are counted.
-//   OPEN     — tripped after CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive
+//   OPEN     — tripped after the configured failure threshold consecutive
 //              failures; fetches are skipped until the cooldown expires.
 //   HALF_OPEN — after the cooldown a single probe fetch is allowed.
 //              Success → CLOSED, failure → OPEN (resets cooldown).
 //
-// The threshold is hardcoded to 5 (spec requirement). The cooldown window is
-// driven by CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
+// The threshold is env-configurable (CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+// default 5) so different upstreams can have different resilience profiles
+// (issue #498). The cooldown window is driven by
+// CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
 
 export type CircuitBreakerState = "CLOSED" | "OPEN" | "HALF_OPEN";
-
-const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
 
 interface CircuitBreaker {
   state: CircuitBreakerState;
@@ -317,7 +317,7 @@ function recordCircuitBreakerFailure(
   if (
     circuitBreaker.state === "HALF_OPEN" ||
     (circuitBreaker.state === "CLOSED" &&
-      circuitBreaker.consecutiveFailures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+      circuitBreaker.consecutiveFailures >= env.CIRCUIT_BREAKER_FAILURE_THRESHOLD)
   ) {
     transitionCircuitBreaker("OPEN", log);
   }
