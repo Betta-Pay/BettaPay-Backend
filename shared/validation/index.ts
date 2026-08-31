@@ -38,6 +38,7 @@ export const ErrorCodes = {
   NOT_FOUND: "NOT_FOUND",
   VALIDATION_ERROR: "VALIDATION_ERROR",
   INVALID_REQUEST: "INVALID_REQUEST",
+  CONFLICT: "CONFLICT",
   RATE_LIMITED: "RATE_LIMITED",
   REQUEST_TIMEOUT: "REQUEST_TIMEOUT",
   GATEWAY_TIMEOUT: "GATEWAY_TIMEOUT",
@@ -290,11 +291,20 @@ export const EnvSchema = z
       .default("60000"),
 
     // FX Engine — circuit breaker cooldown before probing CoinGecko again
-    // after 5 consecutive failures. Default: 5 minutes.
+    // after CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive failures.
+    // Default: 5 minutes.
     CIRCUIT_BREAKER_COOLDOWN_MS: z
       .string()
       .transform((s) => parseInt(s, 10))
       .default("300000"),
+
+    // FX Engine — circuit breaker opens after this many consecutive upstream
+    // failures. Env-configurable per upstream resilience profile (issue #498).
+    // Default: 5.
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("5"),
 
     // FX Engine — maximum allowed deviation (in basis points) between the
     // current cached rate and a newly fetched rate. When the deviation
