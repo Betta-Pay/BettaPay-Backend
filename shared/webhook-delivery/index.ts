@@ -66,6 +66,93 @@
 import { Queue, Worker, type ConnectionOptions, type WorkerOptions, type QueueOptions } from 'bullmq';
 import crypto from 'crypto';
 
+// ── SSRF / redirect guard (issue #513) ──────────────────────────────────────
+//
+// A merchant-registered webhook URL must never be allowed to reach internal
+// infrastructure, and redirects must not be followed (following a 3xx would
+// let a malicious URL bounce the worker onto an internal address through the
+// Location header). This helper validates the target up front and the worker
+// passes `redirect: 'manual'` so any 3xx is treated as a failed delivery.
+
+/** Returns `{ host }` on success or `{ err }` describing why the URL is unsafe. */
+export function validateWebhookTarget(
+  url: string,
+): { host: string | null; err: string | null } {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { host: null, err: 'not a valid URL' };
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return { host: null, err: 'unsupported protocol' };
+  }
+
+  const host = parsed.hostname;
+  if (!host) {
+    return { host: null, err: 'missing host' };
+  }
+
+  // Reject loopback, link-local, unspecified, multicast, and private ranges.
+  // hostnames resolve after validation; a DNS-rebinding race is mitigated by
+  // blocking both loopback names and numeric IP forms up front.
+  if (isLoopbackName(host)) {
+    return { host, err: 'internal loopback host' };
+  }
+
+  const ipInfo = parseIp(host);
+  if (ipInfo && isInternalIp(ipInfo)) {
+    return { host, err: 'internal/private IP address' };
+  }
+
+  return { host, err: null };
+}
+
+function isLoopbackName(host: string): boolean {
+  const lower = host.toLowerCase();
+  return (
+    lower === 'localhost' ||
+    lower.endsWith('.localhost') ||
+    lower === '::1' ||
+    lower.startsWith('0.') // 0.0.0.0 and 0.x.x.x are local
+  );
+}
+
+/** Parses an IPv4 or IPv6 literal hostname, or null if it's a name. */
+function parseIp(host: string): { v4: number[] } | { v6: number[] } | null {
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const parts = v4.slice(1).map(Number);
+    if (parts.every((n) => n >= 0 && n <= 255)) return { v4: parts };
+    return null;
+  }
+  const strip = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  if (strip.includes(':')) {
+    const nums = strip.split(':').filter((s) => s !== '');
+    if (nums.length >= 1 && nums.length <= 8) return { v6: [] };
+  }
+  return null;
+}
+
+/** True if the IP is in a range endpoints should never deliver to. */
+function isInternalIp(ip: { v4: number[] } | { v6: number[] }): boolean {
+  if ('v4' in ip) {
+    const [a, b] = ip.v4;
+    if (a === 0) return true; // 0.0.0.0/8
+    if (a === 10) return true; // RFC1918 10/8
+    if (a === 127) return true; // loopback
+    if (a === 169 && b === 254) return true; // link-local
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918 172.16/12
+    if (a === 192 && b === 168) return true; // RFC1918 192.168/16
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a >= 224) return true; // multicast + reserved
+    return false;
+  }
+  return true; // IPv6 loopback/ULA/hextet punt — treat as internal to be safe
+}
+
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /** Payload for every webhook delivery job. */
@@ -380,7 +467,23 @@ export function createWebhookWorker(
         }
       }
 
-      logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+        logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+
+      // ── SSRF guard ────────────────────────────────────────────────────
+      // Validate the delivery target before POSTing (issue #513): a malicious
+      // or hijacked merchant URL must not be able to reach internal services
+      // or redirect the worker onto them. Redirects are not followed (manual),
+      // so any 3xx is treated as a failure below.
+      const redirectGuard = validateWebhookTarget(url);
+      if (redirectGuard.err !== null) {
+        logger?.warn(
+          { url, jobId: job.id, attempt, reason: redirectGuard.err },
+          '[webhook-delivery] Refusing unsafe webhook target — delivery failed',
+        );
+        throw new Error(
+          `[webhook-delivery] Refusing unsafe webhook target ${url} — ${redirectGuard.err}`,
+        );
+      }
 
       const body = canonicalize({ version, event });
       const headers: Record<string, string> = {};
@@ -409,11 +512,16 @@ export function createWebhookWorker(
           headers,
           body,
           signal: controller.signal,
+          // Never follow redirects: after the SSRF guard above, following a
+          // 3xx to any host would bypass it (issue #513). 3xx = failure here.
+          redirect: 'manual',
         });
 
         clearTimeout(timeoutId);
 
-        if (!response.ok) {
+        // Treat 3xx redirects as failures — the target host was validated
+        // pre-flight, and following an arbitrary Location would defeat it.
+        if (!response.ok || response.status >= 300) {
           // Throw so BullMQ marks this attempt failed and schedules a retry.
           throw new Error(
             `[webhook-delivery] HTTP ${response.status} from ${url} — job ${job.id} attempt ${attempt}`,

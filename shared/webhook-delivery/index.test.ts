@@ -26,6 +26,7 @@ import {
   signPayload,
   verifySignature,
   canonicalize,
+  validateWebhookTarget,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
@@ -900,6 +901,102 @@ test('worker processor — no custom headers means only the defaults are sent', 
   await processor(job as any);
 
   t.same(Object.keys(capturedHeaders), ['Content-Type'], 'only Content-Type is sent when no headers/secret configured');
+  t.end();
+});
+
+// ── Part 6e: SSRF / redirect safety (#513) ─────────────────────────────────
+
+test('validateWebhookTarget — allows public HTTPS/HTTP targets', (t) => {
+  t.same(validateWebhookTarget('https://merchant.example/hook'), { host: 'merchant.example', err: null }, 'public https allowed');
+  t.same(validateWebhookTarget('http://hooks.example.com/cb'), { host: 'hooks.example.com', err: null }, 'public http allowed');
+  t.end();
+});
+
+test('validateWebhookTarget — rejects loopback and internal hosts', (t) => {
+  const bad = [
+    'http://localhost/hook',
+    'http://localhost:8080/hook',
+    'http://127.0.0.1/hook',
+    'http://127.0.0.1:6379/x',
+    'http://10.0.0.5/hook',
+    'http://172.16.1.2/hook',
+    'http://192.168.0.10/hook',
+    'http://169.254.169.254/latest/meta-data', // cloud metadata
+    'http://[::1]/hook',
+    'http://0.0.0.0/hook',
+  ];
+  for (const url of bad) {
+    const { err } = validateWebhookTarget(url);
+    t.notEqual(err, null, `rejects ${url}`);
+  }
+  t.end();
+});
+
+test('validateWebhookTarget — rejects unsupported protocols and malformed URLs', (t) => {
+  t.notEqual(validateWebhookTarget('ftp://example.com/hook').err, null, 'ftp rejected');
+  t.notEqual(validateWebhookTarget('file:///etc/passwd').err, null, 'file rejected');
+  t.notEqual(validateWebhookTarget('not-a-url').err, null, 'malformed rejected');
+  t.end();
+});
+
+test('worker processor — refuses to deliver to an internal host without calling fetch (SSRF #513)', async (t) => {
+  let fetchCalled = false;
+  const mockFetch: typeof fetch = async () => {
+    fetchCalled = true;
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — SSRF test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({ url: 'http://169.254.169.254/latest/meta-data', event: {} });
+
+  let threw = false;
+  let message = '';
+  try {
+    await processor(job as any);
+  } catch (err) {
+    threw = true;
+    message = err instanceof Error ? err.message : String(err);
+  }
+
+  t.ok(threw, 'delivery to internal target throws (fails the attempt)');
+  t.ok(message.includes('unsafe webhook target'), 'error names the refusal reason');
+  t.notOk(fetchCalled, 'fetch is never invoked for an internal target');
+  t.end();
+});
+
+test('worker processor — treats a 3xx redirect as a failed delivery (no following)', async (t) => {
+  // With redirect: 'manual', fetch returns a 3xx Response rather than
+  // following it.  We assert the processor treats that as a failure so
+  // BullMQ retries and the target is not fetched a second time contrary
+  // to the SSRF guard.
+  const mockFetch: typeof fetch = async () => ({ ok: false, status: 302 } as Response);
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — 3xx test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({ url: 'https://merchant.example/hook', event: {} });
+
+  let threw = false;
+  let message = '';
+  try {
+    await processor(job as any);
+  } catch (err) {
+    threw = true;
+    message = err instanceof Error ? err.message : String(err);
+  }
+
+  t.ok(threw, '3xx redirect fails the delivery');
+  t.ok(message.includes('302'), 'error message includes the 3xx status');
   t.end();
 });
 
