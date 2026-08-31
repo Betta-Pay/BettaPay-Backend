@@ -1178,6 +1178,17 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
       .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
   }
 
+  // Re-validate the nonce binding (#616): the signed payload's nonce must be
+  // the one the server bound to this address when issuing the challenge, not
+  // a value the client chose. This closes the cross-address replay where a
+  // victim's signed challenge is re-posted under the attacker's address.
+  if (d.nonce && d.nonce !== stored.nonce) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(409)
+      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge does not match the one issued'));
+  }
+
   // If the client echoed a challenge, it must be the one we issued.
   if (d.challenge && d.challenge !== stored.challenge) {
     await recordAuthIpFailure(request);

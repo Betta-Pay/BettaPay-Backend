@@ -80,6 +80,7 @@ function buildAuthApp(redis: FakeRedis, verifySig: (a: string, c: string, s: str
   const app = Fastify({ logger: false });
   const Body = z.object({
     address: z.string().min(1),
+    nonce: z.string().optional(),
     challenge: z.string().min(1).optional(),
     signature: z.string().min(1),
   });
@@ -94,7 +95,7 @@ function buildAuthApp(redis: FakeRedis, verifySig: (a: string, c: string, s: str
     } catch {
       return reply.code(503).send({ error: 'Authentication service unavailable' });
     }
-    return reply.send({ challenge, expiresAt });
+    return reply.send({ challenge, nonce, expiresAt });
   });
 
   app.post('/verify', async (req, reply) => {
@@ -107,6 +108,13 @@ function buildAuthApp(redis: FakeRedis, verifySig: (a: string, c: string, s: str
     }
     if (!stored || stored.address !== d.address || Date.now() > stored.expiresAt) {
       return reply.code(409).send({ error: 'Challenge expired or already used' });
+    }
+    // Nonce binding (#616): the supplied nonce must be the one the server
+    // bound to this address. Rejecting a mismatched nonce closes the
+    // cross-address replay where a victim's signed challenge is re-posted
+    // under the attacker's address.
+    if (d.nonce && d.nonce !== stored.nonce) {
+      return reply.code(409).send({ error: 'Challenge does not match the one issued' });
     }
     if (d.challenge && d.challenge !== stored.challenge) {
       return reply.code(409).send({ error: 'Challenge does not match the one issued' });
@@ -179,6 +187,52 @@ test('a signed challenge for a different address is rejected (binding)', async (
     payload: { address: 'GBOB', challenge: 'BettaPay:GBOB:whatever', signature: 'sig' },
   });
   t.equal(res.statusCode, 409, 'no challenge bound to GBOB -> 409');
+
+  await app.close();
+  t.end();
+});
+
+test('cross-address replay: victim-issue + attacker-address + nonce is rejected with 409 (#616)', async (t) => {
+  const redis = fakeRedis();
+  const app = buildAuthApp(redis, () => true);
+
+  // Victim requests and signs a challenge bound to GALICE.
+  const chRes = await app.inject({
+    method: 'GET',
+    url: '/challenge?address=GALICE',
+  });
+  const { challenge, nonce } = JSON.parse(chRes.body);
+
+  // Attacker posts the victim's signed challenge under their own address,
+  // echoing the victim's nonce but claiming a different address. The stored
+  // record is consumed keyed by the attacker's address, so nothing is found
+  // and the request is rejected with 409.
+  const atk = await app.inject({
+    method: 'POST',
+    url: '/verify',
+    payload: { address: 'GATTACKER', nonce, challenge, signature: 'sig' },
+  });
+  t.equal(atk.statusCode, 409, 'challenge store is keyed by address — attacker has no challenge');
+
+  await app.close();
+  t.end();
+});
+
+test('a mismatched nonce is rejected even when the address matches (#616)', async (t) => {
+  const redis = fakeRedis();
+  const app = buildAuthApp(redis, () => true);
+
+  const chRes = await app.inject({ method: 'GET', url: '/challenge?address=GALICE' });
+  const { challenge } = JSON.parse(chRes.body);
+
+  // Correct address and challenge, but the attacker swaps the nonce for a
+  // value the server never bound to GALICE — the verify must reject it.
+  const res = await app.inject({
+    method: 'POST',
+    url: '/verify',
+    payload: { address: 'GALICE', nonce: 'forged-nonce', challenge, signature: 'sig' },
+  });
+  t.equal(res.statusCode, 409, 'mismatched nonce is rejected with 409');
 
   await app.close();
   t.end();
