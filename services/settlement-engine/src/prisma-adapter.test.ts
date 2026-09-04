@@ -98,11 +98,68 @@ test('settlement-engine does NOT assign process.env.DATABASE_URL as a side-effec
   t.end();
 });
 
+// ── Prisma adapter concurrency helpers (#543) ────────────────────────────────
+// These tests parse the adapter source as text and exercise it with an
+// in-memory mock so they require no database connection.
+
+const adapterPath = path.resolve(__dirname, './prisma-adapter.ts');
+const adapterContent = fs.readFileSync(adapterPath, 'utf-8');
+
+test('prisma-adapter exists and avoids upsert', (t) => {
+  t.ok(fs.existsSync(adapterPath), 'prisma-adapter.ts should exist');
+  t.notMatch(
+    adapterContent,
+    /\.upsert\s*\(/,
+    'adapter must not use Prisma upsert (create + unique-constraint handling instead)',
+  );
+  t.match(
+    adapterContent,
+    /export\s+async\s+function\s+createSettlementWithUniqueGuard/,
+    'adapter should export createSettlementWithUniqueGuard',
+  );
+  t.match(
+    adapterContent,
+    /export\s+async\s+function\s+updateSettlementWithOptimisticLock/,
+    'adapter should export updateSettlementWithOptimisticLock',
+  );
+  t.match(
+    adapterContent,
+    /export\s+class\s+VersionConflictError/,
+    'adapter should export VersionConflictError',
+  );
+  t.end();
+});
+
+test('prisma-adapter index.ts imports the adapter helpers', (t) => {
+  t.match(
+    content,
+    /from\s+['"]\.\/prisma-adapter\.js['"]/,
+    'index.ts should import from prisma-adapter.js',
+  );
+  t.match(
+    content,
+    /createSettlementWithUniqueGuard/,
+    'index.ts should reference createSettlementWithUniqueGuard',
+  );
+  t.match(
+    content,
+    /updateSettlementWithOptimisticLock/,
+    'index.ts should reference updateSettlementWithOptimisticLock',
+  );
+  t.end();
+});
+
 // ── Transaction isolation tests ───────────────────────────────────────────────
 // Issue #497: Add tests for Prisma adapter transaction isolation
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
+import {
+  createSettlementWithUniqueGuard,
+  updateSettlementWithOptimisticLock,
+  VersionConflictError,
+  UniqueConstraintError,
+} from './prisma-adapter.js';
 
 describe('Prisma Adapter Transaction Isolation (#497)', () => {
   let prisma: PrismaClient;
@@ -296,5 +353,105 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
     // Second settlement should be unchanged
     const unchangedStl2 = await prisma.settlement.findUnique({ where: { id: stl2.id } });
     expect(unchangedStl2?.status).toBe('pending');
+  });
+});
+
+// ── Adapter unit tests (in-memory mocks, no DB required) ─────────────────────
+
+describe('Settlement Prisma Adapter (#543)', () => {
+  function makeMockPrisma(overrides?: {
+    existingById?: Record<string, unknown>;
+    existingByKey?: Record<string, unknown>;
+    updateCount?: number;
+  }) {
+    const store: Record<string, unknown> = {};
+    const mockPrisma = {
+      settlement: {
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+          return { ...(data as object), version: 0 } as unknown as Settlement;
+        }),
+        findUnique: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+          if ('id' in where) {
+            return (overrides?.existingById?.[where.id as string] as Settlement) ?? null;
+          }
+          if ('idempotencyKey' in where) {
+            return (overrides?.existingByKey?.[where.idempotencyKey as string] as Settlement) ?? null;
+          }
+          return null;
+        }),
+        updateMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+          return { count: overrides?.updateCount ?? 1 };
+        }),
+      },
+    };
+    return { mockPrisma, store };
+  }
+
+  it('createSettlementWithUniqueGuard creates a new settlement', async () => {
+    const { mockPrisma } = makeMockPrisma();
+    const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
+      id: 'set_new',
+      merchantId: 'm1',
+      status: 'pending',
+    } as any);
+    expect(result.id).toBe('set_new');
+    expect(mockPrisma.settlement.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('createSettlementWithUniqueGuard returns existing record on P2002', async () => {
+    const existing = { id: 'set_existing', merchantId: 'm1', status: 'pending', version: 0 };
+    const { mockPrisma } = makeMockPrisma({
+      existingById: { set_existing: existing },
+    });
+
+    mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
+
+    const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
+      id: 'set_existing',
+      merchantId: 'm1',
+      status: 'pending',
+    } as any);
+
+    expect(result).toEqual(existing);
+    expect(mockPrisma.settlement.findUnique).toHaveBeenCalledWith({ where: { id: 'set_existing' } });
+  });
+
+  it('createSettlementWithUniqueGuard throws UniqueConstraintError when existing record is not found', async () => {
+    const { mockPrisma } = makeMockPrisma();
+    mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
+
+    await expect(
+      createSettlementWithUniqueGuard(mockPrisma as any, {
+        id: 'set_missing',
+        merchantId: 'm1',
+        status: 'pending',
+      } as any),
+    ).rejects.toBeInstanceOf(UniqueConstraintError);
+  });
+
+  it('updateSettlementWithOptimisticLock increments version on success', async () => {
+    const { mockPrisma } = makeMockPrisma();
+    const result = await updateSettlementWithOptimisticLock(mockPrisma as any, {
+      id: 'set_1',
+      expectedVersion: 3,
+      data: { status: 'processing' },
+    });
+    expect(result).toBeDefined();
+    expect(mockPrisma.settlement.updateMany).toHaveBeenCalledWith({
+      where: { id: 'set_1', version: 3 },
+      data: { status: 'processing', version: { increment: 1 } },
+    });
+  });
+
+  it('updateSettlementWithOptimisticLock throws VersionConflictError on stale version', async () => {
+    const { mockPrisma } = makeMockPrisma({ updateCount: 0 });
+
+    await expect(
+      updateSettlementWithOptimisticLock(mockPrisma as any, {
+        id: 'set_1',
+        expectedVersion: 2,
+        data: { status: 'processing' },
+      }),
+    ).rejects.toBeInstanceOf(VersionConflictError);
   });
 });
