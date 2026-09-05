@@ -1420,6 +1420,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       }
     }
 
+    if (d.settlements.length === 0) {
+      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch must contain at least one settlement'));
+    }
+
     if (d.settlements.length > 100) {
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }

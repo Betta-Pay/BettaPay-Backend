@@ -145,6 +145,25 @@ test('bulk-limits: decimal precision check under boundary constraints', async (t
   t.end();
 });
 
+test('bulk-limits: rejects empty bulk batch', async (t) => {
+  resetMocks();
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_TIGHT_LIMITS as any;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
+      settlements: [],
+    },
+  });
+
+  t.equal(res.statusCode, 400);
+  const body = JSON.parse(res.body);
+  t.ok(body.error.message.includes('at least one settlement'));
+  t.end();
+});
+
 test('bulk-limits: handles multiple assets in the same daily limit check', async (t) => {
   resetMocks();
   prisma.merchant.findUnique = async () => MOCK_MERCHANT_TIGHT_LIMITS as any;
