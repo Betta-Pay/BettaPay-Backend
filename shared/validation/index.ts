@@ -418,15 +418,22 @@ export const EnvSchema = z
         message: "RATE_HISTORY_RETENTION_DAYS must be >= 1",
       }),
 
-    // Settlement Batching — interval (seconds) for batch job and minimum count per batch
+    // Settlement Batching — interval (seconds) for batch job and minimum count per batch.
+    // Reject zero/negative intervals (tight loop risk) and unreasonable upper bounds.
     BATCH_INTERVAL_SECONDS: z
       .string()
       .transform((s) => parseInt(s, 10))
-      .default("300"),
+      .default("300")
+      .refine((val) => Number.isFinite(val) && val >= 1 && val <= 86400, {
+        message: "BATCH_INTERVAL_SECONDS must be between 1 and 86400",
+      }),
     BATCH_MIN_COUNT: z
       .string()
       .transform((s) => parseInt(s, 10))
-      .default("2"),
+      .default("2")
+      .refine((val) => Number.isFinite(val) && val >= 1 && val <= 10000, {
+        message: "BATCH_MIN_COUNT must be between 1 and 10000",
+      }),
 
     // Settlement Engine — optional daily volume limit for pre-validation.
     // When set, the settlement engine rejects settlement creation requests

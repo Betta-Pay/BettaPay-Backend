@@ -177,5 +177,37 @@ test('validateEnv in production succeeds with a strong, complex secret', () => {
   assert.equal(env.JWT_SECRET, strongSecret);
 });
 
+test('validateEnv accepts default settlement batching env values', () => {
+  const env = validateEnv(validEnv());
+  assert.equal(env.BATCH_INTERVAL_SECONDS, 300);
+  assert.equal(env.BATCH_MIN_COUNT, 2);
+});
+
+test('validateEnv rejects BATCH_INTERVAL_SECONDS out of range', () => {
+  for (const value of ['0', '-1', '86401', 'abc']) {
+    assert.throws(
+      () => validateEnv(validEnv({ BATCH_INTERVAL_SECONDS: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /BATCH_INTERVAL_SECONDS/);
+        return true;
+      },
+    );
+  }
+});
+
+test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
+  for (const value of ['0', '-1', '10001', 'abc']) {
+    assert.throws(
+      () => validateEnv(validEnv({ BATCH_MIN_COUNT: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /BATCH_MIN_COUNT/);
+        return true;
+      },
+    );
+  }
+});
+
 
 
