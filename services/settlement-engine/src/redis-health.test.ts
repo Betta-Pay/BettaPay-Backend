@@ -1,5 +1,5 @@
 import test from 'tape';
-import { buildSettlementEngineHealthResponse } from '../../../health.js';
+import { buildSettlementEngineHealthResponse } from '@bettapay/validation';
 
 test('buildSettlementEngineHealthResponse exposes Redis degraded state with error count', async (t) => {
   // Simulate a Redis client that has experienced connection issues

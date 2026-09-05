@@ -56,4 +56,6 @@ pgdata/
 pgsql/
 *.zip
 
-fix.md
+# local artifacts
+build-output.txt
+*.tsbuildinfo
