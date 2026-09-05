@@ -109,6 +109,9 @@ model Settlement {
   supersededById          String?
   supersededBy            Settlement?      @relation("SettlementRetry", fields: [supersededById], references: [id], onDelete: SetNull)
   supersedes              Settlement[]     @relation("SettlementRetry")
+  // Optimistic concurrency version (#543). Incremented on every state-changing
+  // update so concurrent writers cannot silently overwrite each other.
+  version                 Int              @default(0)
 
   @@index([initiatedAt(sort: Desc)])
   @@index([merchantId, initiatedAt(sort: Desc)])

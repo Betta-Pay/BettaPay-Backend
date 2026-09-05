@@ -37,6 +37,11 @@ import { computeSettlementAmounts, SettlementAmountError } from './settlement-am
 import type { DiscountTier } from './settlement-amounts.js';
 import { buildSettlementWebhookData } from './webhook-payload.js';
 import {
+  createSettlementWithUniqueGuard,
+  updateSettlementWithOptimisticLock,
+  VersionConflictError,
+} from './prisma-adapter.js';
+import {
   acquireSemaphore,
   releaseSemaphore,
   startSemaphoreRenewal,
@@ -671,11 +676,24 @@ fastify.post<{ Params: { id: string } }>(
       },
     });
 
-    // Mark original as superseded
-    await prisma.settlement.update({
-      where: { id },
-      data: { supersededById: newSettlementId },
-    });
+    // Mark original as superseded using an optimistic lock so concurrent
+    // retries cannot overwrite each other's chain link (#543).
+    try {
+      await updateSettlementWithOptimisticLock(prisma, {
+        id,
+        expectedVersion: original.version,
+        data: { supersededById: newSettlementId },
+      });
+    } catch (err) {
+      if (err instanceof VersionConflictError) {
+        return reply.code(409).send(createErrorResponse(
+          ErrorCodes.CONCURRENCY_EXCEEDED,
+          'Settlement was modified concurrently; please retry',
+          { expectedVersion: err.expectedVersion },
+        ));
+      }
+      throw err;
+    }
 
     // Queue the new settlement for processing
     await settlementQueue.add('process-settlement', {
@@ -1348,23 +1366,21 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       }
     }
 
-    const settlement = await prisma.settlement.create({
-      data: {
-        id: settlementId,
-        merchantId: d.merchantId,
-        totalAmount: grossAmount,
-        grossAmount,
-        feeAmount,
-        netAmount,
-        feeBps,
-        asset: d.asset,
-        status: 'pending',
-        webhookUrl,
-        webhookHeaders: webhookHeaders as any,
-        feeSnapshot: feeSnapshot as any,
-        idempotencyKey: idempotencyKey ?? undefined,
-        idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
-      },
+    const settlement = await createSettlementWithUniqueGuard(prisma, {
+      id: settlementId,
+      merchantId: d.merchantId,
+      totalAmount: grossAmount,
+      grossAmount,
+      feeAmount,
+      netAmount,
+      feeBps,
+      asset: d.asset,
+      status: 'pending',
+      webhookUrl,
+      webhookHeaders: webhookHeaders as any,
+      feeSnapshot: feeSnapshot as any,
+      idempotencyKey: idempotencyKey ?? undefined,
+      idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
     });
 
     const traceId = (request as unknown as { traceId?: string }).traceId;
@@ -1550,21 +1566,19 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     if (validItems.length > 0) {
       await prisma.$transaction(async (tx) => {
         for (const item of validItems) {
-          await tx.settlement.create({
-            data: {
-              id: item.id,
-              merchantId: d.merchantId,
-              totalAmount: item.grossAmount,
-              grossAmount: item.grossAmount,
-              feeAmount: item.feeAmount,
-              netAmount: item.netAmount,
-              feeBps: item.feeBps,
-              asset: item.asset,
-              status: 'pending',
-              webhookUrl,
-              webhookHeaders: webhookHeaders as any,
-              batchId,
-            },
+          await createSettlementWithUniqueGuard(tx, {
+            id: item.id,
+            merchantId: d.merchantId,
+            totalAmount: item.grossAmount,
+            grossAmount: item.grossAmount,
+            feeAmount: item.feeAmount,
+            netAmount: item.netAmount,
+            feeBps: item.feeBps,
+            asset: item.asset,
+            status: 'pending',
+            webhookUrl,
+            webhookHeaders: webhookHeaders as any,
+            batchId,
           });
         }
       });
