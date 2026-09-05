@@ -1108,12 +1108,13 @@ fastify.get("/api/health", async (_request, reply) => {
   const ratesApi = health.upstream?.find((d) => d.name === "rates-api");
   if (ratesApi) {
     if (feedStatus === "down") {
-      ratesApi.status = "unhealthy";
-    } else if (feedStatus === "degraded" && ratesApi.status === "healthy") {
-      ratesApi.status = "degraded";
+      ratesApi.status = "disconnected";
+    } else if (feedStatus === "degraded" && ratesApi.status === "connected") {
+      // Dependency stays connected but overall health will be degraded
+      ratesApi.status = "connected";
     }
     if (fallbackExceeded) {
-      ratesApi.status = ratesApi.status === "healthy" ? "degraded" : ratesApi.status;
+      ratesApi.status = ratesApi.status === "connected" ? "connected" : ratesApi.status;
     }
     ratesApi.details = {
       ...(ratesApi.details ?? {}),

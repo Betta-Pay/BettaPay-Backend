@@ -217,7 +217,9 @@ test('decrypt: handles truncated encrypted data', (t) => {
   );
 
   t.end();
-import test from 'node:test';
+});
+
+import testNode from 'node:test';
 import assert from 'node:assert/strict';
 import {
   encryptField,
@@ -229,7 +231,7 @@ import {
 
 const TEST_KEY = 'super-secret-32-character-encryption-key-for-bettapay!';
 
-test('encryptField & decryptField: successfully encrypts and decrypts string', () => {
+testNode('encryptField & decryptField: successfully encrypts and decrypts string', () => {
   const plaintext = 'my-secret-merchant-hash-123';
   const ciphertext = encryptField(plaintext, TEST_KEY);
 
@@ -240,7 +242,7 @@ test('encryptField & decryptField: successfully encrypts and decrypts string', (
   assert.equal(decrypted, plaintext, 'Decrypted value must equal original plaintext');
 });
 
-test('encryptField: produces unique ciphertext for identical plaintext calls due to random IV', () => {
+testNode('encryptField: produces unique ciphertext for identical plaintext calls due to random IV', () => {
   const plaintext = 'same-secret-value';
   const cipher1 = encryptField(plaintext, TEST_KEY);
   const cipher2 = encryptField(plaintext, TEST_KEY);
@@ -250,7 +252,7 @@ test('encryptField: produces unique ciphertext for identical plaintext calls due
   assert.equal(decryptField(cipher2, TEST_KEY), plaintext);
 });
 
-test('encryptField & decryptField: throws when FIELD_ENCRYPTION_KEY is missing or too short', () => {
+testNode('encryptField & decryptField: throws when FIELD_ENCRYPTION_KEY is missing or too short', () => {
   const originalEnv = process.env.FIELD_ENCRYPTION_KEY;
   delete process.env.FIELD_ENCRYPTION_KEY;
 
@@ -260,7 +262,7 @@ test('encryptField & decryptField: throws when FIELD_ENCRYPTION_KEY is missing o
   process.env.FIELD_ENCRYPTION_KEY = originalEnv;
 });
 
-test('decryptField: throws descriptive error on malformed or tampered ciphertext', () => {
+testNode('decryptField: throws descriptive error on malformed or tampered ciphertext', () => {
   assert.throws(() => decryptField('$enc$v1$badformat', TEST_KEY), /Malformed encrypted payload structure/);
 
   const validCiphertext = encryptField('test', TEST_KEY);
@@ -269,7 +271,7 @@ test('decryptField: throws descriptive error on malformed or tampered ciphertext
   assert.throws(() => decryptField(tamperedCiphertext, TEST_KEY), /Failed to decrypt field/);
 });
 
-test('encryptSensitiveFields & decryptSensitiveFields: processes sensitive fields in nested objects', () => {
+testNode('encryptSensitiveFields & decryptSensitiveFields: processes sensitive fields in nested objects', () => {
   const data = {
     id: 'merchant-123',
     secretHash: 'raw-secret-hash-value',

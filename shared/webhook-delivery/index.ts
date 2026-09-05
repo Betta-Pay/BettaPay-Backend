@@ -184,6 +184,7 @@ export function resolveWebhookConcurrency(defaultValue = WEBHOOK_DEFAULTS.concur
     }
   }
   return defaultValue;
+}
 // ── Canonical JSON serialization ─────────────────────────────────────────────
 
 /**

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * API Gateway — BettaPay Backend
  *

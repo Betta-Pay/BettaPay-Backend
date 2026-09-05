@@ -400,7 +400,7 @@ const replayWorker = new Worker(
       status: "running",
     });
 
-    let processedLedgers = 0;
+    let processedCount = 0;
 
     try {
       // If contractId is specified, only replay that contract; otherwise replay all
@@ -426,7 +426,7 @@ const replayWorker = new Worker(
           );
         }
 
-        const processedLedgers = new Set<number>();
+        const processedLedgerSet = new Set<number>();
         let currentLedger = -1;
 
         while (cursor <= toLedger) {
@@ -468,11 +468,11 @@ const replayWorker = new Worker(
             if (evt.ledger > toLedger) continue;
 
             if (currentLedger !== -1 && currentLedger !== evt.ledger) {
-              processedLedgers.add(currentLedger);
+              processedLedgerSet.add(currentLedger);
             }
             currentLedger = evt.ledger;
 
-            if (processedLedgers.has(evt.ledger)) {
+            if (processedLedgerSet.has(evt.ledger)) {
               fastify.log.warn(
                 { ledger: evt.ledger },
                 "[Indexer] Skipping out-of-order or duplicate ledger",
@@ -544,13 +544,13 @@ const replayWorker = new Worker(
               throw err;
             }
 
-            processedLedgers = Math.max(
-              processedLedgers,
+            processedCount = Math.max(
+              processedCount,
               evt.ledger - fromLedger + 1,
             );
             await updateReplayProgress(job.id!, {
               totalLedgers,
-              processedLedgers,
+              processedLedgers: processedCount,
               status: "running",
             });
           }
@@ -566,7 +566,7 @@ const replayWorker = new Worker(
 
       await updateReplayProgress(job.id!, {
         totalLedgers,
-        processedLedgers,
+        processedLedgers: processedCount,
         status: "completed",
       });
     } catch (err) {
@@ -577,7 +577,7 @@ const replayWorker = new Worker(
       );
       await updateReplayProgress(job.id!, {
         totalLedgers,
-        processedLedgers,
+        processedLedgers: processedCount,
         status: "failed",
         error: errMsg,
       });
@@ -1352,7 +1352,7 @@ async function pollEvents() {
       return;
     }
 
-    const perLedgerTimeoutMs = env.PER_LEDGER_TIMEOUT_MS;
+    const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
 
     // Wrap server.getEvents() with per-ledger timeout (#565)
     let response: Awaited<ReturnType<typeof server.getEvents>>;

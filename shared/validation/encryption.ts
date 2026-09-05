@@ -128,10 +128,6 @@ export function verifyPassword(encrypted: string, password: string): boolean {
     return false;
   }
 }
-import crypto from 'crypto';
-
-const ALGORITHM = 'aes-256-gcm';
-const IV_LENGTH = 12; // 96-bit IV for AES-GCM
 const TAG_LENGTH = 16; // 128-bit authentication tag
 const ENCRYPTED_PREFIX = '$enc$v1$';
 
