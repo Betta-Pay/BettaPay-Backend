@@ -319,9 +319,11 @@ const worker = new Worker('settlements', async job => {
     log.info({ settlementId }, 'Settlement completed in database');
 
     if (updatedSettlement.webhookUrl) {
+      const eventId = `settlement:${updatedSettlement.id}:completed`;
       await webhookQueue.add('deliver', {
+        eventId,
         url: updatedSettlement.webhookUrl,
-        event: { event: 'settlement.completed', data: updatedSettlement as unknown as Record<string, unknown> },
+        event: { event: 'settlement.completed', eventId, data: updatedSettlement as unknown as Record<string, unknown> },
       });
     }
   } catch (error) {
@@ -334,9 +336,11 @@ const worker = new Worker('settlements', async job => {
 
     if (updatedSettlement?.webhookUrl) {
       // Best-effort enqueue — don't let a queue error mask the original failure.
+      const eventId = `settlement:${updatedSettlement.id}:failed`;
       await webhookQueue.add('deliver', {
+        eventId,
         url: updatedSettlement.webhookUrl,
-        event: { event: 'settlement.failed', data: updatedSettlement as unknown as Record<string, unknown> },
+        event: { event: 'settlement.failed', eventId, data: updatedSettlement as unknown as Record<string, unknown> },
       }).catch((err: unknown) => {
         log.error({ err, settlementId }, 'Failed to enqueue failure webhook');
       });
@@ -352,6 +356,48 @@ const worker = new Worker('settlements', async job => {
   connection: connectionParams,
   concurrency: 5,
 });
+
+const MAX_SETTLEMENT_RETRY_COUNT = 3;
+
+export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT_RETRY_COUNT): void {
+  if (retryCount >= maxRetries) {
+    throw new Error(`Maximum retry limit (${maxRetries}) exceeded`);
+  }
+}
+
+async function getSettlementRetryCount(settlementId: string): Promise<number> {
+  const visited = new Set<string>();
+  let currentId = settlementId;
+  let ancestorCount = 0;
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const current = await prisma.settlement.findUnique({
+      where: { id: currentId },
+      select: { supersededById: true },
+    });
+
+    if (!current?.supersededById) break;
+    currentId = current.supersededById;
+    ancestorCount += 1;
+  }
+
+  let descendantCount = 0;
+  let activeIds = [settlementId];
+
+  while (activeIds.length > 0) {
+    const children = await prisma.settlement.findMany({
+      where: { supersededById: { in: activeIds } },
+      select: { id: true },
+    });
+
+    if (children.length === 0) break;
+    descendantCount += children.length;
+    activeIds = children.map((child) => child.id);
+  }
+
+  return ancestorCount + descendantCount;
+}
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
@@ -454,42 +500,14 @@ fastify.post<{ Params: { id: string } }>(
       ));
     }
 
-    // Count the retry chain to enforce max 3 retries
-    const retryChain = await prisma.settlement.findMany({
-      where: {
-        OR: [
-          { supersededById: id },
-          { id: original.supersededById ?? '' },
-        ],
-      },
-    });
+    const totalRetries = await getSettlementRetryCount(id);
 
-    // Find the root of the chain
-    let current = original;
-    let chainLength = 0;
-    const visited = new Set<string>();
-
-    while (current.supersededById && !visited.has(current.id)) {
-      visited.add(current.id);
-      chainLength++;
-      const parent = await prisma.settlement.findUnique({
-        where: { id: current.supersededById },
-      });
-      if (!parent) break;
-      current = parent;
-    }
-
-    // Count forward retries from original
-    const forwardRetries = await prisma.settlement.count({
-      where: { supersededById: id },
-    });
-
-    const totalRetries = chainLength + forwardRetries;
-
-    if (totalRetries >= 3) {
-      return reply.code(422).send(createErrorResponse(
+    try {
+      assertRetryLimit(totalRetries, MAX_SETTLEMENT_RETRY_COUNT);
+    } catch (error) {
+      return reply.code(409).send(createErrorResponse(
         ErrorCodes.VALIDATION_ERROR,
-        'Maximum retry limit (3) exceeded',
+        (error as Error).message,
         { retryCount: totalRetries }
       ));
     }

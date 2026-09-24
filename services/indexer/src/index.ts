@@ -452,9 +452,11 @@ export async function persistEvent(
 
   const subs = cacheState.subscriptions.data;
   for (const sub of subs) {
+    const eventId = String((record as Record<string, unknown>).id ?? crypto.randomUUID());
     await webhookQueue.add('deliver', {
+      eventId,
       url: sub.url,
-      event: record as Record<string, unknown>,
+      event: { ...record, eventId } as Record<string, unknown>,
       signingSecret: sub.signingSecret ?? undefined,
     });
   }
@@ -653,9 +655,11 @@ fastify.post<{ Params: { id: string } }>(
     }
 
     // Re-enqueue on the main webhook delivery queue
+    const eventId = job.data.eventId ?? `dlq:${job.id}`;
     await webhookQueue.add('deliver', {
+      eventId,
       url: job.data.url,
-      event: job.data.event,
+      event: { ...job.data.event, eventId } as Record<string, unknown>,
       signingSecret: job.data.signingSecret,
     });
 

@@ -5,6 +5,8 @@
  * and mapping functions used across bulk and single settlement tasks.
  */
 
+import BigNumber from 'bignumber.js';
+
 export interface SystemThresholds {
   minLimitDefault: string;
   maxLimitDefault: string;
@@ -66,4 +68,42 @@ export function getAssetPrecision(asset: string): AssetPrecisionConfig {
  */
 export function isSupportedAsset(asset: string): boolean {
   return asset.toUpperCase() in ASSET_PRECISION_MAPPINGS;
+}
+
+export interface SettlementInvariantInput {
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+  feeBps?: number;
+}
+
+export function assertSettlementInvariants({
+  grossAmount,
+  feeAmount,
+  netAmount,
+  feeBps,
+}: SettlementInvariantInput): void {
+  const gross = new BigNumber(grossAmount);
+  const fee = new BigNumber(feeAmount);
+  const net = new BigNumber(netAmount);
+
+  if (!gross.isFinite() || !fee.isFinite() || !net.isFinite()) {
+    throw new Error('Settlement invariant violated: amounts must be finite decimal values');
+  }
+
+  if (!fee.plus(net).isEqualTo(gross)) {
+    throw new Error('Settlement invariant violated: feeAmount + netAmount === grossAmount');
+  }
+
+  if (fee.isLessThan(0)) {
+    throw new Error('Settlement invariant violated: feeAmount must be >= 0');
+  }
+
+  if (net.isGreaterThan(gross)) {
+    throw new Error('Settlement invariant violated: netAmount must be <= grossAmount');
+  }
+
+  if (feeBps !== undefined && (feeBps < 0 || feeBps > 10_000)) {
+    throw new Error('Settlement invariant violated: feeBps must be within [0, 10000]');
+  }
 }

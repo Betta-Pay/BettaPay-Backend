@@ -21,6 +21,7 @@
 
 import BigNumber from 'bignumber.js';
 import type { Amount } from '@bettapay/shared-types';
+import { assertSettlementInvariants } from './settlement-properties.js';
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({ ROUNDING_MODE: BigNumber.ROUND_DOWN, EXPONENTIAL_AT: [-20, 40] });
@@ -143,10 +144,19 @@ export function computeSettlementAmounts(
     feeVersion: '1.0',
   };
 
-  return {
+  const result = {
     grossAmount: grossAmountStr,   // exact original — zero rounding
     feeAmount: feeStr,
     netAmount: netStr,
     feeSnapshot,
   };
+
+  assertSettlementInvariants({
+    grossAmount: result.grossAmount,
+    feeAmount: result.feeAmount,
+    netAmount: result.netAmount,
+    feeBps,
+  });
+
+  return result;
 }

@@ -64,6 +64,8 @@ import crypto from 'crypto';
 
 /** Payload for every webhook delivery job. */
 export interface WebhookJobData {
+  /** Stable, deterministic identifier for the source event. */
+  eventId?: string;
   /** The HTTPS (or HTTP in dev) URL to POST to. */
   url: string;
   /** Arbitrary JSON-serialisable event payload. */
@@ -206,10 +208,10 @@ export function createWebhookWorker(
   const worker = new Worker<WebhookJobData>(
     queueName,
     async (job) => {
-      const { url, event, signingSecret } = job.data;
+      const { url, event, signingSecret, eventId } = job.data;
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
-      logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+      logger?.info({ url, jobId: job.id, eventId, attempt }, '[webhook-delivery] Delivering webhook');
 
       const body = JSON.stringify({ event });
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };

@@ -62,9 +62,12 @@ export async function autoExpireAbandonedPayments(
         if (!webhookUrl) continue;
 
         try {
+          const eventId = `payment:${payment.id}:expired`;
           await webhookQueue.add('deliver', {
+            eventId,
             url: webhookUrl,
             event: {
+              eventId,
               type: 'payment.expired',
               paymentId: payment.id,
               merchantId: payment.merchantId,
