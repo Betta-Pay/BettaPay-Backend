@@ -53,6 +53,7 @@ import {
   createAuditLogger,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   startPrismaPoolMetricsCollector,
@@ -1709,13 +1710,27 @@ export async function discoverStartLedger(): Promise<number> {
 
 const start = async () => {
   try {
-    // #391 — wait for both dependencies before accepting traffic
     // #519 — log active feature flags at startup so the deployed flag set is
     // always visible in the service logs.
     logFeatureFlags(fastify.log);
 
-    await connectWithRetry(prisma, fastify.log);
-    await waitForRedis(redisHealth, fastify.log);
+    await runStartupChecks({
+      service: "indexer",
+      version: SERVICE_VERSION,
+      logger: fastify.log,
+      checks: [
+        {
+          name: "prisma",
+          fn: () => connectWithRetry(prisma, fastify.log),
+          critical: true,
+        },
+        {
+          name: "redis",
+          fn: () => waitForRedis(redisHealth, fastify.log),
+          critical: true,
+        },
+      ],
+    });
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redisHealth, fastify.log);

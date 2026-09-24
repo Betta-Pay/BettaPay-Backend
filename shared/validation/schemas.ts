@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { CurrencyCode } from "./currency.js";
+import { CurrencyCode, validateAmountPrecision } from "./currency.js";
 import { validateStellarAddress } from "@bettapay/stellar-utils";
-import { WebhookUrlSchema, WebhookHeadersSchema } from "./webhookSchema.js";
+import { WebhookHeadersSchema, createWebhookUrlSchema } from "./webhookSchema.js";
 
 // Entity schemas
 export const idSchema = z.string().min(1);
@@ -40,6 +40,19 @@ export const SettlementAmountString = AmountString.refine(
       "Settlement amount exceeds maximum allowed (1,000,000,000,000,000)",
   },
 );
+
+export const AMOUNT_PRECISION_ERROR = "Amount exceeds the maximum decimal places for this asset";
+
+function addAmountPrecisionIssue(
+  amount: string,
+  asset: string,
+  ctx: z.RefinementCtx,
+  path: (string | number)[] = ["amount"],
+): void {
+  if (!validateAmountPrecision(amount, asset)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path, message: AMOUNT_PRECISION_ERROR });
+  }
+}
 
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: "Invalid Stellar public key",
@@ -331,36 +344,55 @@ export const IdempotencyKeySchema = z
   .uuid({ message: "idempotencyKey must be a valid UUID" });
 export type IdempotencyKey = z.infer<typeof IdempotencyKeySchema>;
 
-export const MerchantSettings = z
-  .object({
-    feeBps: z.number().int().min(0).max(10000).optional(),
-    maxFeeBps: z.number().int().min(0).max(10000).optional(),
-    maxFeeThreshold: z
-      .string()
-      .regex(/^\d+(\.\d+)?$/, "maxFeeThreshold must be a numeric string")
-      .optional(),
-    webhookUrl: WebhookUrlSchema.optional(),
-    webhookHeaders: WebhookHeadersSchema.optional(),
-    preferredAsset: z.string().optional(),
-    autoSettle: z.boolean().optional(),
-    maxSettlementAmount: z.number().positive().optional(),
-    minSettlementAmount: z.number().positive().optional(),
-    dailySettlementLimit: z.number().positive().optional(),
-    // Referenced by the mutual-exclusivity `.refine` below but never
-    // declared on this schema — a pre-existing gap unrelated to #607/#608/
-    // #611/#624, fixed here only to unblock building this package (every
-    // other service imports it). `feeSchedules` isn't otherwise implemented
-    // anywhere in this codebase yet, so this is left as an untyped
-    // passthrough rather than guessing its intended shape.
-    feeSchedules: z.unknown().optional(),
-  })
-  .refine(
-    (data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined),
-    {
-      message: "Cannot provide both feeBps and feeSchedules",
-      path: ["feeSchedules"],
-    },
-  );
+/**
+ * Builds the MerchantSettings schema with env-aware webhook URL validation.
+ *
+ * Pass `nodeEnv` explicitly in tests or when the runtime env is injected;
+ * omit it (or pass `undefined`) in production entry-points where
+ * `process.env.NODE_ENV` is the source of truth.
+ *
+ * @envSpecific HTTPS is enforced for `webhookUrl` in production.
+ */
+export function createMerchantSettings(nodeEnv?: string) {
+  return z
+    .object({
+      feeBps: z.number().int().min(0).max(10000).optional(),
+      maxFeeBps: z.number().int().min(0).max(10000).optional(),
+      maxFeeThreshold: z
+        .string()
+        .regex(/^\d+(\.\d+)?$/, "maxFeeThreshold must be a numeric string")
+        .optional(),
+      // Uses createWebhookUrlSchema so HTTPS is enforced in production and
+      // HTTP is allowed in development/test — env-aware via envAwareSchema.
+      webhookUrl: createWebhookUrlSchema(nodeEnv).optional(),
+      webhookHeaders: WebhookHeadersSchema.optional(),
+      preferredAsset: z.string().optional(),
+      autoSettle: z.boolean().optional(),
+      maxSettlementAmount: z.number().positive().optional(),
+      minSettlementAmount: z.number().positive().optional(),
+      dailySettlementLimit: z.number().positive().optional(),
+      // Referenced by the mutual-exclusivity `.refine` below but never
+      // declared on this schema — a pre-existing gap unrelated to #607/#608/
+      // #611/#624, fixed here only to unblock building this package (every
+      // other service imports it). `feeSchedules` isn't otherwise implemented
+      // anywhere in this codebase yet, so this is left as an untyped
+      // passthrough rather than guessing its intended shape.
+      feeSchedules: z.unknown().optional(),
+    })
+    .refine(
+      (data) => !(data.feeBps !== undefined && data.feeSchedules !== undefined),
+      {
+        message: "Cannot provide both feeBps and feeSchedules",
+        path: ["feeSchedules"],
+      },
+    );
+}
+
+/**
+ * Static MerchantSettings schema — reads NODE_ENV from the process environment
+ * at import time, matching the behaviour of all other top-level schema exports.
+ */
+export const MerchantSettings = createMerchantSettings();
 
 export type MerchantSettings = z.infer<typeof MerchantSettings>;
 
@@ -375,15 +407,17 @@ export const CreateMerchantBody = z.object({
     .optional(),
 });
 
-export const CreatePaymentBody = z.object({
-  merchantId: StellarAddressSchema,
-  amount: z.string().regex(/^\d+(\.\d+)?$/, "amount must be a numeric string"),
-  asset: CurrencyCode,
-  convertTo: CurrencyCode.optional(),
-  payerId: z.string().optional(),
-  reference: z.string().optional(),
-  idempotencyKey: IdempotencyKeySchema.optional(),
-});
+export const CreatePaymentBody = z
+  .object({
+    merchantId: StellarAddressSchema,
+    amount: AmountString,
+    asset: CurrencyCode,
+    convertTo: CurrencyCode.optional(),
+    payerId: z.string().optional(),
+    reference: z.string().optional(),
+    idempotencyKey: IdempotencyKeySchema.optional(),
+  })
+  .superRefine((data, ctx) => addAmountPrecisionIssue(data.amount, data.asset, ctx));
 
 export const CreateSettlementBody = z
   .object({
@@ -400,6 +434,12 @@ export const CreateSettlementBody = z
       .optional(),
     idempotencyKey: IdempotencyKeySchema.optional(),
   })
+  .superRefine((data, ctx) => {
+    if (data.amount && data.asset) addAmountPrecisionIssue(data.amount, data.asset, ctx);
+    data.items?.forEach((item, index) =>
+      addAmountPrecisionIssue(item.amount, item.asset, ctx, ["items", index, "amount"]),
+    );
+  })
   .refine(
     (data) => {
       // Either single amount/asset OR items array must be provided, not both
@@ -412,15 +452,21 @@ export const CreateSettlementBody = z
     },
   );
 
-export const BulkSettlementBody = z.object({
-  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/, "Invalid merchantId"),
-  settlements: z.array(
-    z.object({
-      amount: SettlementAmountString,
-      asset: CurrencyCode,
-    }),
-  ),
-});
+export const BulkSettlementBody = z
+  .object({
+    merchantId: z.string().regex(/^[A-Za-z0-9_]+$/, "Invalid merchantId"),
+    settlements: z.array(
+      z.object({
+        amount: SettlementAmountString,
+        asset: CurrencyCode,
+      }),
+    ),
+  })
+  .superRefine((data, ctx) => {
+    data.settlements.forEach((item, index) =>
+      addAmountPrecisionIssue(item.amount, item.asset, ctx, ["settlements", index, "amount"]),
+    );
+  });
 
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
@@ -502,31 +548,49 @@ export function isValidTransition(
 // Per-merchant fee rule configuration. feeBps is basis points (1% = 100 bps),
 // capped at 10000 (100%). Unknown keys are stripped; the route merges these into
 // the merchant's existing settings rather than replacing them.
-export const UpdateMerchantSettingsBody = z.object({
-  feeBps: z.number().int().min(0).max(10000).optional(),
-  maxFeeBps: z.number().int().min(0).max(10000).optional(),
-  maxFeeThreshold: z
-    .string()
-    .regex(/^\d+(\.\d+)?$/, "maxFeeThreshold must be a numeric string")
-    .optional(),
-  tier: z.string().optional(),
-  minSettlementAmount: z
-    .string()
-    .regex(/^\d+(\.\d+)?$/, "minSettlementAmount must be a numeric string")
-    .optional(),
-  maxSettlementAmount: z
-    .string()
-    .regex(/^\d+(\.\d+)?$/, "maxSettlementAmount must be a numeric string")
-    .optional(),
-  dailySettlementLimit: z
-    .string()
-    .regex(/^\d+(\.\d+)?$/, "dailySettlementLimit must be a numeric string")
-    .optional(),
-  webhookUrl: WebhookUrlSchema.optional(),
-  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
-  // settlement webhook delivery attempt, including retries (#569).
-  webhookHeaders: WebhookHeadersSchema.optional(),
-});
+
+/**
+ * Builds the UpdateMerchantSettingsBody schema with env-aware webhook URL
+ * validation. Pass `nodeEnv` explicitly in tests; omit in production.
+ *
+ * @envSpecific HTTPS is enforced for `webhookUrl` in production.
+ */
+export function createUpdateMerchantSettingsBody(nodeEnv?: string) {
+  return z.object({
+    feeBps: z.number().int().min(0).max(10000).optional(),
+    maxFeeBps: z.number().int().min(0).max(10000).optional(),
+    maxFeeThreshold: z
+      .string()
+      .regex(/^\d+(\.\d+)?$/, "maxFeeThreshold must be a numeric string")
+      .optional(),
+    tier: z.string().optional(),
+    minSettlementAmount: z
+      .string()
+      .regex(/^\d+(\.\d+)?$/, "minSettlementAmount must be a numeric string")
+      .optional(),
+    maxSettlementAmount: z
+      .string()
+      .regex(/^\d+(\.\d+)?$/, "maxSettlementAmount must be a numeric string")
+      .optional(),
+    dailySettlementLimit: z
+      .string()
+      .regex(/^\d+(\.\d+)?$/, "dailySettlementLimit must be a numeric string")
+      .optional(),
+    // Uses createWebhookUrlSchema so HTTPS is enforced in production and
+    // HTTP is allowed in development/test — env-aware via envAwareSchema.
+    webhookUrl: createWebhookUrlSchema(nodeEnv).optional(),
+    // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+    // settlement webhook delivery attempt, including retries (#569).
+    webhookHeaders: WebhookHeadersSchema.optional(),
+  });
+}
+
+/**
+ * Static UpdateMerchantSettingsBody schema — reads NODE_ENV from the process
+ * environment at import time.
+ */
+export const UpdateMerchantSettingsBody = createUpdateMerchantSettingsBody();
+export type UpdateMerchantSettingsBody = z.infer<typeof UpdateMerchantSettingsBody>;
 
 export const UpdateMerchantNameBody = z.object({
   name: z.string().min(2, "Name must be at least 2 characters"),
@@ -664,9 +728,6 @@ export type WebhookTestPayload = z.infer<typeof WebhookTestPayloadSchema>;
 export type WebhookTestResult = z.infer<typeof WebhookTestResultSchema>;
 export type WebhookSubscription = z.infer<typeof WebhookSubscriptionSchema>;
 export type UpdatePaymentStatusBody = z.infer<typeof UpdatePaymentStatusBody>;
-export type UpdateMerchantSettingsBody = z.infer<
-  typeof UpdateMerchantSettingsBody
->;
 
 // ─── Indexer cleanup query ─────────────────────────────────────────────────────
 

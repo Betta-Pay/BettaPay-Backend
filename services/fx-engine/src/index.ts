@@ -36,15 +36,20 @@ import {
   ErrorCodes,
   createLoggerOptions,
   registerTracing,
-  CurrencyCode,
   buildFxEngineHealthResponse,
   readServiceVersion,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   RateOverrideBody,
 } from "@bettapay/validation";
+import {
+  createHistoryQuerySchema,
+  createQuoteQuerySchema,
+  createVerifyQuoteBodySchema,
+} from "./validation.js";
 
 const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? "3002");
@@ -1260,26 +1265,7 @@ fastify.post<{ Body: unknown }>(
 
 // ── GET /api/quote (issues #48 & #49) ────────────────────────────────────
 
-const QuoteQuerySchema = z.object({
-  from: CurrencyCode.default("USDC"),
-  to: CurrencyCode.default("NGN"),
-  amount: z
-    .string()
-    .regex(/^\d+(\.\d+)?$/, "amount must be a numeric string")
-    .default("1"),
-  slippageBps: z
-    .string()
-    .regex(/^\d+$/, "slippageBps must be a non-negative integer")
-    // Issue #620: without an upper bound, a merchant could submit an
-    // arbitrarily large slippageBps (e.g. 10000 = 100%) and get silently
-    // clamped to env.MAX_SLIPPAGE_BPS below with no error signal — the
-    // request looked accepted while their actual tolerance was ignored.
-    // Reject out-of-range values outright instead.
-    .refine((val) => parseInt(val, 10) <= 1000, {
-      message: "slippageBps must be between 0 and 1000",
-    })
-    .optional(),
-});
+const QuoteQuerySchema = createQuoteQuerySchema(env.NODE_ENV);
 
 fastify.get(
   "/api/quote",
@@ -1449,11 +1435,7 @@ fastify.get(
 
 // ── GET /api/rates/history (issue #56) ───────────────────────────────────
 
-const HistoryQuerySchema = z.object({
-  from: CurrencyCode,
-  to: CurrencyCode,
-  at: z.string().optional(), // ISO 8601; defaults to now
-});
+const HistoryQuerySchema = createHistoryQuerySchema(env.NODE_ENV);
 
 fastify.get(
   "/api/rates/history",
@@ -1575,9 +1557,7 @@ fastify.get(
 
 // ── POST /api/quote/verify (issue #57) ───────────────────────────────────
 
-const VerifyQuoteBody = z.object({
-  quoteId: z.string().min(1),
-});
+const VerifyQuoteBody = createVerifyQuoteBodySchema(env.NODE_ENV);
 
 interface VerifyQuoteRouteBody {
   quoteId?: unknown;
@@ -1728,8 +1708,26 @@ const metricsServer = startMetricsServer({
 
 const start = async () => {
   try {
-    // #391 — wait for Redis before doing anything else
-    await waitForRedis(redis, fastify.log);
+    await runStartupChecks({
+      service: "fx-engine",
+      version: SERVICE_VERSION,
+      logger: fastify.log,
+      checks: [
+        {
+          name: "redis",
+          fn: () => waitForRedis(redis, fastify.log),
+          critical: true,
+        },
+        {
+          name: "bullmq",
+          fn: async () => {
+            const counts = await cleanupQueue.getJobCounts();
+            fastify.log.info({ counts }, "BullMQ queue reachable");
+          },
+          critical: true,
+        },
+      ],
+    });
 
     // Warm up cache from latest Redis snapshot (#232)
     await warmupCacheFromRedis();

@@ -52,6 +52,32 @@ test('validation: POST /api/payments validates amount format', async (t) => {
   t.end();
 });
 
+test('validation: POST /api/payments rejects amounts beyond asset precision with 422', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
+      amount: '1.123456789012345678901234567890',
+      asset: 'USDC',
+    },
+  });
+
+  t.equal(res.statusCode, 422, 'should reject 30-decimal USDC amount with 422');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.ok(
+    body.error.details.some((detail: any) => detail.path.includes('amount')),
+    'should report the precision issue on amount',
+  );
+  await app.close();
+  t.end();
+});
+
 test('validation: POST /api/payments validates asset format', async (t) => {
   const { app } = await createTestApp();
   const token = generateTestJwt(app);

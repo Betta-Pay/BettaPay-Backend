@@ -50,6 +50,7 @@ import {
   registerTracing,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   logFeatureFlags,
@@ -58,6 +59,7 @@ import {
   decryptField,
   encryptSensitiveFields,
   decryptSensitiveFields,
+  createValidationContext,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -85,12 +87,13 @@ import {
 import {
   CreateMerchantBody,
   CreatePaymentBody,
+  AMOUNT_PRECISION_ERROR,
   CreateSettlementBody,
   CreateSupportedAssetBody,
   UpdateSupportedAssetBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
-  UpdateMerchantSettingsBody,
+  createUpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
   WalletVerifyBody,
   AuthIpScoreQuery,
@@ -205,9 +208,13 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
   return (key as string).trim() || null;
 }
 
-const isProduction = process.env.NODE_ENV === "production";
+// Derive isProduction via the shared createValidationContext utility so
+// env-based branching is consistent with the rest of the validation layer
+// (cors.ts, webhookSchema.ts) rather than being duplicated ad-hoc here.
+const { isProduction } = createValidationContext();
 
 const env = validateEnvOrExit(process.env);
+const updateMerchantSettingsBody = createUpdateMerchantSettingsBody(env.NODE_ENV);
 const PORT = Number(process.env.PORT ?? "3000");
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
@@ -2133,7 +2140,7 @@ fastify.get('/api/admin/auth/ip-score', {
   // settings.feeBps from here when computing fees.
   fastify.patch<{
     Params: { id: string };
-    Body: z.infer<typeof UpdateMerchantSettingsBody>;
+    Body: z.infer<typeof updateMerchantSettingsBody>;
   }>(
     "/api/merchants/:id/settings",
     {
@@ -2142,7 +2149,7 @@ fastify.get('/api/admin/auth/ip-score', {
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
     async (request, reply) => {
-      const d = UpdateMerchantSettingsBody.parse(request.body);
+      const d = updateMerchantSettingsBody.parse(request.body);
 
       // Reject attempts to set kycStatus via the merchant settings endpoint
       if ("kycStatus" in (request.body as Record<string, unknown>)) {
@@ -2251,7 +2258,28 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       // ── 1. Parse and validate request body ──────────────────────────────────────
-      const d = CreatePaymentBody.parse(request.body);
+      let d: z.infer<typeof CreatePaymentBody>;
+      try {
+        d = CreatePaymentBody.parse(request.body);
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          const isPrecisionError = err.errors.some(
+            (issue) => issue.message === AMOUNT_PRECISION_ERROR,
+          );
+          return reply
+            .code(isPrecisionError ? 422 : 400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.VALIDATION_ERROR,
+                isPrecisionError
+                  ? "Amount has too many decimal places for the selected asset"
+                  : "Invalid payment request",
+                err.errors,
+              ),
+            );
+        }
+        throw err;
+      }
 
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
       const merchant = await prisma.merchant.findFirst({
@@ -3378,9 +3406,23 @@ const start = async () => {
     const prisma = getDefaultPrisma();
     const redis = sharedRedis!;
 
-    // #391 — wait for dependencies before accepting traffic
-    await connectWithRetry(prisma, app.log);
-    await waitForRedis(redis, app.log);
+    await runStartupChecks({
+      service: "api-gateway",
+      version: SERVICE_VERSION,
+      logger: app.log,
+      checks: [
+        {
+          name: "prisma",
+          fn: () => connectWithRetry(prisma, app.log),
+          critical: true,
+        },
+        {
+          name: "redis",
+          fn: () => waitForRedis(redis, app.log),
+          critical: true,
+        },
+      ],
+    });
 
     // #314 — warmup downstream services with unique trace IDs
     await warmupDownstreamServices(env, app.log);

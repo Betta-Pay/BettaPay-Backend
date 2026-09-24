@@ -3,6 +3,7 @@ import { IncomingMessage } from 'http';
 import { randomUUID } from 'crypto';
 import { FastifyRequest } from 'fastify';
 import { resolveAllowedOrigins } from './cors.js';
+import { createValidationContext } from './envAwareSchema.js';
 
 export * from './schemas.js';
 export * from './currency.js';
@@ -116,6 +117,14 @@ export const EnvSchema = z
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default("info"),
+
+    // Fraction of inbound requests that should be marked for trace sampling.
+    // Route config can override this value for targeted debugging.
+    TRACE_SAMPLE_RATE: z
+      .string()
+      .default("1")
+      .transform((value) => Number(value))
+      .pipe(z.number().finite().min(0).max(1)),
 
     // Fees — default basis points applied when a merchant has no custom fee rule.
     FEES_DEFAULT_BPS: z
@@ -381,7 +390,12 @@ export const EnvSchema = z
       .string()
       .transform((s) => parseInt(s, 10))
       .default("30")
-      .refine((val) => process.env.NODE_ENV !== "production" || val >= 1, {
+      .refine((val) => {
+        // Use createValidationContext so env-aware branching is centralised
+        // rather than duplicated inline with raw process.env access.
+        const { isProduction } = createValidationContext();
+        return !isProduction || val >= 1;
+      }, {
         message: "EVENT_RETENTION_DAYS must be >= 1 in production",
       }),
 

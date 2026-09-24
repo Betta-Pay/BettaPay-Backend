@@ -30,6 +30,31 @@ export interface TraceContext {
   traceId: string;
 }
 
+export const DEFAULT_TRACE_SAMPLE_RATE = 1;
+
+export interface TracingOptions {
+  sampleRate?: number;
+  random?: () => number;
+}
+
+export function resolveTraceSampleRate(value: unknown): number {
+  if (value === undefined || value === null || value === '') {
+    return DEFAULT_TRACE_SAMPLE_RATE;
+  }
+
+  const rate = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(rate) && rate >= 0 && rate <= 1
+    ? rate
+    : DEFAULT_TRACE_SAMPLE_RATE;
+}
+
+export function shouldSampleTrace(
+  sampleRate: number,
+  random: () => number = Math.random,
+): boolean {
+  return random() < resolveTraceSampleRate(sampleRate);
+}
+
 /**
  * Extract the trace context from incoming headers, generating fresh ids when
  * absent (the gateway edge case). `requestId` and `traceId` are independent so
@@ -64,7 +89,10 @@ export function propagateTracingHeaders(
  * consistent), echo `x-trace-id` back on the response, and bind both ids to the
  * request logger.
  */
-export function registerTracing(fastify: FastifyInstance): void {
+export function registerTracing(
+  fastify: FastifyInstance,
+  options: TracingOptions = {},
+): void {
   fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     // Honour a forwarded request id; otherwise fall back to Fastify's request.id.
     const requestId = firstHeader(request.headers[REQUEST_ID_HEADER]) || request.id;
@@ -74,7 +102,16 @@ export function registerTracing(fastify: FastifyInstance): void {
     request.headers[TRACE_ID_HEADER] = traceId;
     (request as FastifyRequest & { traceId: string }).traceId = traceId;
 
+    const routeConfig = request.routeOptions?.config as
+      | { traceSampleRate?: unknown }
+      | undefined;
+    const sampleRate = resolveTraceSampleRate(
+      routeConfig?.traceSampleRate ?? options.sampleRate ?? process.env.TRACE_SAMPLE_RATE,
+    );
+    const sampled = shouldSampleTrace(sampleRate, options.random);
+    (request as FastifyRequest & { traceSampled: boolean }).traceSampled = sampled;
+
     reply.header(TRACE_ID_HEADER, traceId);
-    request.log = request.log.child({ requestId, traceId });
+    request.log = request.log.child({ requestId, traceId, traceSampled: sampled });
   });
 }
