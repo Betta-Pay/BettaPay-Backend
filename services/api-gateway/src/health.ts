@@ -49,7 +49,9 @@ export async function buildGatewayHealthResponse(
     startTime,
     dependencies: [postgresql],
     upstream: [fxEngine, settlementEngine, indexer],
-    criticalDependencyNames: ['postgresql'],
+    // Readiness contract: the gateway cannot serve payments/quotes without its
+    // database AND its downstream engines, so all of them gate the 503.
+    criticalDependencyNames: ['postgresql', 'fx-engine', 'settlement-engine', 'indexer'],
   });
 
   // Include abandoned payments count in non-test environments
@@ -89,6 +91,14 @@ export async function buildAggregatedHealthResponse(
 export function registerGatewayHealthRoutes(options: RegisterGatewayHealthRoutesOptions): void {
   const { fastify } = options;
 
+  // Liveness: always 200 when the process is up — load balancers use this
+  // to decide whether to keep routing traffic to this instance.
+  fastify.get('/api/health/live', { config: { rateLimit: false } }, async (_request, reply) => {
+    return reply.code(200).send({ status: 'alive', service: 'api-gateway' });
+  });
+
+  // Readiness: returns 503 when critical dependents (DB, upstream engines) are
+  // down so the load balancer stops sending traffic to a degraded gateway.
   fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
     const health = await buildGatewayHealthResponse(options);
     const statusCode = health.status === 'unhealthy' ? 503 : 200;

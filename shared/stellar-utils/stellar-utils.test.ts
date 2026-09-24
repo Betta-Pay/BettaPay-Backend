@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import { buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
 
-const VALID_KEY = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
+const VALID_KEY = 'GCCTLHSAZTFDGPG4IT4HHGOUFHSX6K4VUEKXCGWP2ZWG2U3FUO4HOAZO';
 
 test('toStellarAmount', async (t) => {
   await t.test('converts an integer string to stroops', () => {

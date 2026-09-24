@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
@@ -31,8 +31,8 @@ test('bulk-extensive: validation loop for various positive amounts', async (t) =
     
     t.equal(res.statusCode, 201, `amount ${amount} should pass standard validation`);
     const body = JSON.parse(res.body);
-    t.equal(body.created, 1);
-    t.equal(body.errors.length, 0);
+    t.equal(body.data.created, 1);
+    t.equal(body.data.errors.length, 0);
   }
   t.end();
 });
@@ -57,9 +57,9 @@ test('bulk-extensive: validation loop for various invalid amounts', async (t) =>
 
     t.equal(res.statusCode, 201, `amount ${amount} should process with validation error`);
     const body = JSON.parse(res.body);
-    t.equal(body.created, 0);
-    t.equal(body.errors.length, 1);
-    t.equal(body.errors[0].reason, 'amount must be greater than zero');
+    t.equal(body.data.created, 0);
+    t.equal(body.data.errors.length, 1);
+    t.equal(body.data.errors[0].reason, 'amount must be greater than zero');
   }
   t.end();
 });
@@ -84,8 +84,8 @@ test('bulk-extensive: batch limit checks on border value 100', async (t) => {
 
   t.equal(res.statusCode, 201, 'should accept exactly 100 items');
   const body = JSON.parse(res.body);
-  t.equal(body.total, 100);
-  t.equal(body.created, 100);
+  t.equal(body.data.total, 100);
+  t.equal(body.data.created, 100);
   t.end();
 });
 
@@ -109,7 +109,7 @@ test('bulk-extensive: merchant rules fallback values verification', async (t) =>
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.created, 1, 'should fallback to default settings gracefully');
+  t.equal(body.data.created, 1, 'should fallback to default settings gracefully');
   t.end();
 });
 
@@ -154,5 +154,13 @@ test('bulk-extensive: batch tracking overall status transitions validation', asy
   });
   t.equal(JSON.parse(res3.body).status, 'failed');
 
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

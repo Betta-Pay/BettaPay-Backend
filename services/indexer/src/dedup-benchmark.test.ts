@@ -82,6 +82,79 @@ test('dedup: batch findMany result mapping mirrors production code', (t) => {
   t.end();
 });
 
+// ── Functional Deduplication Verification (Issue #508) ─────────────────────────
+
+test('functional: batch stream filtering suppresses all duplicate event deliveries', (t) => {
+  const existingDbEvents = [
+    { stellarId: 'evt-db-001' },
+    { stellarId: 'evt-db-002' },
+    { stellarId: 'evt-db-003' },
+  ];
+  const existingSet = new Set(existingDbEvents.map((e) => e.stellarId));
+
+  const incomingEvents = [
+    { stellarId: 'evt-db-001', payload: 'dup from DB 1' },
+    { stellarId: 'evt-new-101', payload: 'fresh event 1' },
+    { stellarId: 'evt-db-002', payload: 'dup from DB 2' },
+    { stellarId: 'evt-new-102', payload: 'fresh event 2' },
+    { stellarId: 'evt-new-101', payload: 'intra-batch duplicate of 101' },
+    { stellarId: 'evt-new-103', payload: 'fresh event 3' },
+    { stellarId: 'evt-db-003', payload: 'dup from DB 3' },
+    { stellarId: 'evt-new-102', payload: 'intra-batch duplicate of 102' },
+  ];
+
+  const delivered: Array<{ stellarId: string; payload: string }> = [];
+  const suppressed: string[] = [];
+  const seenInBatch = new Set<string>();
+
+  for (const event of incomingEvents) {
+    if (existingSet.has(event.stellarId) || seenInBatch.has(event.stellarId)) {
+      suppressed.push(event.stellarId);
+      continue;
+    }
+    seenInBatch.add(event.stellarId);
+    delivered.push(event);
+  }
+
+  t.equal(delivered.length, 3, 'exactly 3 unique new events were delivered');
+  t.equal(suppressed.length, 5, 'exactly 5 duplicate events were suppressed');
+  t.deepEqual(
+    delivered.map((e) => e.stellarId),
+    ['evt-new-101', 'evt-new-102', 'evt-new-103'],
+    'delivered events match expected unique fresh event IDs in order',
+  );
+  t.deepEqual(
+    suppressed,
+    ['evt-db-001', 'evt-db-002', 'evt-new-101', 'evt-db-003', 'evt-new-102'],
+    'suppressed list captures both DB duplicates and intra-batch duplicates',
+  );
+  t.end();
+});
+
+test('functional: force replay flag bypasses dedup suppression', (t) => {
+  const existingSet = new Set(['evt-db-001', 'evt-db-002']);
+  const incomingEvents = ['evt-db-001', 'evt-db-002', 'evt-new-003'];
+
+  // 1. Standard mode (force = false): duplicate deliveries suppressed
+  const standardDelivered: string[] = [];
+  for (const id of incomingEvents) {
+    if (existingSet.has(id)) continue;
+    standardDelivered.push(id);
+  }
+  t.deepEqual(standardDelivered, ['evt-new-003'], 'standard mode delivers only new non-duplicate events');
+
+  // 2. Force mode (force = true): delivers all events regardless of pre-existing records
+  const force = true;
+  const forceDelivered: string[] = [];
+  const activeExistingSet = force ? new Set<string>() : existingSet;
+  for (const id of incomingEvents) {
+    if (activeExistingSet.has(id)) continue;
+    forceDelivered.push(id);
+  }
+  t.deepEqual(forceDelivered, ['evt-db-001', 'evt-db-002', 'evt-new-003'], 'force mode delivers all events for replay');
+  t.end();
+});
+
 // ── Benchmark: batch vs individual query simulation ────────────────────────────
 
 function simulateBatchLookup(ids: string[], existingSet: Set<string>): number {

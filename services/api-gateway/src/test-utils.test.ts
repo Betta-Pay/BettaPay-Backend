@@ -1,5 +1,162 @@
 import test from 'tape';
-import { createMockPrisma, generateTestJwt, createTestApp } from './test-utils.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import {
+  createMockPrisma,
+  generateTestJwt,
+  createTestApp,
+  createMockSettlementClient,
+  createMockFxClient,
+  createMockIndexerClient,
+} from './test-utils.js';
+
+// ── Centralized mock-client builders (issue #557) ───────────────────────────
+
+test('mock builders: settlement client exposes the real client surface', (t) => {
+  const client = createMockSettlementClient();
+  t.equal(typeof client.createSettlement, 'function', 'createSettlement is a function');
+  t.end();
+});
+
+test('mock builders: settlement client has a consistent default response', async (t) => {
+  const first = await createMockSettlementClient().createSettlement({
+    merchantId: 'merch_1',
+    grossAmount: '50.00',
+    asset: 'USDC',
+  });
+  const second = await createMockSettlementClient().createSettlement({
+    merchantId: 'merch_1',
+    grossAmount: '50.00',
+    asset: 'USDC',
+  });
+
+  t.equal(first.status, 201, 'default status is 201');
+  t.equal(first.contentType, 'application/json', 'default content type is json');
+  t.equal(first.body.data.id, 'set_mock_1', 'stable mock settlement id');
+  t.equal(first.body.data.merchantId, 'merch_1', 'echoes merchantId');
+  // Strip the volatile createdAt timestamp before comparing consistency.
+  const { createdAt: _a, ...firstRest } = first.body.data;
+  const { createdAt: _b, ...secondRest } = second.body.data;
+  t.same(secondRest, firstRest, 'defaults are consistent across instances');
+  t.end();
+});
+
+test('mock builders: settlement client honours overrides', async (t) => {
+  const client = createMockSettlementClient({
+    createSettlement: async () => ({ status: 504, body: { error: 'down' }, contentType: 'application/json' }),
+  });
+  const result = await client.createSettlement({});
+  t.equal(result.status, 504, 'override is used');
+  t.end();
+});
+
+test('mock builders: fx client exposes getQuote with a consistent default quote', async (t) => {
+  const client = createMockFxClient();
+  t.equal(typeof client.getQuote, 'function', 'getQuote is a function');
+
+  const quote = await client.getQuote({ from: 'USDC', to: 'NGN', amount: '10.00' });
+  t.ok(quote, 'returns a quote');
+  t.equal(quote?.quoteId, 'quote_mock_1', 'stable mock quote id');
+  t.equal(quote?.from, 'USDC', 'echoes from');
+  t.equal(quote?.to, 'NGN', 'echoes to');
+  t.equal(quote?.amount, '10.00', 'echoes amount');
+  t.ok(quote?.result, 'result is present');
+  t.ok(quote?.rate, 'rate is present');
+  t.ok(quote?.cachedAt && quote?.expiresAt, 'timestamps are present');
+  t.end();
+});
+
+test('mock builders: fx client defaults are deterministic (no fixture drift)', async (t) => {
+  const a = await createMockFxClient().getQuote({ from: 'USDC', to: 'NGN', amount: '10.00' });
+  const b = await createMockFxClient().getQuote({ from: 'USDC', to: 'NGN', amount: '10.00' });
+  t.same(b, a, 'two instances produce the identical quote');
+  t.end();
+});
+
+test('mock builders: indexer client exposes getPaymentEvents with empty default', async (t) => {
+  const client = createMockIndexerClient();
+  t.equal(typeof client.getPaymentEvents, 'function', 'getPaymentEvents is a function');
+  const events = await client.getPaymentEvents('merchant_1');
+  t.same(events, [], 'defaults to no events (indexer empty)');
+  t.end();
+});
+
+test('consistency: createTestApp wires the centralized mock clients by default', async (t) => {
+  const { app } = await createTestApp({}, {
+    merchants: [
+      { id: 'merch_1', settings: {} },
+      { id: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H', settings: {}, deletedAt: null, status: 'active' },
+    ],
+    supportedAssets: [{ code: 'USDC', contractId: 'C1', decimals: 6, name: 'USD Coin', isActive: true }],
+  });
+
+  // Default fx client backs payment creation with convertTo
+  const paymentRes = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${generateTestJwt(app)}` },
+    payload: {
+      merchantId: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H',
+      amount: '10.00',
+      asset: 'USDC',
+      convertTo: 'NGN',
+    },
+  });
+  t.equal(paymentRes.statusCode, 201, 'payment creation succeeds with default fx mock');
+  const paymentBody = JSON.parse(paymentRes.body);
+  t.equal(paymentBody.data.fxQuote.quoteId, 'quote_mock_1', 'default fx mock quote is served');
+
+  // Default settlement client backs settlement creation
+  const settlementRes = await app.inject({
+    method: 'POST',
+    url: '/api/settlements',
+    headers: { authorization: `Bearer ${generateTestJwt(app)}` },
+    payload: {
+      merchantId: 'merch_1',
+      items: [{ amount: '50.00', asset: 'USDC' }],
+    },
+  });
+  t.equal(settlementRes.statusCode, 201, 'settlement creation succeeds with default settlement mock');
+  const settlementBody = JSON.parse(settlementRes.body);
+  t.equal(settlementBody.data.id, 'set_mock_1', 'default settlement mock response is served');
+
+  // Default indexer client enriches payment queries with an empty event list
+  const eventsRes = await app.inject({ method: 'GET', url: '/api/payments/nope?includeEvents=true' });
+  t.equal(eventsRes.statusCode, 404, 'unrelated 404 still works');
+
+  await app.close();
+  t.end();
+});
+
+test('consistency: test files do not redefine inline client mocks (single source of truth)', (t) => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const testFiles = fs
+    .readdirSync(here)
+    .filter((f) => f.endsWith('.test.ts'))
+    .filter((f) => f !== 'test-utils.test.ts');
+
+  // Inline mock client declarations that must only ever live in test-utils.ts.
+  const inlineDeclPatterns = [
+    /const\s+mockSettlementClient\s*=\s*{/,
+    /const\s+mockFxClient\s*=\s*{/,
+    /const\s+mockIndexerClient\s*=\s*{/,
+    /const\s+indexer\s*:\s*IndexerClient\s*=\s*{/,
+  ];
+
+  const offenders: string[] = [];
+  for (const file of testFiles) {
+    const source = fs.readFileSync(path.join(here, file), 'utf8');
+    for (const pattern of inlineDeclPatterns) {
+      if (pattern.test(source)) {
+        offenders.push(`${file} matches ${pattern}`);
+      }
+    }
+  }
+
+  t.same(offenders, [], 'no test file defines its own mock clients — use the builders in test-utils.ts');
+  t.end();
+});
 
 test('mockPrisma: payment model - findUnique returns correct record', async (t) => {
   const initialPayments = [
@@ -204,7 +361,7 @@ test('mockPrisma: $transaction executes block successfully', async (t) => {
 });
 
 test('test-utils: createTestApp setup app instance with default mockPrisma', async (t) => {
-  const { app, mockPrisma } = createTestApp();
+  const { app, mockPrisma } = await createTestApp();
   t.ok(app, 'app should be defined');
   t.ok(mockPrisma, 'mockPrisma should be defined');
   await app.close();
@@ -212,7 +369,7 @@ test('test-utils: createTestApp setup app instance with default mockPrisma', asy
 });
 
 test('test-utils: generateTestJwt returns valid signed token', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app, { merchantId: 'm100', ownerId: 'owner100' });
   t.ok(token, 'should return a token');
 

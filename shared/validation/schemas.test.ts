@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import fc from 'fast-check';
 import {
   AmountString,
   CreateMerchantBody,
@@ -14,7 +15,11 @@ import {
   merchantSchema,
   paymentSchema,
   walletSchema,
+  PAYMENT_STATUS_TRANSITIONS,
+  SETTLEMENT_STATUS_TRANSITIONS,
+  isValidTransition,
 } from './schemas.js';
+import { CurrencyCode, validateAmountPrecision, ASSET_DECIMALS } from './currency.js';
 
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
@@ -43,6 +48,105 @@ test('UpdateMerchantSettingsBody webhookUrl validation', async (t) => {
     const long = 'https://example.com/' + 'a'.repeat(2048);
     const result = UpdateMerchantSettingsBody.safeParse({ webhookUrl: long });
     assert.strictEqual(result.success, false);
+  });
+});
+
+// ─── Property-based tests for state machine transitions ─────────────────────
+test('property: payment status transitions are valid and terminal states are absorbing', async () => {
+  const paymentStates = Object.keys(PAYMENT_STATUS_TRANSITIONS);
+
+  fc.assert(
+    fc.property(
+      fc.constantFrom(...paymentStates),
+      fc.array(fc.constantFrom(...paymentStates), { maxLength: 20 }),
+      (start, seq) => {
+        let cur = start;
+        for (const target of seq) {
+          const allowed = PAYMENT_STATUS_TRANSITIONS[cur] ?? [];
+          const valid = isValidTransition(PAYMENT_STATUS_TRANSITIONS, cur, target);
+          if (valid !== allowed.includes(target)) return false;
+          if (valid) cur = target;
+          // If current is terminal, ensure no transitions are accepted
+          const curAllowed = PAYMENT_STATUS_TRANSITIONS[cur] ?? [];
+          if (curAllowed.length === 0) {
+            for (const s of paymentStates) {
+              if (isValidTransition(PAYMENT_STATUS_TRANSITIONS, cur, s)) return false;
+            }
+          }
+        }
+        return true;
+      }
+    ),
+    { numRuns: 1000 }
+  );
+});
+
+test('property: settlement status transitions are valid and terminal states are absorbing', async () => {
+  const settlementStates = Object.keys(SETTLEMENT_STATUS_TRANSITIONS);
+
+  fc.assert(
+    fc.property(
+      fc.constantFrom(...settlementStates),
+      fc.array(fc.constantFrom(...settlementStates), { maxLength: 20 }),
+      (start, seq) => {
+        let cur = start;
+        for (const target of seq) {
+          const allowed = SETTLEMENT_STATUS_TRANSITIONS[cur] ?? [];
+          const valid = isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, cur, target);
+          if (valid !== allowed.includes(target)) return false;
+          if (valid) cur = target;
+          const curAllowed = SETTLEMENT_STATUS_TRANSITIONS[cur] ?? [];
+          if (curAllowed.length === 0) {
+            for (const s of settlementStates) {
+              if (isValidTransition(SETTLEMENT_STATUS_TRANSITIONS, cur, s)) return false;
+            }
+          }
+        }
+        return true;
+      }
+    ),
+    { numRuns: 1000 }
+  );
+});
+
+// ─── Shared status vocabulary consistency (#473) ──────────────────────────────
+// PAYMENT_STATUS_TRANSITIONS / SETTLEMENT_STATUS_TRANSITIONS are the single
+// status map consumed by the api-gateway and the settlement-engine (which
+// re-exports SETTLEMENT_STATUS_TRANSITIONS as SettlementStatusTransitions).
+// These assertions fail the moment the shared vocabulary drifts from the
+// canonical Prisma enums or stops being internally closed.
+test('shared status maps match the canonical status vocabulary and are self-consistent', async (t) => {
+  const PAYMENT_STATUSES = ['cancelled', 'completed', 'failed', 'initiated'];
+  const SETTLEMENT_STATUSES = ['completed', 'failed', 'pending', 'processing'];
+
+  await t.test('payment status vocabulary is exactly the Prisma PaymentStatus set', () => {
+    assert.deepStrictEqual(Object.keys(PAYMENT_STATUS_TRANSITIONS).sort(), PAYMENT_STATUSES);
+  });
+
+  await t.test('settlement status vocabulary is exactly the Prisma SettlementStatus set', () => {
+    assert.deepStrictEqual(Object.keys(SETTLEMENT_STATUS_TRANSITIONS).sort(), SETTLEMENT_STATUSES);
+  });
+
+  await t.test('every payment transition target is itself a known status', () => {
+    for (const [from, targets] of Object.entries(PAYMENT_STATUS_TRANSITIONS)) {
+      for (const to of targets) {
+        assert.ok(
+          PAYMENT_STATUS_TRANSITIONS[to] !== undefined,
+          `payment status "${from}" -> unknown status "${to}"`,
+        );
+      }
+    }
+  });
+
+  await t.test('every settlement transition target is itself a known status', () => {
+    for (const [from, targets] of Object.entries(SETTLEMENT_STATUS_TRANSITIONS)) {
+      for (const to of targets) {
+        assert.ok(
+          SETTLEMENT_STATUS_TRANSITIONS[to] !== undefined,
+          `settlement status "${from}" -> unknown status "${to}"`,
+        );
+      }
+    }
   });
 });
 
@@ -412,5 +516,57 @@ test('StellarAddressSchema validation', async (t) => {
       status: 'initiated',
       createdAt: new Date().toISOString(),
     }).merchantId, VALID_STELLAR_PUBLIC_KEY);
+  });
+});
+
+// ─── CurrencyCode schema tests ────────────────────────────────────────────
+test('CurrencyCode schema', async (t) => {
+  await t.test('accepts supported currencies', () => {
+    assert.strictEqual(CurrencyCode.parse('USDC'), 'USDC');
+    assert.strictEqual(CurrencyCode.parse('EURT'), 'EURT');
+    assert.strictEqual(CurrencyCode.parse('NGN'), 'NGN');
+  });
+
+  await t.test('rejects unknown currency codes', () => {
+    assert.throws(() => CurrencyCode.parse('BTC'));
+    assert.throws(() => CurrencyCode.parse(''));
+    assert.throws(() => CurrencyCode.parse('usdc'));
+  });
+
+  await t.test('CreatePaymentBody rejects invalid currency', () => {
+    assert.throws(() => CreatePaymentBody.parse({
+      merchantId: VALID_STELLAR_PUBLIC_KEY,
+      amount: '100',
+      asset: 'INVALID',
+    }));
+  });
+
+  await t.test('ASSET_DECIMALS covers all supported currencies', () => {
+    for (const code of ['USDC', 'EURT', 'NGN']) {
+      assert.ok(code in ASSET_DECIMALS, `${code} should have decimals defined`);
+      assert.ok(ASSET_DECIMALS[code] >= 0, `${code} decimals should be non-negative`);
+    }
+  });
+});
+
+// ─── Amount precision validation tests ────────────────────────────────────
+test('validateAmountPrecision', async (t) => {
+  await t.test('accepts integer amounts', () => {
+    assert.strictEqual(validateAmountPrecision('100', 'USDC'), true);
+    assert.strictEqual(validateAmountPrecision('0', 'NGN'), true);
+  });
+
+  await t.test('accepts amounts within decimal limit', () => {
+    assert.strictEqual(validateAmountPrecision('1.1234567', 'USDC'), true);
+    assert.strictEqual(validateAmountPrecision('1.12', 'NGN'), true);
+  });
+
+  await t.test('rejects amounts exceeding decimal limit', () => {
+    assert.strictEqual(validateAmountPrecision('1.12345678', 'USDC'), false);
+    assert.strictEqual(validateAmountPrecision('1.123', 'NGN'), false);
+  });
+
+  await t.test('rejects unknown asset', () => {
+    assert.strictEqual(validateAmountPrecision('1.00', 'UNKNOWN'), false);
   });
 });

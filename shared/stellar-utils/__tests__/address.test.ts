@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert';
 import { validateStellarAddress } from '../index.js';
 
-// Known valid Ed25519 public keys for testing
-const VALID_MAINNET_KEY = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
-const VALID_TESTNET_KEY = 'GDQERENWDDSQZS7R7WUFZKQSDF8CCVPWI67TMYYNMCJYJQYOUVHKFKB';
+// Known valid Ed25519 public keys for testing (checksummed G... addresses)
+const VALID_MAINNET_KEY = 'GCCTLHSAZTFDGPG4IT4HHGOUFHSX6K4VUEKXCGWP2ZWG2U3FUO4HOAZO';
+const VALID_TESTNET_KEY = 'GB6UADKLRL4KUSVDWRL5Z37JW4C3NIICHDEODRCNOO3J7OLIUB3RPIFC';
 
 test('validateStellarAddress — valid keys', async (t) => {
   await t.test('returns true for a valid mainnet public key', () => {

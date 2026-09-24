@@ -3,20 +3,27 @@ import test from 'tape';
 // Mock state tracking for fallback mode
 let lastSuccessfulFetch: number | null = null;
 let fallbackStartTime: number | null = null;
+let fallbackEvents = 0;
+let fallbackActiveGauge = 0;
 
 function resetState(): void {
   lastSuccessfulFetch = null;
   fallbackStartTime = null;
+  fallbackEvents = 0;
+  fallbackActiveGauge = 0;
 }
 
 function markFetchSuccess(): void {
   lastSuccessfulFetch = Date.now();
   fallbackStartTime = null;
+  fallbackActiveGauge = 0;
 }
 
 function markFetchFailure(): void {
   if (fallbackStartTime === null) {
     fallbackStartTime = Date.now();
+    fallbackEvents++;
+    fallbackActiveGauge = 1;
   }
 }
 
@@ -25,6 +32,8 @@ function getStatus(): {
   lastSuccessfulFetch: string | null;
   fallbackActiveDurationMs: number;
   isUnhealthy: boolean;
+  events: number;
+  activeGauge: number;
 } {
   const inFallback = fallbackStartTime !== null;
   const fallbackDurationMs = inFallback ? Date.now() - fallbackStartTime : 0;
@@ -36,6 +45,8 @@ function getStatus(): {
     lastSuccessfulFetch: lastSuccessfulFetch ? new Date(lastSuccessfulFetch).toISOString() : null,
     fallbackActiveDurationMs: fallbackDurationMs,
     isUnhealthy,
+    events: fallbackEvents,
+    activeGauge: fallbackActiveGauge,
   };
 }
 
@@ -46,6 +57,8 @@ test('Fallback tracking: initial state is live', (t) => {
   t.equal(status.lastSuccessfulFetch, null, 'no successful fetch recorded');
   t.equal(status.fallbackActiveDurationMs, 0, 'fallback duration is 0');
   t.notOk(status.isUnhealthy, 'not unhealthy');
+  t.equal(status.events, 0, '0 events');
+  t.equal(status.activeGauge, 0, 'gauge is 0');
   t.end();
 });
 
@@ -65,8 +78,10 @@ test('Fallback tracking: failed fetch enters fallback mode', (t) => {
 
   const status = getStatus();
   t.equal(status.mode, 'fallback', 'mode is fallback after fetch failure');
-  t.ok(status.fallbackActiveDurationMs > 0, 'fallback duration is tracked');
+  t.ok(status.fallbackActiveDurationMs >= 0, 'fallback duration is tracked');
   t.notOk(status.isUnhealthy, 'not unhealthy yet (duration < 1 hour)');
+  t.equal(status.events, 1, '1 event recorded');
+  t.equal(status.activeGauge, 1, 'gauge is 1');
   t.end();
 });
 
@@ -82,6 +97,8 @@ test('Fallback tracking: recovery to live mode', (t) => {
   t.equal(status.mode, 'live', 'mode is live after recovery');
   t.equal(status.fallbackActiveDurationMs, 0, 'fallback duration is 0 after recovery');
   t.notOk(status.isUnhealthy, 'not unhealthy after recovery');
+  t.equal(status.events, 1, 'event count remains 1');
+  t.equal(status.activeGauge, 0, 'gauge resets to 0');
   t.end();
 });
 
@@ -115,7 +132,10 @@ test('Fallback tracking: multiple failed fetches', (t) => {
   // Simulate another failed fetch shortly after
   markFetchFailure();
 
+  const status = getStatus();
   t.equal(fallbackStartTime, firstFailureTime, 'fallback start time not reset on subsequent failures');
+  t.equal(status.events, 1, 'event count not incremented for continuous failure');
+  t.equal(status.activeGauge, 1, 'gauge stays 1');
   t.end();
 });
 

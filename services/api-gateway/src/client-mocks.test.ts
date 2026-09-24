@@ -1,20 +1,31 @@
 import test from 'tape';
-import { createTestApp, generateTestJwt } from './test-utils.js';
+import {
+  createTestApp,
+  generateTestJwt,
+  createMockSettlementClient,
+  createMockFxClient,
+  createMockIndexerClient,
+} from './test-utils.js';
 import { SettlementEngineUnavailableError } from './clients/settlement-client.js';
+import { MOCK_MERCHANT_ACTIVE, MOCK_SUPPORTED_ASSET_USDC } from './test-fixtures.js';
 
 test('client-mocks: settlementClient throwing SettlementEngineUnavailableError returns 504', async (t) => {
-  const mockSettlementClient = {
+  const settlementClient = createMockSettlementClient({
     createSettlement: async () => {
       throw new SettlementEngineUnavailableError('settlement-engine down');
     },
-  };
-
-  const { app } = createTestApp({
-    settlementClient: mockSettlementClient as any,
-  }, {
-    merchants: [{ id: 'merch_1', settings: {} }],
   });
-  
+
+  const { app } = await createTestApp(
+    {
+      settlementClient: settlementClient as any,
+    },
+    {
+      merchants: [{ id: 'merch_1', settings: {} }],
+      supportedAssets: [MOCK_SUPPORTED_ASSET_USDC],
+    },
+  );
+
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -39,17 +50,21 @@ test('client-mocks: settlementClient throwing SettlementEngineUnavailableError r
 });
 
 test('client-mocks: settlementClient throwing unexpected error returns 500', async (t) => {
-  const mockSettlementClient = {
+  const settlementClient = createMockSettlementClient({
     createSettlement: async () => {
       throw new Error('Unexpected network split');
     },
-  };
-
-  const { app } = createTestApp({
-    settlementClient: mockSettlementClient as any,
-  }, {
-    merchants: [{ id: 'merch_1', settings: {} }],
   });
+
+  const { app } = await createTestApp(
+    {
+      settlementClient: settlementClient as any,
+    },
+    {
+      merchants: [{ id: 'merch_1', settings: {} }],
+      supportedAssets: [MOCK_SUPPORTED_ASSET_USDC],
+    },
+  );
 
   const token = generateTestJwt(app);
 
@@ -72,13 +87,18 @@ test('client-mocks: settlementClient throwing unexpected error returns 500', asy
 });
 
 test('client-mocks: fxClient returning null falls back gracefully on payment creation', async (t) => {
-  const mockFxClient = {
+  const fxClient = createMockFxClient({
     getQuote: async () => null, // mock quote lookup failure / unavailable
-  };
-
-  const { app } = createTestApp({
-    fxClient: mockFxClient as any,
   });
+
+  const { app } = await createTestApp(
+    {
+      fxClient: fxClient as any,
+    },
+    {
+      merchants: [{ ...MOCK_MERCHANT_ACTIVE }],
+    },
+  );
 
   const token = generateTestJwt(app);
 
@@ -89,7 +109,7 @@ test('client-mocks: fxClient returning null falls back gracefully on payment cre
       authorization: `Bearer ${token}`,
     },
     payload: {
-      merchantId: 'merch_1',
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
       amount: '10.00',
       asset: 'USDC',
       convertTo: 'EURT',
@@ -98,25 +118,28 @@ test('client-mocks: fxClient returning null falls back gracefully on payment cre
 
   t.equal(res.statusCode, 201, 'succeeds with 201 Created');
   const body = JSON.parse(res.body);
-  t.equal(body.fxQuote, null, 'fxQuote should be null in response');
-  t.equal(body.status, 'initiated', 'payment session still initialized');
+  t.equal(body.data.fxQuote, null, 'fxQuote should be null in response');
+  t.equal(body.data.status, 'initiated', 'payment session still initialized');
 
   await app.close();
   t.end();
 });
 
 test('client-mocks: indexerClient returning null falls back gracefully on payment query', async (t) => {
-  const mockIndexerClient = {
+  const indexerClient = createMockIndexerClient({
     getPaymentEvents: async () => null, // mock indexer down
-  };
+  });
 
   const PAYMENT = { id: 'pay_1', merchantId: 'merchant_1', status: 'completed', amount: '10.00', asset: 'USDC' };
 
-  const { app } = createTestApp({
-    indexerClient: mockIndexerClient as any,
-  }, {
-    payments: [PAYMENT],
-  });
+  const { app } = await createTestApp(
+    {
+      indexerClient: indexerClient as any,
+    },
+    {
+      payments: [PAYMENT],
+    },
+  );
 
   const res = await app.inject({
     method: 'GET',
@@ -125,7 +148,7 @@ test('client-mocks: indexerClient returning null falls back gracefully on paymen
 
   t.equal(res.statusCode, 200, 'returns 200 OK');
   const body = JSON.parse(res.body);
-  t.equal(body.events, null, 'events field is null on indexer failure');
+  t.equal(body.data.events, null, 'events field is null on indexer failure');
 
   await app.close();
   t.end();

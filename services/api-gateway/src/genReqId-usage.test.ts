@@ -16,3 +16,14 @@ test('API Gateway imports and uses shared registerRequestId plugin', (t) => {
   t.match(content, /registerRequestId\(fastify\)/s, 'index.ts should call registerRequestId(fastify)');
   t.end();
 });
+
+test('Error handler includes reqId in response body for correlation', (t) => {
+  const pluginsPath = path.resolve(__dirname, '../../../shared/validation/plugins.ts');
+  const content = fs.readFileSync(pluginsPath, 'utf-8');
+
+  t.ok(
+    content.includes("reqId") && content.includes("createErrorResponse(code, sanitizeErrorMessage(fastifyErr.message), details, reqId)"),
+    'error handler should pass reqId to createErrorResponse',
+  );
+  t.end();
+});

@@ -16,13 +16,14 @@ test('Settlement Engine imports and uses shared registerRequestId plugin', (t) =
   t.end();
 });
 
-test('Settlement Engine configures BullMQ Redis retry options', (t) => {
+test('Settlement Engine connects BullMQ through the shared Redis client', (t) => {
+  // The shared createRedisClient factory (shared/validation/redis.ts) is
+  // BullMQ-compatible: it sets maxRetriesPerRequest: null and configures an
+  // explicit capped retryStrategy (verified in shared/validation/redis.test.ts).
   const indexPath = path.resolve(__dirname, './index.ts');
   const content = fs.readFileSync(indexPath, 'utf-8');
 
-  t.match(content, /maxRetriesPerRequest:\s*env\.REDIS_MAX_RETRIES/s, 'BullMQ max retries should come from REDIS_MAX_RETRIES');
-  t.match(content, /enableReadyCheck:\s*false/s, 'BullMQ should disable Redis ready checks for compatibility');
-  t.match(content, /retryStrategy:\s*\(times:\s*number\)/s, 'BullMQ should configure an explicit retryStrategy');
-  t.match(content, /Math\.min\(times \* 1000,\s*30000\)/s, 'retryStrategy should cap reconnect delay');
+  t.match(content, /createRedisClient\(env\.REDIS_URL/s, 'creates Redis via the shared createRedisClient factory');
+  t.match(content, /connection:\s*redis/s, 'BullMQ queues and workers connect through the shared client');
   t.end();
 });

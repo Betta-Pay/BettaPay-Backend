@@ -15,7 +15,14 @@ export type Json = string | number | boolean | null | { [key: string]: Json } | 
 export type ID = string;
 export type Currency = string;
 /** Arbitrary-precision decimal amount encoded as a numeric string, e.g. "1500.50". */
-export type Amount = string;
+declare const amountBrand: unique symbol;
+export type Amount = string & { readonly [amountBrand]: 'Amount' };
+export const AMOUNT_PATTERN = /^\d+(?:\.\d+)?$/;
+export function isAmount(value: unknown): value is Amount { return typeof value === 'string' && AMOUNT_PATTERN.test(value); }
+export function parseAmount(value: string): Amount {
+  if (!isAmount(value)) throw new TypeError('Amount must be an unsigned decimal string');
+  return value;
+}
 /** Integer Stellar stroop amount encoded as a string, e.g. "15005000000". */
 export type Stroops = string;
 

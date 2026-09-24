@@ -1,6 +1,6 @@
 {
   "name": "fx-engine",
-  "ver sion": "0.1.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,12 +8,13 @@
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
-    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-refresh.test.ts",
+    "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-refresh.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-cleanup.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-quote-slippage.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-quote-age.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-quote-computation.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-rate-staleness.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/fx-computed-cache-ttl.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/validation.test.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@fastify/rate-limit": "^10.0.0",
     "@bettapay/validation": "workspace:*",
+    "bullmq": "^5.79.1",
     "ioredis": "^5.11.1",
     "prom-client": "^15.1.0",
     "zod": "^3.22.4"

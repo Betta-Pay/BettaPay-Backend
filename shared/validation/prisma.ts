@@ -200,3 +200,34 @@ export async function connectWithRetryWithRotation(
     lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown error');
   throw new Error(`Failed to connect to database after ${maxRetries} attempts: ${message}`);
 }
+
+import { readReplicas } from "@prisma/extension-read-replicas";
+
+interface PrismaClientLike {
+  $extends: (extension: unknown) => any;
+}
+
+const REPLICA_WARNING_EMITTED = Symbol("replicaWarningEmitted");
+
+export function applyReadReplicas<T extends PrismaClientLike>(
+  client: T,
+  replicaUrl?: string | null,
+  logger?: { warn: (obj: object, msg?: string) => void },
+): T {
+  if (!replicaUrl) {
+    if (logger && !(REPLICA_WARNING_EMITTED in client)) {
+      logger.warn(
+        { hint: "Set DATABASE_READ_REPLICA_URL to offload read queries to a replica" },
+        "No read-replica configured — all queries use the primary database",
+      );
+      Object.defineProperty(client, REPLICA_WARNING_EMITTED, { value: true });
+    }
+    return client;
+  }
+
+  return client.$extends(
+    readReplicas({
+      replicas: [{ url: replicaUrl }],
+    }),
+  ) as unknown as T;
+}

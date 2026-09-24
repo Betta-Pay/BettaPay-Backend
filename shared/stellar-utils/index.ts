@@ -7,6 +7,13 @@ import { StrKey, Keypair } from '@stellar/stellar-sdk';
 
 type Amount = string;
 type Stroops = string;
+export enum StellarNetwork { PUBLIC = 'public', TESTNET = 'testnet', FUTURENET = 'futurenet' }
+const HORIZON_URLS: Record<StellarNetwork, string> = {
+  [StellarNetwork.PUBLIC]: 'https://horizon.stellar.org',
+  [StellarNetwork.TESTNET]: 'https://horizon-testnet.stellar.org',
+  [StellarNetwork.FUTURENET]: 'https://horizon-futurenet.stellar.org',
+};
+export type MemoType = 'text' | 'id' | 'hash' | 'return';
 
 export function validateStellarAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address);
@@ -34,6 +41,12 @@ export function generateStellarKeypair(): { publicKey: string; secretKey: string
 
 // Convert decimal string to stroops (string of integer stroops)
 export function toStellarAmount(decimalStr: string, decimals = 7): string {
+  // Strict format: one or more digits, optionally followed by a decimal point
+  // and one or more digits. Rejects empty strings, negatives, scientific
+  // notation, whitespace, and partial decimals like '.5' or '1.'.
+  if (!/^\d+(\.\d+)?$/.test(decimalStr)) {
+    throw new TypeError('toStellarAmount: input must be a valid numeric string');
+  }
   // naive conversion: multiply decimal by 10^decimals
   const [whole, frac = ''] = decimalStr.split('.');
   const paddedFrac = (frac + '0'.repeat(decimals)).slice(0, decimals);
@@ -151,6 +164,11 @@ export function validateMemo(type: string, value: string): boolean {
   }
 }
 
+export function buildMemo(type: MemoType, value: string): { type: MemoType; value: string } {
+  if (!validateMemo(type, value)) throw new TypeError(`Invalid Stellar ${type} memo`);
+  return { type, value };
+}
+
 /**
  * Builds a properly encoded Horizon API URL for the specified resource.
  * Handles trailing slashes in base URL and encodes query parameters.
@@ -199,4 +217,9 @@ export function buildHorizonUrl(
   }
 
   return url.toString();
+}
+
+export function horizonUrlBuilder(network: StellarNetwork, resource: string, params?: Record<string, unknown>): string {
+  if (!Object.values(StellarNetwork).includes(network)) throw new TypeError(`Unsupported Stellar network: ${String(network)}`);
+  return buildHorizonUrl(HORIZON_URLS[network], resource, params);
 }

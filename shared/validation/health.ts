@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AggregatedHealthResponse, DependencyHealth, HealthResponse, HealthStatus } from './schemas.js';
+import type { RedisHealthState } from './redis.js';
 
 export const HEALTH_CHECK_TIMEOUT_MS = 3_000;
 export const UPSTREAM_HEALTH_TIMEOUT_MS = 5_000;
@@ -71,12 +72,36 @@ export async function checkPostgresql(
 export async function checkRedisPing(
   pingFn: () => Promise<string>,
   timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
+  healthState?: { connected: boolean; errors: number; lastError?: string; reconnects: number },
 ): Promise<DependencyHealth> {
   const result = await withLatency(pingFn, timeoutMs);
-  if (result.ok && result.value === 'PONG') {
-    return { name: 'redis', status: 'connected', latencyMs: result.latencyMs };
+  
+  const details: Record<string, unknown> = {};
+  
+  if (healthState) {
+    details.connected = healthState.connected;
+    details.errors = healthState.errors;
+    details.reconnects = healthState.reconnects;
+    if (healthState.lastError) {
+      details.lastError = healthState.lastError;
+    }
   }
-  return { name: 'redis', status: 'disconnected', latencyMs: result.latencyMs };
+  
+  if (result.ok && result.value === 'PONG') {
+    return { 
+      name: 'redis', 
+      status: 'connected', 
+      latencyMs: result.latencyMs,
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+    };
+  }
+  
+  return { 
+    name: 'redis', 
+    status: 'disconnected', 
+    latencyMs: result.latencyMs,
+    ...(Object.keys(details).length > 0 ? { details } : {}),
+  };
 }
 
 export const BULLMQ_WAITING_DEGRADED_THRESHOLD = 1000;
@@ -328,15 +353,16 @@ async function checkStellarRpc(
 export async function buildFxEngineHealthResponse(options: {
   pingRedis: () => Promise<string>;
   ratesApiUrl: string;
+  redisHealthState?: RedisHealthState;
   startTime: number;
   service: string;
   version: string;
   fetchImpl?: typeof fetch;
 }): Promise<HealthResponse> {
-  const { pingRedis, ratesApiUrl, startTime, service, version, fetchImpl = fetch } = options;
+  const { pingRedis, ratesApiUrl, redisHealthState, startTime, service, version, fetchImpl = fetch } = options;
 
   const [redisDep, ratesApi] = await Promise.all([
-    checkRedisPing(pingRedis),
+    checkRedisPing(pingRedis, HEALTH_CHECK_TIMEOUT_MS, redisHealthState),
     checkHttpEndpoint(ratesApiUrl, {
       name: 'rates-api',
       fetchImpl,
@@ -359,15 +385,16 @@ export async function buildSettlementEngineHealthResponse(options: {
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
   getQueueIsPaused?: () => Promise<boolean>;
+  redisHealthState?: RedisHealthState;
   startTime: number;
   service: string;
   version: string;
 }): Promise<HealthResponse> {
-  const { queryDatabase, pingRedis, getQueueJobCounts, getQueueIsPaused, startTime, service, version } = options;
+  const { queryDatabase, pingRedis, getQueueJobCounts, getQueueIsPaused, redisHealthState, startTime, service, version } = options;
 
   const [postgresql, redisDep, bullmq] = await Promise.all([
     checkPostgresql(queryDatabase),
-    checkRedisPing(pingRedis),
+    checkRedisPing(pingRedis, HEALTH_CHECK_TIMEOUT_MS, redisHealthState),
     checkBullMQ(getQueueJobCounts, 'bullmq-settlement', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
   ]);
 
@@ -392,6 +419,7 @@ export async function buildIndexerHealthResponse(options: {
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
   getQueueIsPaused?: () => Promise<boolean>;
+  redisHealthState?: RedisHealthState;
   getLatestLedger: () => Promise<{ sequence: number }>;
   latestLedgerCursor?: number;
   latestLedgerSequence?: number;
@@ -405,6 +433,7 @@ export async function buildIndexerHealthResponse(options: {
     pingRedis,
     getQueueJobCounts,
     getQueueIsPaused,
+    redisHealthState,
     getLatestLedger,
     latestLedgerCursor,
     latestLedgerSequence,
@@ -416,7 +445,7 @@ export async function buildIndexerHealthResponse(options: {
 
   const [postgresql, redisDep, bullmq, stellarRpc] = await Promise.all([
     checkPostgresql(queryDatabase),
-    checkRedisPing(pingRedis),
+    checkRedisPing(pingRedis, HEALTH_CHECK_TIMEOUT_MS, redisHealthState),
     checkBullMQ(getQueueJobCounts, 'bullmq-webhooks', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
     checkStellarRpc(getLatestLedger),
   ]);

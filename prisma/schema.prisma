@@ -27,12 +27,22 @@ enum KycStatus {
   rejected
 }
 
+// #317 — Merchant suspension status. Backfilled to 'active' for existing rows
+// by the add_merchant_status migration.
+enum MerchantStatus {
+  active
+  suspended
+}
+
 model Merchant {
-  id          String       @id
+  id          String          @id
   name        String
   ownerId     String
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime        @default(now())
   deletedAt   DateTime?
+  // #317 — Merchant suspension status. Existing rows are backfilled to
+  // 'active' by the add_merchant_status migration.
+  status      MerchantStatus  @default(active)
   settings    Json?
   secretHash  String?
   kycStatus   KycStatus    @default(unverified)
@@ -40,6 +50,7 @@ model Merchant {
   settlements Settlement[]
 
   @@unique([ownerId])
+  @@index([status])
 }
 
 model Payment {
@@ -63,6 +74,10 @@ model Payment {
   fxRate                  String?
   fxQuoteId               String?
   fxQuoteExpiresAt        DateTime?
+
+  @@index([merchantId, status, createdAt(sort: Desc)])
+  // #622 — supports the idempotency-key cleanup job's scan for expired keys.
+  @@index([idempotencyKeyExpiresAt])
 }
 
 model Settlement {
@@ -77,6 +92,9 @@ model Settlement {
   asset                   String
   status                  SettlementStatus @default(pending)
   webhookUrl              String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // webhook delivery attempt for this settlement, including retries (#569).
+  webhookHeaders          Json?
   batchId                 String?
   initiatedAt             DateTime         @default(now())
   completedAt             DateTime?
@@ -91,37 +109,82 @@ model Settlement {
   supersededById          String?
   supersededBy            Settlement?      @relation("SettlementRetry", fields: [supersededById], references: [id], onDelete: SetNull)
   supersedes              Settlement[]     @relation("SettlementRetry")
+  // Optimistic concurrency version (#543). Incremented on every state-changing
+  // update so concurrent writers cannot silently overwrite each other.
+  version                 Int              @default(0)
 
   @@index([initiatedAt(sort: Desc)])
   @@index([merchantId, initiatedAt(sort: Desc)])
+  @@index([merchantId, status, initiatedAt(sort: Desc)])
   @@index([supersededById])
+  // #622 — supports the idempotency-key cleanup job's scan for expired keys.
+  @@index([idempotencyKeyExpiresAt])
 }
 
 model IndexedEvent {
-  id             String   @id
-  stellarId      String?
-  contractId     String
-  contractName   String?
-  topics         String[]
-  type           String
-  rawValue       String
-  decodedPayload Json?
-  ledger         Int
-  indexedAt      DateTime @default(now())
+  id               String   @id
+  stellarId        String?
+  contractId       String
+  contractName     String?
+  topics           String[]
+  type             String
+  rawValue         String
+  decodedPayload   Json?
+  validationError  String?
+  ledger           Int
+  indexedAt        DateTime @default(now())
 
+  // The Prisma schema DSL cannot express NULLS NOT DISTINCT, but the actual
+  // Postgres index (see migration 20260901000000_dedupe_null_stellarid_indexed_events,
+  // #612) is created with it so that two events sharing a (contractId, ledger)
+  // pair and a NULL stellarId are also rejected as duplicates.
   @@unique([stellarId, contractId, ledger])
   @@index([ledger])
   @@index([type])
   @@index([contractId])
+  @@index([contractId, ledger(sort: Desc)])
   @@index([indexedAt])
 }
 
+enum WebhookDeliveryStatus {
+  pending
+  delivered
+  failed
+  expired
+}
+
+model IndexedEventWebhookDelivery {
+  id             String   @id
+  indexedEventId String
+  subscriptionId String
+  url            String
+  event          Json
+  signingSecret  String?
+  headers        Json?
+  status         WebhookDeliveryStatus @default(pending)
+  retryCount     Int      @default(0)
+  lastAttemptAt  DateTime?
+  lastError      String?
+  processedAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  @@unique([indexedEventId, subscriptionId])
+  @@index([status, createdAt])
+  @@index([subscriptionId, status, createdAt])
+}
+
 model WebhookSubscription {
-  id            String   @id
-  url           String
-  createdAt     DateTime @default(now())
-  signingSecret String?
-  merchantId    String?
+  id                 String    @id
+  url                String
+  createdAt          DateTime  @default(now())
+  signingSecret      String?
+  merchantId         String?
+  // Custom headers (idempotency keys, auth tokens, etc.) sent with every
+  // delivery attempt for this subscription, including retries (#569).
+  headers            Json?
+  lastTestedAt       DateTime?
+  lastTestStatus     String?
+  lastTestStatusCode Int?
 }
 
 model AuditLog {
@@ -136,6 +199,7 @@ model AuditLog {
   createdAt  DateTime @default(now())
 
   @@index([entityType])
+  @@index([entityType, entityId, createdAt(sort: Desc)])
   @@index([action])
   @@index([createdAt])
   @@index([entityId])

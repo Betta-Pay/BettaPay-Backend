@@ -24,6 +24,7 @@ process.env.ADMIN_ADDRESS = 'GBJDHFU7XYDT4MMSTXTU4Z4VABMFR6SPLPNCZF656SIHPXT6LPW
 process.env.INTER_SERVICE_SECRET = 'test-secret-that-is-at-least-16-chars';
 process.env.GOOGLE_CLIENT_ID = 'test-google-client-id';
 process.env.ADMIN_SECRET = 'test-admin-secret';
+process.env.FIELD_ENCRYPTION_KEY = 'b'.repeat(32);
 
 import test from 'tape';
 
@@ -35,6 +36,7 @@ const {
   startCleanupScheduler,
   stopCleanupScheduler,
   fastify,
+  prisma,
 } = await import('./index.js');
 
 // ── Part 1: buildCleanupWhere (pure, no I/O) ──────────────────────────────────
@@ -199,5 +201,95 @@ test('startCleanupScheduler / stopCleanupScheduler — round-trip is safe', (t) 
   // Call stop a second time to verify idempotency.
   stopCleanupScheduler();
   t.pass('start→stop→stop round-trip completes without error');
+  t.end();
+});
+
+// ── Part 5: dry-run cleanup (#346) ────────────────────────────────────────────
+
+test('cleanupOldEvents — dry-run returns zero result when retention is disabled', async (t) => {
+  env.EVENT_RETENTION_DAYS = 0;
+  const result = await cleanupOldEvents(true) as any;
+  t.equal(result.wouldDelete, 0, 'wouldDelete is 0');
+  t.equal(result.totalSizeBytes, 0, 'totalSizeBytes is 0');
+  t.equal(result.retentionDays, 0, 'retentionDays is 0');
+  t.equal(result.oldestEventDate, '', 'oldestEventDate is empty string');
+  t.end();
+});
+
+test('cleanupOldEvents — dry-run with mocked data returns correct count and size', async (t) => {
+  env.EVENT_RETENTION_DAYS = 30;
+
+  const origCount = prisma.indexedEvent.count.bind(prisma.indexedEvent);
+  const origFindFirst = prisma.indexedEvent.findFirst.bind(prisma.indexedEvent);
+  const origQueryRaw = prisma.$queryRawUnsafe.bind(prisma);
+
+  prisma.indexedEvent.count = (async () => 5) as any;
+  prisma.indexedEvent.findFirst = (async () => ({ indexedAt: new Date('2025-01-01T00:00:00Z') })) as any;
+  prisma.$queryRawUnsafe = (async () => [{ total_bytes: 1000n }]) as any;
+
+  try {
+    const result = await cleanupOldEvents(true) as any;
+    t.equal(result.wouldDelete, 5, 'wouldDelete matches mock count');
+    t.equal(result.totalSizeBytes, 1000, 'totalSizeBytes matches mock size');
+    t.equal(result.retentionDays, 30, 'retentionDays matches env value');
+    t.equal(result.oldestEventDate, '2025-01-01T00:00:00.000Z', 'oldestEventDate is set correctly');
+  } finally {
+    prisma.indexedEvent.count = origCount;
+    prisma.indexedEvent.findFirst = origFindFirst;
+    prisma.$queryRawUnsafe = origQueryRaw;
+  }
+  t.end();
+});
+
+test('cleanupOldEvents — no old events dry-run returns wouldDelete=0 with mocked data', async (t) => {
+  env.EVENT_RETENTION_DAYS = 30;
+
+  const origCount = prisma.indexedEvent.count.bind(prisma.indexedEvent);
+  const origFindFirst = prisma.indexedEvent.findFirst.bind(prisma.indexedEvent);
+  const origQueryRaw = prisma.$queryRawUnsafe.bind(prisma);
+
+  prisma.indexedEvent.count = (async () => 0) as any;
+  prisma.indexedEvent.findFirst = (async () => null) as any;
+  prisma.$queryRawUnsafe = (async () => [{ total_bytes: 0n }]) as any;
+
+  try {
+    const result = await cleanupOldEvents(true) as any;
+    t.equal(result.wouldDelete, 0, 'wouldDelete is 0 when no events match');
+    t.equal(result.totalSizeBytes, 0, 'totalSizeBytes is 0 when no events match');
+  } finally {
+    prisma.indexedEvent.count = origCount;
+    prisma.indexedEvent.findFirst = origFindFirst;
+    prisma.$queryRawUnsafe = origQueryRaw;
+  }
+  t.end();
+});
+
+test('cleanupOldEvents — skips entries with active webhook jobs', async (t) => {
+  env.EVENT_RETENTION_DAYS = 30;
+
+  const { webhookQueue } = await import('./index.js');
+  const origGetJobs = webhookQueue.getJobs.bind(webhookQueue);
+  const origDeleteMany = prisma.indexedEvent.deleteMany.bind(prisma.indexedEvent);
+
+  webhookQueue.getJobs = (async () => [
+    { data: { event: { id: 'evt_123' } } },
+    { data: { event: { id: 'evt_456' } } },
+  ]) as any;
+
+  let capturedWhere: any = null;
+  prisma.indexedEvent.deleteMany = (async (args: any) => {
+    capturedWhere = args.where;
+    return { count: 2 };
+  }) as any;
+
+  try {
+    const deletedCount = await cleanupOldEvents(false);
+    t.equal(deletedCount, 2, 'returns count from deleteMany');
+    t.ok(capturedWhere, 'captured where clause');
+    t.deepEqual(capturedWhere.id, { notIn: ['evt_123', 'evt_456'] }, 'excludes active event IDs');
+  } finally {
+    webhookQueue.getJobs = origGetJobs;
+    prisma.indexedEvent.deleteMany = origDeleteMany;
+  }
   t.end();
 });

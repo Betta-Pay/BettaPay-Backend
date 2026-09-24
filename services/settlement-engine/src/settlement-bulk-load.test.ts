@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
@@ -35,9 +35,9 @@ test('bulk-load: processing multiple batches sequentially to verify state memory
 
     t.equal(res.statusCode, 201, `batch ${batchIndex} processes successfully`);
     const body = JSON.parse(res.body);
-    t.equal(body.total, 2);
-    t.equal(body.created, 2);
-    t.equal(body.errors.length, 0);
+    t.equal(body.data.total, 2);
+    t.equal(body.data.created, 2);
+    t.equal(body.data.errors.length, 0);
   }
   t.end();
 });
@@ -115,3 +115,11 @@ test('bulk-load: verify invalid asset type rejections inside bulk collection', a
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

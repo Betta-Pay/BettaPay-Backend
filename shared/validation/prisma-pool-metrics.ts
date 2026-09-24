@@ -20,6 +20,51 @@ export type PoolOrStatsGetter =
   | PoolStatsProvider
   | (() => PoolStatsProvider | null | undefined);
 
+// ── Alert threshold (#520) ────────────────────────────────────────────────────
+//
+// Healthy pool utilisation range: 0 – 80 % of totalCount in active use.
+// Above 80 % the pool is under pressure and response latency will increase.
+// Above 95 % the pool is near-exhausted and new requests will queue or fail.
+//
+// The threshold is configurable so operators can tighten it for smaller pools
+// (e.g. 10-connection staging) without changing code.
+
+/** Fraction of total pool connections that is considered high utilisation. */
+export const POOL_ALERT_THRESHOLD_RATIO = 0.8;
+
+export interface PoolAlertLogger {
+  warn: (obj: object, msg?: string) => void;
+}
+
+/**
+ * Emits a structured warning when active connections exceed the alert threshold.
+ *
+ * @param activeCount  Number of connections currently in use.
+ * @param totalCount   Maximum pool size (max connections configured).
+ * @param logger       Logger to emit the warning through.
+ * @param thresholdRatio  Fraction of totalCount that triggers the alert (default 0.8).
+ */
+export function checkPoolAlertThreshold(
+  activeCount: number,
+  totalCount: number,
+  logger: PoolAlertLogger,
+  thresholdRatio = POOL_ALERT_THRESHOLD_RATIO,
+): void {
+  if (totalCount <= 0) return;
+  const utilisation = activeCount / totalCount;
+  if (utilisation >= thresholdRatio) {
+    logger.warn(
+      {
+        activeCount,
+        totalCount,
+        utilisationPct: Math.round(utilisation * 100),
+        thresholdPct: Math.round(thresholdRatio * 100),
+      },
+      'Prisma pool utilisation above alert threshold — DB latency may increase',
+    );
+  }
+}
+
 let activeInterval: NodeJS.Timeout | null = null;
 
 export function registerPrismaPoolMetrics(registry: any, promClientModule?: any) {
@@ -89,6 +134,11 @@ export function updatePrismaPoolMetrics(
     if (metrics.usedGauge) metrics.usedGauge.set(activeCount);
     if (metrics.idleGauge) metrics.idleGauge.set(idleCount);
     if (metrics.waitingGauge) metrics.waitingGauge.set(waitingCount);
+
+    // #520 — alert when pool utilisation exceeds the healthy range (> 80 %).
+    if (logger && totalCount > 0) {
+      checkPoolAlertThreshold(activeCount, totalCount, logger);
+    }
   } catch (error) {
     if (logger) {
       logger.warn({ error }, 'Failed to collect Prisma pool metrics');

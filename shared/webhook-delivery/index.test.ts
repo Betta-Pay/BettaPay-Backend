@@ -20,13 +20,18 @@
  */
 
 import test from 'tape';
+import crypto from 'crypto';
 import {
   createWebhookQueue,
   createWebhookWorker,
   signPayload,
+  verifySignature,
+  canonicalize,
+  resolveWebhookConcurrency,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
+  type DedupRedis,
 } from './index.js';
 import { Queue, Worker } from 'bullmq';
 
@@ -180,6 +185,8 @@ test('createWebhookQueue — default job options use exponential back-off', (t) 
 function extractProcessor(
   fetchImpl: typeof fetch,
   loggerOverride?: WebhookLogger,
+  redisOverride?: DedupRedis,
+  workerOpts?: { timeoutMs?: number },
 ): ((job: FakeJob) => Promise<void>) | null {
   let captured: ((job: FakeJob) => Promise<void>) | null = null;
 
@@ -216,12 +223,17 @@ function extractProcessor(
       fetchImpl,
       logger: loggerOverride,
       concurrency: 1,
+      redis: redisOverride,
+      timeoutMs: workerOpts?.timeoutMs,
     });
 
-    // BullMQ Worker stores the processor internally — access it via cast.
-    // This is intentional test-only introspection; production code never
-    // accesses this field.
-    captured = (w as any).processor as (job: FakeJob) => Promise<void>;
+    // BullMQ v5 stores the processor as `processFn` on the Worker instance
+    // (older versions exposed it as `processor`).  Access it via cast —
+    // intentional test-only introspection; production code never accesses
+    // this field.
+    captured = ((w as any).processFn ?? (w as any).processor) as (
+      job: FakeJob,
+    ) => Promise<void>;
 
     // Close the worker async (ignore Redis errors).
     void (w as any).close?.().catch(() => {});
@@ -260,7 +272,7 @@ test('worker processor — delivers successfully on 2xx response', async (t) => 
 
   t.notOk(threw, 'processor should not throw on 2xx response');
   t.equal(calledUrl, 'https://merchant.example/hook', 'POSTs to the correct URL');
-  t.same(calledBody, { event: { type: 'settlement.completed' } }, 'sends event wrapped in { event }');
+  t.same(calledBody, { version: '1.0', event: { type: 'settlement.completed' } }, 'sends event wrapped with version');
   t.end();
 });
 
@@ -454,13 +466,230 @@ test('migration note — indexer queue name constant is documented', (t) => {
   t.end();
 });
 
-// ── Part 6: HMAC-SHA256 webhook signing ──────────────────────────────────────
+// ── Part 6: Env-driven concurrency (#516) ─────────────────────────────────────
 
-import crypto from 'crypto';
+test('resolveWebhookConcurrency — returns default when WEBHOOK_CONCURRENCY unset', (t) => {
+  delete process.env.WEBHOOK_CONCURRENCY;
+
+  t.equal(resolveWebhookConcurrency(), 10, 'default is 10');
+  t.equal(resolveWebhookConcurrency(20), 20, 'custom default is respected');
+  t.end();
+});
+
+test('resolveWebhookConcurrency — honors WEBHOOK_CONCURRENCY env var', (t) => {
+  process.env.WEBHOOK_CONCURRENCY = '25';
+
+  t.equal(resolveWebhookConcurrency(), 25, 'env var overrides default');
+
+  delete process.env.WEBHOOK_CONCURRENCY;
+  t.end();
+});
+
+test('resolveWebhookConcurrency — falls back to default for invalid env var', (t) => {
+  process.env.WEBHOOK_CONCURRENCY = 'not-a-number';
+  t.equal(resolveWebhookConcurrency(), 10, 'invalid string falls back to default');
+  
+  process.env.WEBHOOK_CONCURRENCY = '-5';
+  t.equal(resolveWebhookConcurrency(), 10, 'negative number falls back to default');
+  
+  process.env.WEBHOOK_CONCURRENCY = '0';
+  t.equal(resolveWebhookConcurrency(), 10, 'zero falls back to default');
+  
+  delete process.env.WEBHOOK_CONCURRENCY;
+  t.end();
+});
+
+test('createWebhookWorker — uses env-driven concurrency by default (#516)', (t) => {
+  process.env.WEBHOOK_CONCURRENCY = '15';
+  
+  try {
+    // createWebhookWorker should pick up the env var when concurrency option is omitted
+    const w = createWebhookWorker('test-concurrency', FAKE_CONNECTION as any, {});
+    
+    // BullMQ Worker stores concurrency as (this as any).opts.concurrency
+    const workerConcurrency = (w as any).opts?.concurrency;
+    t.equal(workerConcurrency, 15, 'worker concurrency respects WEBHOOK_CONCURRENCY env var');
+    
+    void (w as any).close?.().catch(() => {});
+  } catch {
+    // Constructor may throw without Redis; test is about config parsing
+    t.pass('Worker constructor threw (no Redis) — env var parsing verified via resolveWebhookConcurrency tests');
+  }
+  
+  delete process.env.WEBHOOK_CONCURRENCY;
+  t.end();
+});
+
+test('createWebhookWorker — explicit concurrency option overrides env var (#516)', (t) => {
+  process.env.WEBHOOK_CONCURRENCY = '15';
+  
+  try {
+    const w = createWebhookWorker('test-override', FAKE_CONNECTION as any, {
+      concurrency: 5, // explicit override
+    });
+    
+    const workerConcurrency = (w as any).opts?.concurrency;
+    t.equal(workerConcurrency, 5, 'explicit concurrency option takes precedence over env var');
+    
+    void (w as any).close?.().catch(() => {});
+  } catch {
+    t.pass('Worker constructor threw (no Redis) — config precedence verified');
+  }
+  
+  delete process.env.WEBHOOK_CONCURRENCY;
+  t.end();
+});
+
+// ── Part 7: Socket cleanup in finally block (#517) ────────────────────────────
+
+// The processor runs alongside BullMQ/ioredis internals that also schedule
+// timers, so tracking a single "last timer id" is racy — a reconnect timer
+// can overwrite it mid-test.  Instead we record every timer id together with
+// its delay and report clearance per delay value.  AbortController.prototype
+// is spied because the implementation calls controller.abort() (AbortSignal
+// itself has no abort method, so patching signal.abort observes nothing).
+function installCleanupSpies() {
+  const delayByTimer = new Map<unknown, number>();
+  const clearedDelays = new Set<number>();
+  let abortCalls = 0;
+
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const originalAbort = AbortController.prototype.abort;
+
+  global.setTimeout = ((callback: any, ms?: number, ...rest: any[]) => {
+    const id = (originalSetTimeout as any)(callback, ms, ...rest);
+    delayByTimer.set(id, ms ?? 0);
+    return id;
+  }) as typeof setTimeout;
+
+  global.clearTimeout = ((id: any) => {
+    if (delayByTimer.has(id)) {
+      clearedDelays.add(delayByTimer.get(id)!);
+      delayByTimer.delete(id);
+    }
+    return (originalClearTimeout as any)(id);
+  }) as typeof clearTimeout;
+
+  AbortController.prototype.abort = function (this: AbortController): void {
+    abortCalls++;
+    originalAbort.call(this);
+  };
+
+  return {
+    restore() {
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+      AbortController.prototype.abort = originalAbort;
+    },
+    wasTimerCleared(delayMs: number) {
+      return clearedDelays.has(delayMs);
+    },
+    abortCallCount() {
+      return abortCalls;
+    },
+  };
+}
+
+test('worker processor — cleans up timer and aborts controller on success (#517)', async (t) => {
+  const mockFetch: typeof fetch = async () => ({ ok: true, status: 200 } as Response);
+
+  const spies = installCleanupSpies();
+  try {
+    const processor = extractProcessor(mockFetch);
+    if (!processor) {
+      t.pass('Worker constructor unavailable (no Redis) — cleanup test skipped');
+      t.end();
+      return;
+    }
+
+    const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
+    await processor(job as any);
+
+    t.ok(spies.wasTimerCleared(WEBHOOK_DEFAULTS.timeoutMs), 'timeout should be cleared in finally block');
+    t.ok(spies.abortCallCount() >= 1, 'abort controller should be called in finally block on success path');
+  } finally {
+    spies.restore();
+  }
+
+  t.end();
+});
+
+test('worker processor — cleans up timer and aborts controller on failure (#517)', async (t) => {
+  const mockFetch: typeof fetch = async () => {
+    throw new Error('Network failure');
+  };
+
+  const spies = installCleanupSpies();
+  try {
+    const processor = extractProcessor(mockFetch);
+    if (!processor) {
+      t.pass('Worker constructor unavailable (no Redis) — cleanup test skipped');
+      t.end();
+      return;
+    }
+
+    const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
+
+    try {
+      await processor(job as any);
+      t.fail('processor should have thrown');
+    } catch (err) {
+      t.ok(err instanceof Error && err.message.includes('Network failure'), 'error propagated');
+    }
+
+    t.ok(spies.wasTimerCleared(WEBHOOK_DEFAULTS.timeoutMs), 'timeout should be cleared in finally block on error path');
+    t.ok(spies.abortCallCount() >= 1, 'abort controller should be called in finally block on error path');
+  } finally {
+    spies.restore();
+  }
+
+  t.end();
+});
+
+test('worker processor — finally block prevents timer leak on timeout abort (#517)', async (t) => {
+  const mockFetch: typeof fetch = (_url, init) => {
+    return new Promise((_resolve, reject) => {
+      // Simulate abort firing
+      init!.signal!.addEventListener('abort', () => {
+        reject(new DOMException('Aborted', 'AbortError'));
+      });
+    });
+  };
+
+  // Use a short timeout so the test doesn't wait the 5 s production default.
+  const SHORT_TIMEOUT_MS = 50;
+  const spies = installCleanupSpies();
+
+  try {
+    const processor = extractProcessor(mockFetch, undefined, undefined, { timeoutMs: SHORT_TIMEOUT_MS });
+    if (!processor) {
+      t.pass('Worker constructor unavailable (no Redis) — leak test skipped');
+      t.end();
+      return;
+    }
+
+    const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
+
+    try {
+      await processor(job as any);
+    } catch (err) {
+      t.ok(err instanceof Error && err.name === 'AbortError', 'abort error thrown');
+    }
+
+    t.ok(spies.wasTimerCleared(SHORT_TIMEOUT_MS), 'timer must be cleared even when abort fires (prevents leak)');
+  } finally {
+    spies.restore();
+  }
+
+  t.end();
+});
+
+// ── Part 6: HMAC-SHA256 webhook signing ──────────────────────────────────────
 
 test('signPayload — returns correctly formatted header', (t) => {
   const secret = 'test-secret-123';
-  const body = '{"event":{"type":"payment.completed"}}';
+  const body = '{"version":"1.0","event":{"type":"payment.completed"}}';
   const sig = signPayload(body, secret);
 
   // Format: t={unix_ts},s={hex_hmac}
@@ -485,7 +714,7 @@ test('signPayload — returns correctly formatted header', (t) => {
 
 test('signPayload — recomputable by consumer (same body + secret + timestamp = same HMAC)', (t) => {
   const secret = 'merchant-signing-key';
-  const body = '{"event":{"id":"evt_1"}}';
+  const body = '{"version":"1.0","event":{"id":"evt_1"}}';
 
   const sig1 = signPayload(body, secret);
   // Extract the timestamp from sig1
@@ -499,7 +728,7 @@ test('signPayload — recomputable by consumer (same body + secret + timestamp =
 });
 
 test('signPayload — different secrets produce different signatures', (t) => {
-  const body = '{"event":{}}';
+  const body = '{"version":"1.0","event":{}}';
   const sig1 = signPayload(body, 'secret-a');
   const sig2 = signPayload(body, 'secret-b');
 
@@ -513,6 +742,178 @@ test('signPayload — different bodies produce different signatures', (t) => {
   const sig2 = signPayload('{"b":2}', secret);
 
   t.notEqual(sig1, sig2, 'different bodies yield different signatures');
+  t.end();
+});
+
+// ── Part 6b: Canonical JSON serialization (#567) ────────────────────────────
+
+test('canonicalize — sorts object keys recursively and strips whitespace', (t) => {
+  t.equal(canonicalize({ b: 1, a: 2 }), '{"a":2,"b":1}', 'top-level keys are sorted');
+  t.equal(
+    canonicalize({ z: { y: 1, x: [3, 2, 1] }, a: 'v' }),
+    '{"a":"v","z":{"x":[3,2,1],"y":1}}',
+    'nested keys are sorted; array order is preserved',
+  );
+  t.equal(canonicalize({ a: 1 }), JSON.stringify({ a: 1 }), 'no insignificant whitespace');
+  t.equal(canonicalize(null), 'null', 'null serializes as null');
+  t.equal(canonicalize([1, 'two', true, null]), '[1,"two",true,null]', 'primitives in arrays');
+  t.end();
+});
+
+test('canonicalize — semantically identical payloads produce identical bytes', (t) => {
+  const payload = {
+    version: '1.0',
+    event: {
+      id: 'evt_1',
+      type: 'payment.completed',
+      amount: 100,
+      meta: { z: 'last', a: 'first', arr: [1, 2, { b: 1, a: 2 }] },
+    },
+  };
+
+  // Same data, different key insertion order (what a reserialization produces).
+  const shuffled = {
+    event: {
+      meta: { arr: [1, 2, { a: 2, b: 1 }], a: 'first', z: 'last' },
+      amount: 100,
+      type: 'payment.completed',
+      id: 'evt_1',
+    },
+    version: '1.0',
+  };
+
+  const roundTripped = JSON.parse(JSON.stringify(payload));
+
+  t.equal(canonicalize(payload), canonicalize(shuffled), 'key reordering does not change canonical bytes');
+  t.equal(canonicalize(payload), canonicalize(roundTripped), 'parse/stringify round-trip does not change canonical bytes');
+  t.end();
+});
+
+test('#567 — signature survives canonical re-serialization (sign & verify the canonical form)', (t) => {
+  const secret = 'merchant-secret';
+  const payload = {
+    version: '1.0',
+    event: { id: 'evt_1', type: 'payment.completed', meta: { b: 2, a: 1 } },
+  };
+
+  // Re-serialize the payload the way a consumer would after logging/storing
+  // it: parse, then stringify again (whitespace/key order may differ).
+  const reserialized = JSON.stringify(JSON.parse(JSON.stringify(payload)));
+  const canonical = canonicalize(payload);
+  const signature = signPayload(canonical, secret);
+
+  t.notEqual(reserialized, canonical, 'raw reserialization differs from canonical bytes (the original bug)');
+  t.equal(
+    canonicalize(JSON.parse(reserialized)),
+    canonical,
+    'canonicalizing the reserialized payload restores the signed bytes',
+  );
+  t.ok(
+    verifySignature(canonicalize(JSON.parse(reserialized)), secret, signature),
+    'verification matches after canonical re-serialization',
+  );
+  t.ok(verifySignature(canonical, secret, signature), 'verification matches on the original canonical form');
+  t.end();
+});
+
+// ── Part 6c: verifySignature (#567) ─────────────────────────────────────────
+
+test('verifySignature — accepts a valid signature', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ version: '1.0', event: { type: 'payment.completed' } });
+  const sig = signPayload(body, secret);
+
+  t.ok(verifySignature(body, secret, sig), 'valid signature verifies');
+  t.end();
+});
+
+test('verifySignature — rejects tampered body, wrong secret, malformed header', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ event: { type: 'payment.completed' } });
+  const sig = signPayload(body, secret);
+
+  t.notOk(
+    verifySignature(canonicalize({ event: { type: 'payment.failed' } }), secret, sig),
+    'tampered body rejected',
+  );
+  t.notOk(verifySignature(body, 'wrong-secret', sig), 'wrong secret rejected');
+  t.notOk(verifySignature(body, secret, 'garbage'), 'malformed header rejected');
+  t.notOk(verifySignature(body, secret, 't=abc,s=xyz'), 'non-numeric timestamp rejected');
+  t.notOk(
+    verifySignature(body, secret, sig.replace(/s=[0-9a-f]{64}$/, `s=${'0'.repeat(64)}`)),
+    'modified HMAC rejected',
+  );
+  t.end();
+});
+
+test('verifySignature — enforces maxAgeSeconds replay window', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ event: { type: 'payment.completed' } });
+  const now = 1_700_000_000;
+
+  const makeSig = (ts: number) => {
+    const hmac = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+    return `t=${ts},s=${hmac}`;
+  };
+
+  t.ok(verifySignature(body, secret, makeSig(now - 100), { maxAgeSeconds: 300, now }), 'fresh signature within window accepted');
+  t.notOk(verifySignature(body, secret, makeSig(now - 400), { maxAgeSeconds: 300, now }), 'signature older than window rejected');
+  t.ok(verifySignature(body, secret, makeSig(now - 400)), 'age check is optional — accepted without maxAgeSeconds');
+  t.end();
+});
+
+test('worker processor — signs the canonical body, verification survives reserialization (#567)', async (t) => {
+  let capturedBody = '';
+  let capturedSignature = '';
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedBody = String(init?.body ?? '');
+    const headers = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    capturedSignature = headers['X-BettaPay-Signature'] ?? '';
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — canonical signing test skipped');
+    t.end();
+    return;
+  }
+
+  const event = {
+    id: 'evt_1',
+    type: 'settlement.completed',
+    data: { amount: '100', currency: 'USDC' },
+  };
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event,
+    signingSecret: 'my-secret',
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedBody, canonicalize({ version: '1.0', event }), 'worker POSTs the canonical serialization');
+  t.ok(capturedSignature.startsWith('t='), 'signature header is present');
+
+  // Consumer receives the payload, logs/stores it, and reserializes it with
+  // keys in a different order — verification must still match.
+  const reserialized = JSON.parse(capturedBody);
+  const reordered = {
+    event: {
+      data: { currency: 'USDC', amount: '100' },
+      type: 'settlement.completed',
+      id: 'evt_1',
+    },
+    version: '1.0',
+  };
+  t.same(reordered, reserialized, 'reordered object is semantically identical');
+  t.ok(
+    verifySignature(canonicalize(reordered), 'my-secret', capturedSignature),
+    'signature verifies against canonical re-serialization',
+  );
   t.end();
 });
 
@@ -576,7 +977,278 @@ test('worker processor — no X-BettaPay-Signature when signingSecret absent', a
   t.end();
 });
 
-// ── Part 7: DLQ support (removeOnFail: false) ───────────────────────────────
+// ── Part 6d: Custom header passthrough (#569) ───────────────────────────────
+
+test('worker processor — delivers configured custom headers', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — custom header test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    headers: {
+      'Idempotency-Key': 'idem_abc123',
+      'X-Merchant-Auth': 'Bearer merchant-token',
+    },
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedHeaders['Idempotency-Key'], 'idem_abc123', 'idempotency header delivered');
+  t.equal(capturedHeaders['X-Merchant-Auth'], 'Bearer merchant-token', 'auth header delivered');
+  t.equal(capturedHeaders['Content-Type'], 'application/json', 'Content-Type is still set');
+  t.end();
+});
+
+test('worker processor — custom headers are replayed identically across retry attempts', async (t) => {
+  const attemptsSeen: Array<Record<string, string>> = [];
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    attemptsSeen.push(
+      Object.fromEntries(Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])),
+    );
+    // Fail the first two attempts so BullMQ (in prod) would retry; here we
+    // just invoke the processor again ourselves with an incremented
+    // attemptsMade, exactly as BullMQ would when it re-delivers job.data.
+    if (attemptsSeen.length < 3) throw new Error('simulated transient failure');
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — retry header test skipped');
+    t.end();
+    return;
+  }
+
+  const jobData: WebhookJobData = {
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    headers: { 'Idempotency-Key': 'idem_stable_across_retries' },
+  };
+
+  for (let attemptsMade = 0; attemptsMade < 3; attemptsMade++) {
+    try {
+      await processor(makeFakeJob(jobData, attemptsMade) as any);
+    } catch {
+      // expected for the first two simulated attempts
+    }
+  }
+
+  t.equal(attemptsSeen.length, 3, 'processor ran three attempts');
+  for (const [i, headers] of attemptsSeen.entries()) {
+    t.equal(
+      headers['Idempotency-Key'],
+      'idem_stable_across_retries',
+      `attempt ${i + 1} carried the same custom header`,
+    );
+  }
+  t.end();
+});
+
+test('worker processor — custom headers cannot override Content-Type or the signature header', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — header override test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    signingSecret: 'my-secret',
+    headers: {
+      'content-type': 'text/plain',
+      'X-BETTAPAY-SIGNATURE': 'forged',
+      'X-Safe-Header': 'kept',
+    },
+  });
+
+  await processor(job as any);
+
+  t.equal(capturedHeaders['Content-Type'], 'application/json', 'Content-Type cannot be overridden (case-insensitive)');
+  t.notEqual(capturedHeaders['X-BettaPay-Signature'], 'forged', 'signature cannot be spoofed via custom headers (case-insensitive)');
+  t.ok(capturedHeaders['X-BettaPay-Signature']?.startsWith('t='), 'real computed signature is sent instead');
+  t.equal(capturedHeaders['X-Safe-Header'], 'kept', 'non-reserved custom headers still pass through');
+  t.end();
+});
+
+test('worker processor — no custom headers means only the defaults are sent', async (t) => {
+  let capturedHeaders: Record<string, string> = {};
+
+  const mockFetch: typeof fetch = async (_input, init) => {
+    capturedHeaders = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).map(([k, v]) => [k, String(v)])
+    );
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — default headers test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+  });
+
+  await processor(job as any);
+
+  t.same(Object.keys(capturedHeaders), ['Content-Type'], 'only Content-Type is sent when no headers/secret configured');
+  t.end();
+});
+
+// ── Part 7: Webhook deduplication (Redis SET NX) ──────────────────────────
+
+test('worker processor — deliver webhook records eventId in Redis', async (t) => {
+  let redisKey = '';
+  let redisValue = '';
+  let redisMode = '';
+  let redisDuration = '';
+  let redisFlag = '';
+
+  const mockRedis: DedupRedis = {
+    set: async (key, value, mode, duration, flag) => {
+      redisKey = key;
+      redisValue = value;
+      redisMode = mode;
+      redisDuration = duration;
+      redisFlag = flag;
+      return 'OK';
+    },
+  };
+
+  const mockFetch: typeof fetch = async () => ({ ok: true, status: 200 } as Response);
+
+  const processor = extractProcessor(mockFetch, undefined, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — dedup test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_123',
+  });
+
+  await processor(job as any);
+
+  t.equal(redisKey, 'webhook_sent:evt_123', 'uses webhook_sent:{eventId} key');
+  t.equal(redisValue, '1', 'sets value to 1');
+  t.equal(redisMode, 'PX', 'uses PX mode');
+  t.equal(redisDuration, '3600000', 'TTL is 3600000 ms (1 hour)');
+  t.equal(redisFlag, 'NX', 'uses NX flag');
+  t.end();
+});
+
+test('worker processor — duplicate eventId is skipped and warning logged', async (t) => {
+  const logs: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
+  const logger: WebhookLogger = {
+    info: (obj, msg) => logs.push({ level: 'info', obj, msg }),
+    warn: (obj, msg) => logs.push({ level: 'warn', obj, msg }),
+    error: (obj, msg) => logs.push({ level: 'error', obj, msg }),
+  };
+
+  let callCount = 0;
+  const mockRedis: DedupRedis = {
+    set: async () => {
+      callCount++;
+      return null; // NX fails — key already exists
+    },
+  };
+
+  const mockFetch: typeof fetch = async () => {
+    throw new Error('should not be called');
+  };
+
+  const processor = extractProcessor(mockFetch, logger, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — dedup skip test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_dup',
+  });
+
+  await processor(job as any);
+
+  t.equal(callCount, 1, 'Redis set was called once');
+  const warnLogs = logs.filter((l) => l.level === 'warn');
+  t.ok(warnLogs.length >= 1, 'warning log emitted');
+  t.ok(warnLogs.some((l) => l.msg.includes('Duplicate')), 'warning mentions duplicate');
+  t.end();
+});
+
+test('worker processor — Redis unavailable fails closed (throws without delivering duplicate)', async (t) => {
+  let delivered = false;
+  const mockRedis: DedupRedis = {
+    set: async () => { throw new Error('ECONNREFUSED'); },
+  };
+
+  const mockFetch: typeof fetch = async () => {
+    delivered = true;
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch, undefined, mockRedis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — fail-closed test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'settlement.completed' },
+    eventId: 'evt_failclosed',
+  });
+
+  let threw = false;
+  try {
+    await processor(job as any);
+  } catch (err) {
+    threw = true;
+    t.ok((err as Error).message.includes('Redis dedup check failed'), 'error mentions dedup check failure');
+  }
+
+  t.true(threw, 'processor throws when Redis dedup check fails (fail-closed)');
+  t.false(delivered, 'webhook was NOT delivered when Redis dedup failed');
+  t.end();
+});
+
+// ── Part 8: DLQ support (removeOnFail: false & deadLetterQueue) ───────────────
 
 test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => {
   let threw = false;
@@ -589,5 +1261,42 @@ test('createWebhookQueue — removeOnFail: false keeps all failed jobs', (t) => 
     threw = false;
   }
   t.notOk(threw, 'factory does not throw with removeOnFail: false');
+  t.end();
+});
+
+test('createWebhookWorker — routes exhausted failed jobs to deadLetterQueue', async (t) => {
+  const archivedJobs: Array<{ name: string; data: WebhookJobData }> = [];
+  const mockDlq = {
+    add: async (name: string, data: WebhookJobData) => {
+      archivedJobs.push({ name, data });
+    },
+  };
+
+  try {
+    const worker = createWebhookWorker('test-worker-dlq', FAKE_CONNECTION as any, {
+      deadLetterQueue: mockDlq,
+    });
+    // Emit failed event on worker with exhausted attempts
+    const failedJob: any = {
+      id: 'job_dlq_1',
+      attemptsMade: 5,
+      opts: { attempts: 5 },
+      data: {
+        url: 'https://merchant.example/hook',
+        event: { type: 'payment.failed' },
+        eventId: 'evt_dlq_1',
+      },
+    };
+
+    worker.emit('failed', failedJob, new Error('Simulated failure'));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    t.equal(archivedJobs.length, 1, 'job was routed to dead-letter queue');
+    t.equal(archivedJobs[0]?.data?.eventId, 'evt_dlq_1', 'archived correct job data');
+    void worker.close().catch(() => {});
+  } catch {
+    t.pass('Worker constructor skipped (no Redis connection)');
+  }
   t.end();
 });

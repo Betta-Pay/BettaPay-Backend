@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import {
   MOCK_MERCHANT_TIGHT_LIMITS,
 } from './test-fixtures.js';
@@ -25,19 +25,19 @@ test('bulk-limits: validates item below tight min limit', async (t) => {
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
-        { amount: '4.99', asset: 'XLM' }, // Below min (5.00)
-        { amount: '5.00', asset: 'XLM' }, // Exactly min
+        { amount: '4.99', asset: 'USDC' }, // Below min (5.00)
+        { amount: '5.00', asset: 'USDC' }, // Exactly min
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 2);
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 0);
-  t.ok(body.errors[0].reason.includes('below minimum'));
+  t.equal(body.data.total, 2);
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 0);
+  t.ok(body.data.errors[0].reason.includes('below minimum'));
   t.end();
 });
 
@@ -51,19 +51,19 @@ test('bulk-limits: validates item above tight max limit', async (t) => {
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
-        { amount: '100.00', asset: 'XLM' }, // Exactly max
-        { amount: '100.01', asset: 'XLM' }, // Above max (100.00)
+        { amount: '100.00', asset: 'USDC' }, // Exactly max
+        { amount: '100.01', asset: 'USDC' }, // Above max (100.00)
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 2);
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 1);
-  t.ok(body.errors[0].reason.includes('exceeds maximum'));
+  t.equal(body.data.total, 2);
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 1);
+  t.ok(body.data.errors[0].reason.includes('exceeds maximum'));
   t.end();
 });
 
@@ -78,20 +78,20 @@ test('bulk-limits: daily limit aggregation on empty history', async (t) => {
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
-        { amount: '90.00', asset: 'XLM' },
-        { amount: '90.00', asset: 'XLM' },
-        { amount: '30.00', asset: 'XLM' }, // Cumulative: 210.00, exceeds tight daily limit of 200.00
+        { amount: '90.00', asset: 'USDC' },
+        { amount: '90.00', asset: 'USDC' },
+        { amount: '30.00', asset: 'USDC' }, // Cumulative: 210.00, exceeds tight daily limit of 200.00
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 3);
-  t.equal(body.created, 2);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 2);
-  t.ok(body.errors[0].reason.includes('daily settlement limit exceeded'));
+  t.equal(body.data.total, 3);
+  t.equal(body.data.created, 2);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 2);
+  t.ok(body.data.errors[0].reason.includes('Daily settlement limit exceeded'));
   t.end();
 });
 
@@ -106,18 +106,18 @@ test('bulk-limits: daily limit aggregation with pre-existing settlements', async
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
-        { amount: '40.00', asset: 'XLM' }, // Fit (150+40 <= 200)
-        { amount: '20.00', asset: 'XLM' }, // Exceed (150+40+20 > 200)
+        { amount: '40.00', asset: 'USDC' }, // Fit (150+40 <= 200)
+        { amount: '20.00', asset: 'USDC' }, // Exceed (150+40+20 > 200)
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 2);
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 1);
+  t.equal(body.data.total, 2);
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 1);
   t.end();
 });
 
@@ -132,16 +132,35 @@ test('bulk-limits: decimal precision check under boundary constraints', async (t
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
-        { amount: '10.0000001', asset: 'XLM' }, // Highly precise decimal
+        { amount: '10.0000001', asset: 'USDC' }, // Highly precise decimal
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 1);
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 0);
+  t.equal(body.data.total, 1);
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 0);
+  t.end();
+});
+
+test('bulk-limits: rejects empty bulk batch', async (t) => {
+  resetMocks();
+  prisma.merchant.findUnique = async () => MOCK_MERCHANT_TIGHT_LIMITS as any;
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    payload: {
+      merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
+      settlements: [],
+    },
+  });
+
+  t.equal(res.statusCode, 400);
+  const body = JSON.parse(res.body);
+  t.ok(body.error.message.includes('at least one settlement'));
   t.end();
 });
 
@@ -158,16 +177,24 @@ test('bulk-limits: handles multiple assets in the same daily limit check', async
       settlements: [
         { amount: '50.00', asset: 'USDC' },
         { amount: '50.00', asset: 'EURT' },
-        { amount: '10.00', asset: 'XLM' }, // Exceeds daily limit (100 + 50 + 50 + 10 = 210 > 200)
+        { amount: '10.00', asset: 'USDC' }, // Exceeds daily limit (100 + 50 + 50 + 10 = 210 > 200)
       ],
     },
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 3);
-  t.equal(body.created, 2);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 2);
+  t.equal(body.data.total, 3);
+  t.equal(body.data.created, 2);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 2);
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

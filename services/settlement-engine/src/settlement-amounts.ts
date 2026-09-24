@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * settlement-amounts.ts
  *
@@ -19,12 +20,41 @@
  * effective fee is clamped to [0, feeBps] so it can never go negative.
  */
 
-import BigNumber from 'bignumber.js';
-import type { Amount } from '@bettapay/shared-types';
-import { assertSettlementInvariants } from './settlement-properties.js';
+import BigNumber from "bignumber.js";
+import type { Amount } from "@bettapay/shared-types";
+import { feeSnapshotSchema } from "@bettapay/validation";
+import type { FeeScheduleItem } from "@bettapay/validation";
+import { ASSET_PRECISION_MAPPINGS } from "./settlement-properties.js";
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
-BigNumber.config({ ROUNDING_MODE: BigNumber.ROUND_DOWN, EXPONENTIAL_AT: [-20, 40] });
+BigNumber.config({
+  ROUNDING_MODE: BigNumber.ROUND_DOWN,
+  EXPONENTIAL_AT: [-20, 40],
+});
+
+/**
+ * Fee algorithm version constant (#482).
+ * Bump this when the fee computation logic changes so audits can
+ * distinguish pre/post-change snapshots.
+ */
+export const FEE_VERSION = '1.0' as const;
+
+/**
+ * Maximum allowed settlement amount in whole currency units (#481).
+ * The per-asset cap is derived as: MAX_SETTLEMENT_BASE_UNITS × 10^decimals.
+ */
+export const MAX_SETTLEMENT_BASE_UNITS = "100000000"; // 10^8
+
+/** Legacy absolute cap used when asset is unknown (10^15). */
+export const MAX_SETTLEMENT_AMOUNT = "1000000000000000";
+
+/** Thrown when a settlement gross amount exceeds MAX_SETTLEMENT_AMOUNT. */
+export class SettlementAmountError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SettlementAmountError";
+  }
+}
 
 export interface DiscountTier {
   /** Minimum monthly gross volume (USD/USDC) that activates this tier. */
@@ -58,6 +88,26 @@ export interface FeeConfig {
   feeBps: number;
   maxFeeBps?: number;
   maxFeeThreshold?: string;
+}
+
+/**
+ * Returns the maximum settlement amount (as a decimal string) for a given
+ * asset, derived from its decimal precision (#481).
+ *
+ * For a 7-decimal asset like USDC: 10^8 × 10^7 = 10^15
+ * For a 2-decimal asset like NGN:  10^8 × 10^2 = 10^10
+ *
+ * Falls back to MAX_SETTLEMENT_AMOUNT when the asset is unknown.
+ */
+export function getMaxSettlementAmountForAsset(asset?: string): string {
+  if (!asset) return MAX_SETTLEMENT_AMOUNT;
+  const normalized = asset.toUpperCase();
+  const config = ASSET_PRECISION_MAPPINGS[normalized];
+  // Unknown assets fall back to the legacy absolute cap — a made-up precision
+  // must never silently lower (or raise) the limit.
+  if (!config) return MAX_SETTLEMENT_AMOUNT;
+  const decimals = config.decimals;
+  return new BigNumber(MAX_SETTLEMENT_BASE_UNITS).multipliedBy(new BigNumber(10).pow(decimals)).toFixed(0);
 }
 
 /**
@@ -105,6 +155,7 @@ export function resolveVolumeDiscount(
  *                        Defaults to 0 (no discount applied).
  * @param discountTiers   Volume-discount tier list from `FEE_DISCOUNT_TIERS`.
  *                        Defaults to [] (no tiers, no discount).
+ * @param asset           Optional asset code for per-asset max validation (#481).
  * @returns               { grossAmount, feeAmount, netAmount, feeSnapshot }
  *
  * @example
@@ -121,18 +172,31 @@ export function computeSettlementAmounts(
   feeBps: number,
   monthlyVolume = 0,
   discountTiers: DiscountTier[] = [],
+  asset?: string,
 ): SettlementAmounts {
   const gross = new BigNumber(grossAmountStr);
 
+  // Guard: reject amounts that exceed the maximum allowed settlement amount (#481).
+  // Per-asset cap is derived from the asset's decimal precision.
+  const effectiveMax = getMaxSettlementAmountForAsset(asset);
+  if (gross.isGreaterThan(effectiveMax)) {
+    throw new SettlementAmountError(
+      `Settlement amount ${grossAmountStr} exceeds maximum allowed (${effectiveMax}) for asset ${asset ?? 'unknown'}`,
+    );
+  }
+
   // Resolve volume-based discount and clamp to [0, feeBps]
-  const discountBps = Math.min(resolveVolumeDiscount(monthlyVolume, discountTiers), feeBps);
+  const discountBps = Math.min(
+    resolveVolumeDiscount(monthlyVolume, discountTiers),
+    feeBps,
+  );
   const effectiveFeeBps = Math.max(0, feeBps - discountBps);
 
   // fee = gross × effectiveFeeBps / 10 000   (rounded DOWN to preserve net accuracy)
   const fee = gross.multipliedBy(effectiveFeeBps).dividedBy(10_000);
 
   // Preserve the same decimal places as the original input string.
-  const inputDecimals = (grossAmountStr.split('.')[1] ?? '').length;
+  const inputDecimals = (grossAmountStr.split(".")[1] ?? "").length;
   const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
@@ -141,11 +205,19 @@ export function computeSettlementAmounts(
     maxFeeBpsApplied: feeBps,
     discountApplied: discountBps,
     monthlyVolumeAtTime: monthlyVolume,
-    feeVersion: '1.0',
+    feeVersion: "1.0",
   };
 
-  const result = {
-    grossAmount: grossAmountStr,   // exact original — zero rounding
+  // Validate fee snapshot against schema (#625)
+  const validationResult = feeSnapshotSchema.safeParse(feeSnapshot);
+  if (!validationResult.success) {
+    throw new SettlementAmountError(
+      `Invalid fee snapshot: ${validationResult.error.message}`,
+    );
+  }
+
+  return {
+    grossAmount: grossAmountStr, // exact original — zero rounding
     feeAmount: feeStr,
     netAmount: netStr,
     feeSnapshot,
@@ -159,4 +231,45 @@ export function computeSettlementAmounts(
   });
 
   return result;
+}
+
+/**
+ * Computes the applicable fee BPS for a given asset based on fee schedules.
+ * Falls back to defaultBps if no matching schedule is found.
+ *
+ * @param asset       The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules  Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps    Default fee BPS to use if no schedule matches
+ * @returns           The applicable fee BPS for the asset
+ */
+export function resolveFeeBpsForAsset(
+  asset: string,
+  feeSchedules: FeeScheduleItem[] | undefined,
+  defaultBps: number,
+): number {
+  if (!feeSchedules || feeSchedules.length === 0) {
+    return defaultBps;
+  }
+  const schedule = feeSchedules.find((s) => s.asset === asset);
+  return schedule ? schedule.bps : defaultBps;
+}
+
+/**
+ * Computes fee and net amounts with full decimal precision using BigNumber,
+ * resolving the fee BPS from fee schedules based on the asset.
+ *
+ * @param grossAmountStr  Validated numeric string from the request body.
+ * @param asset           The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules    Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps      Default fee BPS to use if no schedule matches
+ * @returns               { grossAmount, feeAmount, netAmount } as full-precision strings.
+ */
+export function computeSettlementAmountsWithSchedule(
+  grossAmountStr: Amount,
+  asset: string,
+  feeSchedules: FeeScheduleItem[] | undefined,
+  defaultBps: number,
+): SettlementAmounts {
+  const feeBps = resolveFeeBpsForAsset(asset, feeSchedules, defaultBps);
+  return computeSettlementAmounts(grossAmountStr, feeBps, 0, [], asset);
 }

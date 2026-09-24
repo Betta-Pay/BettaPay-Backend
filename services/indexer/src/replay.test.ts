@@ -79,3 +79,11 @@ test('replay: graceful shutdown closes replay queue and worker', (t) => {
   t.ok(content.includes('replayProgressRedis.quit()'), 'replayProgressRedis quit on shutdown');
   t.end();
 });
+
+test('replay: dedupes out-of-order and duplicate ledgers by sequence', (t) => {
+  t.ok(content.includes('const processedLedgers = new Set<number>()'), 'tracks processed ledgers');
+  t.ok(content.includes('processedLedgers.add(currentLedger)'), 'adds to processed ledgers');
+  t.ok(content.includes('processedLedgers.has(evt.ledger)'), 'checks for duplicate ledgers');
+  t.ok(content.includes('[Indexer] Skipping out-of-order or duplicate ledger'), 'logs warning for skipped ledgers');
+  t.end();
+});

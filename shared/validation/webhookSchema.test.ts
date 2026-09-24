@@ -10,6 +10,8 @@ import {
   clearDnsCache,
   validateWebhookUrl,
   WEBHOOK_VALIDATE_RATE_LIMIT,
+  WebhookPayloadSchema,
+  WebhookHeadersSchema,
 } from './webhookSchema.js';
 
 test('createWebhookUrlSchema - format & length rules apply in every environment', async (t) => {
@@ -221,5 +223,107 @@ test('validateWebhookUrl', async (t) => {
     assert.strictEqual(result.statusCode, 500);
 
     mockDns.mock.restore();
+  });
+});
+
+test('WebhookPayloadSchema', async (t) => {
+  await t.test('accepts valid payload with version', () => {
+    const payload = {
+      version: '1.0',
+      event: { id: 'evt_123', type: 'PaymentInitiated' },
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, true);
+  });
+
+  await t.test('rejects payload missing version', () => {
+    const payload = {
+      event: { id: 'evt_123', type: 'PaymentInitiated' },
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, false);
+    if (!result.success) {
+      assert.match(result.error.issues[0].message, /Required|version/i);
+    }
+  });
+
+  await t.test('rejects payload missing event', () => {
+    const payload = {
+      version: '1.0',
+    };
+    const result = WebhookPayloadSchema.safeParse(payload);
+    assert.strictEqual(result.success, false);
+  });
+});
+
+// #569 — configurable custom headers per webhook subscription
+test('WebhookHeadersSchema', async (t) => {
+  await t.test('accepts a valid map of custom headers', () => {
+    const result = WebhookHeadersSchema.safeParse({
+      'Idempotency-Key': 'idem_abc123',
+      'X-Merchant-Auth': 'Bearer merchant-token',
+    });
+    assert.strictEqual(result.success, true);
+  });
+
+  await t.test('accepts an empty header map', () => {
+    const result = WebhookHeadersSchema.safeParse({});
+    assert.strictEqual(result.success, true);
+  });
+
+  await t.test('rejects Content-Type as a custom header (case-insensitive)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'Content-Type': 'text/plain' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'content-type': 'text/plain' }).success, false);
+  });
+
+  await t.test('rejects X-BettaPay-Signature as a custom header (case-insensitive)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'X-BettaPay-Signature': 'forged' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'x-bettapay-signature': 'forged' }).success, false);
+  });
+
+  await t.test('rejects header names with invalid characters', () => {
+    const result = WebhookHeadersSchema.safeParse({ 'Bad Header Name': 'value' });
+    assert.strictEqual(result.success, false);
+  });
+
+  await t.test('rejects header values containing line breaks (header injection) (#607)', () => {
+    // The exact attack shape from #607's acceptance criteria.
+    const result = WebhookHeadersSchema.safeParse({ 'X-Ok': 'a\r\nInjected: b' });
+    assert.strictEqual(result.success, false);
+  });
+
+  await t.test('rejects Host as a custom header (case-insensitive) (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ Host: 'evil.example.com' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ host: 'evil.example.com' }).success, false);
+  });
+
+  await t.test('rejects Content-Length as a custom header (case-insensitive) (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'Content-Length': '0' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'content-length': '0' }).success, false);
+  });
+
+  await t.test('rejects Transfer-Encoding and Connection as custom headers (#607)', () => {
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ 'Transfer-Encoding': 'chunked' }).success, false);
+    assert.strictEqual(WebhookHeadersSchema.safeParse({ Connection: 'keep-alive' }).success, false);
+  });
+
+  await t.test('valid headers round-trip unchanged (#607)', () => {
+    const result = WebhookHeadersSchema.safeParse({ 'X-Ok': 'a normal value', 'X-Idempotency-Key': 'abc123' });
+    assert.strictEqual(result.success, true);
+    if (result.success) {
+      assert.deepStrictEqual(result.data, { 'X-Ok': 'a normal value', 'X-Idempotency-Key': 'abc123' });
+    }
+  });
+
+  await t.test('rejects more than 20 custom headers', () => {
+    const tooMany: Record<string, string> = {};
+    for (let i = 0; i < 21; i++) tooMany[`X-Header-${i}`] = 'v';
+    const result = WebhookHeadersSchema.safeParse(tooMany);
+    assert.strictEqual(result.success, false);
+  });
+
+  await t.test('rejects a header value exceeding 4096 characters', () => {
+    const result = WebhookHeadersSchema.safeParse({ 'X-Long': 'a'.repeat(4097) });
+    assert.strictEqual(result.success, false);
   });
 });

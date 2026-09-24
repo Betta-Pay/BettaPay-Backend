@@ -17,24 +17,58 @@ export interface AuditLogRequestLike {
   user?: unknown;
 }
 
-function getRequestIp(request?: AuditLogRequestLike | null): string | null {
-  if (!request) return null;
+function parseTrustedProxyCount(raw: string | undefined): number {
+  const parsed = raw !== undefined ? parseInt(raw, 10) : 0;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
+ * Extract the real client IP from a request, honoring a configured number of
+ * trusted reverse-proxy hops (#621).
+ *
+ * X-Forwarded-For (and X-Real-IP) are entirely attacker-controlled unless
+ * something in front of this process is known to overwrite/append to them
+ * honestly. With trustedProxyCount = 0 (the default), neither header is
+ * consulted — the request's own transport-layer address (request.ip) is
+ * used, which the client cannot spoof. With trustedProxyCount = N, the
+ * X-Forwarded-For chain is combined with request.ip into one hop list
+ * [xff-entries..., request.ip] and the client is taken to be the entry N
+ * positions in from the right — i.e. the entries a chain of N trusted
+ * proxies would have appended are stripped off, mirroring Express's/
+ * Fastify's `trust proxy: N` semantics.
+ */
+export function getClientIp(
+  request: AuditLogRequestLike,
+  trustedProxyCount: number = parseTrustedProxyCount(process.env.TRUSTED_PROXY_COUNT),
+): string {
+  const fallback = request.ip ?? '';
+  if (trustedProxyCount <= 0) return fallback;
 
   const forwardedFor = request.headers?.['x-forwarded-for'];
-  if (typeof forwardedFor === 'string') {
-    const [first] = forwardedFor.split(',');
-    return first?.trim() || null;
-  }
-  if (Array.isArray(forwardedFor) && forwardedFor.length > 0) {
-    return String(forwardedFor[0]).trim() || null;
+  const rawForwardedFor = Array.isArray(forwardedFor) ? forwardedFor.join(',') : forwardedFor;
+
+  if (typeof rawForwardedFor === 'string' && rawForwardedFor.trim()) {
+    const hops = rawForwardedFor
+      .split(',')
+      .map((hop) => hop.trim())
+      .filter(Boolean);
+    const chain = [...hops, fallback];
+    const clientIndex = Math.max(0, chain.length - 1 - trustedProxyCount);
+    return chain[clientIndex] || fallback;
   }
 
   const realIp = request.headers?.['x-real-ip'];
-  if (typeof realIp === 'string' && realIp.trim()) {
-    return realIp.trim();
+  const rawRealIp = Array.isArray(realIp) ? realIp[0] : realIp;
+  if (typeof rawRealIp === 'string' && rawRealIp.trim()) {
+    return rawRealIp.trim();
   }
 
-  return request.ip ?? null;
+  return fallback;
+}
+
+function getRequestIp(request?: AuditLogRequestLike | null): string | null {
+  if (!request) return null;
+  return getClientIp(request) || null;
 }
 
 function getActorFromRequest(request?: AuditLogRequestLike | null): {

@@ -27,6 +27,48 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
   } as unknown as Response;
 }
 
+test('GET /api/health/live always returns 200 (liveness probe)', async () => {
+  const prisma = createMockPrisma() as any;
+
+  const app = buildApp({
+    prisma,
+    logger: false,
+    fetchImpl: (async () => { throw new Error('all downstream down'); }) as any
+  });
+
+  const res = await app.inject({ method: 'GET', url: '/api/health/live' });
+  assert.equal(res.statusCode, 200);
+
+  const body = JSON.parse(res.body);
+  assert.equal(body.status, 'alive');
+  assert.equal(body.service, 'api-gateway');
+
+  await app.close();
+});
+
+test('GET /api/health returns 503 when critical dependents fail (readiness probe)', async () => {
+  const prisma = createMockPrisma() as any;
+
+  const fetchImpl = async (url: string | URL | Request) => {
+    throw new Error('upstream unreachable');
+  };
+
+  const app = buildApp({
+    prisma,
+    logger: false,
+    fetchImpl: fetchImpl as any
+  });
+
+  const res = await app.inject({ method: 'GET', url: '/api/health' });
+  assert.equal(res.statusCode, 503);
+
+  const body = JSON.parse(res.body);
+  assert.equal(body.status, 'unhealthy');
+  assert.equal(body.service, 'api-gateway');
+
+  await app.close();
+});
+
 test('GET /api/health/all aggregates downstream health with graceful degradation', async () => {
   const prisma = createMockPrisma() as any;
 

@@ -47,8 +47,32 @@ pnpm lint               # Lint all packages
 pnpm type-check         # Run TypeScript type checking
 pnpm build              # Build the workspace packages
 pnpm test               # Execute the test suite
+pnpm test:load          # Run k6 load tests (requires k6 installed)
+pnpm test:mutation      # Run mutation tests (Stryker)
 pnpm audit --audit-level=high   # Security audit (fails on high/critical)
 ```
+
+## Load testing
+
+Run the k6 settlement-creation load test to ramp from 1 to 50 VUs over 60s:
+
+```bash
+# install k6 (macOS/Homebrew or apt/choco) and then:
+k6 run tests/load/settlement-creation.js --env GATEWAY_URL=http://localhost:3000 --env MERCHANT_ID=test-merchant
+```
+
+Check p50/p95/p99 and error rate in k6 output. To capture BullMQ queue depth, query Redis `llen` for `bull:settlements:wait` during the test.
+
+## Mutation testing
+
+Run mutation tests with Stryker using the workspace script:
+
+```bash
+pnpm test:mutation
+```
+
+Target mutation score is >= 80% for critical modules (`settlement-amounts.ts`, `shared/validation/schemas.ts`). Address surviving mutants by either strengthening tests or fixing the implementation.
+
 If any of these commands fail, fix the reported issues before pushing.
 
 ### Required status checks

@@ -4,34 +4,158 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface MinimalLogger {
+export interface MinimalLogger {
   warn: (obj: object, msg?: string) => void;
   info: (obj: object, msg?: string) => void;
   error: (obj: object, msg?: string) => void;
 }
 
-export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrategy'> {
-  maxDelayMs?: number;
+export interface RedisHealthState {
+  connected: boolean;
+  errors: number;
+  lastError?: string;
+  reconnects: number;
 }
 
-// #386 — exponential backoff: 2^attempt × 100 ms, capped at maxDelayMs (default 5 s).
-// Retries indefinitely so transient restarts do not permanently break the connection.
-export function createRedisClient(
-  url: string,
-  logger: MinimalLogger,
-  options: CreateRedisClientOptions = {},
-): Redis {
-  const { maxDelayMs = 5_000, ...rest } = options;
+export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrategy'> {
+  maxDelayMs?: number;
+  url?: string;
+  logger?: MinimalLogger;
+  shared?: boolean;
+  onConnect?: () => void;
+  onError?: (err: Error) => void;
+  onClose?: () => void;
+  onReconnect?: () => void;
+  healthState?: RedisHealthState;
+}
 
-  return new Redis(url, {
+const sharedRedisClients = new Map<string, Redis>();
+
+export function getSharedRedisClient(
+  urlOrOptions?: string | CreateRedisClientOptions,
+  logger?: MinimalLogger,
+  options?: CreateRedisClientOptions,
+): Redis {
+  let url: string;
+  let clientOpts: CreateRedisClientOptions;
+  let log: MinimalLogger | undefined;
+
+  if (typeof urlOrOptions === 'string') {
+    url = urlOrOptions;
+    log = logger;
+    clientOpts = options ?? {};
+  } else {
+    clientOpts = urlOrOptions ?? {};
+    url = clientOpts.url ?? process.env.REDIS_URL ?? 'redis://localhost:6379';
+    log = logger ?? clientOpts.logger;
+  }
+
+  if (!sharedRedisClients.has(url)) {
+    const client = createRedisClient(url, log, {
+      ...clientOpts,
+      maxRetriesPerRequest: clientOpts.maxRetriesPerRequest ?? null,
+      shared: false,
+    });
+    sharedRedisClients.set(url, client);
+  }
+  return sharedRedisClients.get(url)!;
+}
+
+export async function clearSharedRedisClients(): Promise<void> {
+  for (const client of sharedRedisClients.values()) {
+    try {
+      await client.quit();
+    } catch {
+      client.disconnect();
+    }
+  }
+  sharedRedisClients.clear();
+}
+
+// #386 & #231 — exponential backoff and shared Redis connection management.
+// Supports connection sharing, lifecycle hooks (connect, error, close, reconnect),
+// and default maxRetriesPerRequest: null for BullMQ compatibility.
+export function createRedisClient(
+  urlOrOptions?: string | CreateRedisClientOptions,
+  logger?: MinimalLogger,
+  options?: CreateRedisClientOptions,
+): Redis {
+  let url: string;
+  let clientOpts: CreateRedisClientOptions;
+  let log: MinimalLogger | undefined;
+
+  if (typeof urlOrOptions === 'string') {
+    url = urlOrOptions;
+    log = logger;
+    clientOpts = options ?? {};
+  } else {
+    clientOpts = urlOrOptions ?? {};
+    url = clientOpts.url ?? process.env.REDIS_URL ?? 'redis://localhost:6379';
+    log = logger ?? clientOpts.logger;
+  }
+
+  if (clientOpts.shared) {
+    return getSharedRedisClient(url, log, clientOpts);
+  }
+
+  const {
+    maxDelayMs = 5_000,
+    onConnect,
+    onError,
+    onClose,
+    onReconnect,
+    healthState,
+    logger: _ignoredLogger,
+    url: _ignoredUrl,
+    shared: _ignoredShared,
+    ...rest
+  } = clientOpts;
+
+  const client = new Redis(url, {
     enableOfflineQueue: false,
+    maxRetriesPerRequest: null,
     ...rest,
     retryStrategy: (attempt: number) => {
       const delay = Math.min(Math.pow(2, attempt) * 100, maxDelayMs);
-      logger.warn({ attempt, delayMs: delay }, 'Redis connection retry');
+      log?.warn({ attempt, delayMs: delay }, 'Redis connection retry');
       return delay;
     },
   });
+
+  client.on('connect', () => {
+    log?.info({ url }, 'Redis connection established');
+    if (healthState) {
+      healthState.connected = true;
+    }
+    onConnect?.();
+  });
+
+  client.on('error', (err: Error) => {
+    log?.warn({ err: err.message, url }, 'Redis connection error');
+    if (healthState) {
+      healthState.errors++;
+      healthState.lastError = err.message;
+    }
+    onError?.(err);
+  });
+
+  client.on('close', () => {
+    log?.warn({ url }, 'Redis connection closed');
+    if (healthState) {
+      healthState.connected = false;
+    }
+    onClose?.();
+  });
+
+  client.on('reconnecting', () => {
+    log?.info({ url }, 'Redis reconnecting');
+    if (healthState) {
+      healthState.reconnects++;
+    }
+    onReconnect?.();
+  });
+
+  return client;
 }
 
 export interface WaitForRedisOptions {

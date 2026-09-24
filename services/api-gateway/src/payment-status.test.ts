@@ -2,7 +2,7 @@ import test from 'tape';
 import { createTestApp, generateTestJwt } from './test-utils.js';
 
 test('authorization: PATCH /api/payments/:id/status returns 401 without valid JWT', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     payments: [{ id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
   });
 
@@ -19,7 +19,7 @@ test('authorization: PATCH /api/payments/:id/status returns 401 without valid JW
 
 test('persistence & transitions: initiated transitions to a terminal state and updates DB', async (t) => {
   const initialPayment = { id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' };
-  const { app, mockPrisma } = createTestApp({}, { payments: [initialPayment] });
+  const { app, mockPrisma } = await createTestApp({}, { payments: [initialPayment] });
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -31,7 +31,7 @@ test('persistence & transitions: initiated transitions to a terminal state and u
 
   t.equal(res.statusCode, 200, 'returns 200 OK');
   const body = JSON.parse(res.body);
-  t.equal(body.status, 'completed', 'response status is updated to completed');
+  t.equal(body.data.status, 'completed', 'response status is updated to completed');
 
   // Persistence verification in mock DB
   const stored = await mockPrisma.payment.findUnique({ where: { id: 'pay_1' } });
@@ -43,7 +43,7 @@ test('persistence & transitions: initiated transitions to a terminal state and u
 });
 
 test('terminal states cannot transition', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     payments: [{ id: 'pay_1', status: 'completed', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
   });
   const token = generateTestJwt(app);
@@ -64,7 +64,7 @@ test('terminal states cannot transition', async (t) => {
 });
 
 test('an unaccepted status value is rejected as a bad payload', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     payments: [{ id: 'pay_1', status: 'initiated', merchantId: 'm1', amount: '10.00', asset: 'USDC' }],
   });
   const token = generateTestJwt(app);
@@ -82,7 +82,7 @@ test('an unaccepted status value is rejected as a bad payload', async (t) => {
 });
 
 test('updating a missing payment returns 404', async (t) => {
-  const { app } = createTestApp({}, { payments: [] });
+  const { app } = await createTestApp({}, { payments: [] });
   const token = generateTestJwt(app);
 
   const res = await app.inject({

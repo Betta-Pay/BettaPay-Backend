@@ -2,7 +2,7 @@ import test from 'tape';
 import { createTestApp, generateTestJwt } from './test-utils.js';
 
 test('CSRF: POST with matching Origin header is allowed', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1' }] });
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1' }] });
   const token = generateTestJwt(app);
 
   try {
@@ -26,7 +26,7 @@ test('CSRF: POST with matching Origin header is allowed', async (t) => {
 });
 
 test('CSRF: POST with disallowed Origin header returns 403', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1' }] });
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1' }] });
   const token = generateTestJwt(app);
 
   try {
@@ -51,8 +51,8 @@ test('CSRF: POST with disallowed Origin header returns 403', async (t) => {
   }
 });
 
-test('CSRF: POST without Origin header is allowed (server-to-server)', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1' }] });
+test('CSRF: POST without Origin header or CSRF token is rejected', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1' }] });
   const token = generateTestJwt(app);
 
   try {
@@ -65,7 +65,33 @@ test('CSRF: POST without Origin header is allowed (server-to-server)', async (t)
       payload: { id: 'm2', name: 'Test', ownerId: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' },
     });
 
-    t.equal(res.statusCode, 201, 'no origin header allows server-to-server calls');
+    t.equal(res.statusCode, 403, 'no origin header without CSRF token is rejected');
+    const body = JSON.parse(res.body);
+    t.equal(body.error.code, 'INVALID_ORIGIN', 'returns INVALID_ORIGIN error code');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('CSRF: POST without Origin header but with x-csrf-check is allowed', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1' }] });
+  const token = generateTestJwt(app);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/merchants',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-csrf-check': '1',
+      },
+      payload: { id: 'm2', name: 'Test', ownerId: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' },
+    });
+
+    t.equal(res.statusCode, 201, 'no origin header with CSRF token is allowed');
   } catch (err: any) {
     t.fail(err);
   } finally {
@@ -75,7 +101,7 @@ test('CSRF: POST without Origin header is allowed (server-to-server)', async (t)
 });
 
 test('CSRF: GET requests bypass origin check', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1', name: 'M1', ownerId: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' }] });
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1', name: 'M1', ownerId: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' }] });
   const token = generateTestJwt(app);
 
   try {
@@ -98,7 +124,7 @@ test('CSRF: GET requests bypass origin check', async (t) => {
 });
 
 test('CSRF: PATCH with disallowed Origin returns 403', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1', settings: {} }] });
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1', settings: {} }] });
   const token = generateTestJwt(app);
 
   try {
@@ -122,7 +148,7 @@ test('CSRF: PATCH with disallowed Origin returns 403', async (t) => {
 });
 
 test('CSRF: DELETE with disallowed Origin returns 403', async (t) => {
-  const { app } = createTestApp({}, { merchants: [{ id: 'm1' }] });
+  const { app } = await createTestApp({}, { merchants: [{ id: 'm1' }] });
   const token = generateTestJwt(app);
 
   try {

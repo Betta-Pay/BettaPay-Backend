@@ -30,7 +30,7 @@ export interface AssetPrecisionConfig {
 export const ASSET_PRECISION_MAPPINGS: Record<string, AssetPrecisionConfig> = {
   USDC: {
     assetCode: 'USDC',
-    decimals: 6,
+    decimals: 7,
     roundingMode: 'down',
   },
   EURT: {

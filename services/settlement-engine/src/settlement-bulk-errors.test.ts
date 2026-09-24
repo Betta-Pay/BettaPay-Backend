@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD, BATCH_VALID_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
@@ -105,5 +105,13 @@ test('bulk-errors: status checks fail on malformed batchId', async (t) => {
   const body = JSON.parse(res.body);
   t.equal(body.error.code, 'VALIDATION_ERROR');
   t.equal(body.error.message, 'Invalid batchId format');
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

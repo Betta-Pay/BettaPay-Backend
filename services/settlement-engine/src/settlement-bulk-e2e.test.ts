@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma, settlementQueue } from './index.js';
+import { fastify, prisma, settlementQueue, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
@@ -91,13 +91,21 @@ test('bulk-e2e: pipeline status changes after partial completions', async (t) =>
 
   t.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
-  t.equal(body.batchId, batchId);
-  t.equal(body.total, 3);
-  t.equal(body.completed, 1);
-  t.equal(body.failed, 1);
-  t.equal(body.pending, 1);
-  t.equal(body.status, 'processing', 'batch with mixed states should be marked as processing');
+  t.equal(body.data.batchId, batchId);
+  t.equal(body.data.total, 3);
+  t.equal(body.data.completed, 1);
+  t.equal(body.data.failed, 1);
+  t.equal(body.data.pending, 1);
+  t.equal(body.data.status, 'processing', 'batch with mixed states should be marked as processing');
 
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

@@ -46,6 +46,7 @@ services:
       INTER_SERVICE_SECRET: dev-inter-service-secret
       JWT_SECRET: super-secret-development-key-please-change
       JWT_EXPIRES_IN: 24h
+      FIELD_ENCRYPTION_KEY: dev-only-field-encryption-key-for-local-use-32
       GOOGLE_CLIENT_ID: local-dev-google-client
       ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
       SETTLEMENT_CONTRACT_ID: CA_TEST
@@ -103,6 +104,13 @@ services:
       INTER_SERVICE_SECRET: dev-inter-service-secret
       LOG_LEVEL: info
       ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
+      JWT_SECRET: super-secret-development-key-please-change
+      FIELD_ENCRYPTION_KEY: dev-only-field-encryption-key-for-local-use-32
+      GOOGLE_CLIENT_ID: local-dev-google-client
+      SETTLEMENT_CONTRACT_ID: CA_TEST
+      GOVERNANCE_CONTRACT_ID: GA_TEST
+      ADMIN_ADDRESS: GA_TEST
+      ADMIN_SECRET: test-secret
       DATABASE_POOL_SIZE: 10
       DATABASE_POOL_TIMEOUT: 10
       REDIS_MAX_RETRIES: 3
@@ -149,6 +157,9 @@ services:
       INTER_SERVICE_SECRET: dev-inter-service-secret
       LOG_LEVEL: info
       ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
+      JWT_SECRET: super-secret-development-key-please-change
+      FIELD_ENCRYPTION_KEY: dev-only-field-encryption-key-for-local-use-32
+      GOOGLE_CLIENT_ID: local-dev-google-client
       DATABASE_POOL_SIZE: 10
       DATABASE_POOL_TIMEOUT: 10
       REDIS_MAX_RETRIES: 3
@@ -193,6 +204,9 @@ services:
       INTER_SERVICE_SECRET: dev-inter-service-secret
       LOG_LEVEL: info
       ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173
+      JWT_SECRET: super-secret-development-key-please-change
+      FIELD_ENCRYPTION_KEY: dev-only-field-encryption-key-for-local-use-32
+      GOOGLE_CLIENT_ID: local-dev-google-client
       DATABASE_POOL_SIZE: 10
       DATABASE_POOL_TIMEOUT: 10
       REDIS_MAX_RETRIES: 3
