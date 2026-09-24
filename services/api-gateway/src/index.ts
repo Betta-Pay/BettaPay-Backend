@@ -120,6 +120,11 @@ import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { fetchUpstream, UpstreamTimeoutError, SsrfRejectedError, validateUpstreamUrl } from "./upstream-fetch.js";
+import {
+  CONNECTION_TIMEOUT_MS,
+  GATEWAY_TIMEOUT_CONFIG,
+  REQUEST_TIMEOUT_MS,
+} from "./timeout-config.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
@@ -232,9 +237,6 @@ const SERVICE_VERSION = readServiceVersion(import.meta.url);
 // IMPORTANT: keep both values BELOW any upstream load balancer / reverse proxy
 // idle timeout (commonly 60s) so this gateway returns a clean 408 rather than
 // the load balancer cutting the connection first.
-const REQUEST_TIMEOUT_MS = 30_000;
-const CONNECTION_TIMEOUT_MS = 31_000;
-
 // --- App Factory & Configuration Options ------------------------------------
 export interface AppOptions {
   prisma?: PrismaClient;
@@ -512,6 +514,10 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   fastify.addHook("onSend", async (_request, reply, _payload) => {
+    reply.header(
+      GATEWAY_TIMEOUT_CONFIG.responseHeader,
+      String(GATEWAY_TIMEOUT_CONFIG.requestTimeoutMs),
+    );
     if (!reply.getHeader("permissions-policy")) {
       reply.header(
         "Permissions-Policy",

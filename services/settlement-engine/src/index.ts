@@ -78,6 +78,7 @@ import {
   WebhookHeadersSchema,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
+  propagateTracingHeaders,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -782,10 +783,11 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     let gatewayRecords: any[] = [];
     try {
       const response = await fetch(url.toString(), {
-        headers: {
+        headers: propagateTracingHeaders(request.headers as Record<string, string>, {
           'x-service-token': token,
           'Content-Type': 'application/json',
-        },
+        }),
+        signal: AbortSignal.timeout(env.WRITE_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -797,9 +799,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
       reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'upstream_error' });
-      return reply.code(502).send({
-        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway', details: error instanceof Error ? error.message : String(error) }
-      });
+      return reply.code(504).send(
+        createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
+      );
     }
 
     // 3. Diff the two sets by settlement ID and compare records
@@ -1106,10 +1108,11 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     let gatewayRecords: any[] = [];
     try {
       const response = await fetch(url.toString(), {
-        headers: {
+        headers: propagateTracingHeaders(request.headers as Record<string, string>, {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-        },
+        }),
+        signal: AbortSignal.timeout(env.WRITE_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -1120,9 +1123,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway for report');
-      return reply.code(502).send({
-        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway' }
-      });
+      return reply.code(504).send(
+        createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
+      );
     }
 
     // 3. Compute summary statistics
@@ -1131,6 +1134,19 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
 
     const missingCount = gatewayRecords.filter(r => !localIds.has(r.id)).length;
     const extraCount = localRecords.filter(r => !gatewayIds.has(r.id)).length;
+
+    const lineItemDiscrepancies: Array<{
+      id: string;
+      type: 'missing' | 'extra' | 'mismatched';
+      fields: Array<{ field: string; local: unknown; gateway: unknown }>;
+    }> = [
+      ...gatewayRecords
+        .filter(r => !localIds.has(r.id))
+        .map(r => ({ id: r.id, type: 'missing' as const, fields: [] })),
+      ...localRecords
+        .filter(r => !gatewayIds.has(r.id))
+        .map(r => ({ id: r.id, type: 'extra' as const, fields: [] })),
+    ];
 
     let mismatchedCount = 0;
     const matchedIds = [...localIds].filter(id => gatewayIds.has(id));
@@ -1143,14 +1159,19 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       const gatewayRec = gatewayMap.get(id);
       
       const fieldsToCompare = ['merchantId', 'totalAmount', 'grossAmount', 'feeAmount', 'netAmount', 'feeBps', 'asset', 'status'];
-      const hasDifference = fieldsToCompare.some(field => {
+      const fields = fieldsToCompare.filter(field => {
         const localVal = String((localRec as any)[field] ?? '');
         const gatewayVal = String(gatewayRec[field] ?? '');
         return localVal !== gatewayVal;
-      });
+      }).map(field => ({
+        field,
+        local: (localRec as any)[field] ?? null,
+        gateway: gatewayRec[field] ?? null,
+      }));
 
-      if (hasDifference) {
+      if (fields.length > 0) {
         mismatchedCount++;
+        lineItemDiscrepancies.push({ id, type: 'mismatched', fields });
       }
     }
 
@@ -1222,6 +1243,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
           net: netDiff.toString(),
         },
       },
+      lineItemDiscrepancies,
       alerts: hasDiscrepancies || hasAmountDifferences ? [
         ...(missingCount > 0 ? [`${missingCount} settlement(s) in gateway but missing in local database`] : []),
         ...(extraCount > 0 ? [`${extraCount} settlement(s) in local database but missing in gateway`] : []),
