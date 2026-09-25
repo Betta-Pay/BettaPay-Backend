@@ -222,6 +222,15 @@ export function computeSettlementAmounts(
     netAmount: netStr,
     feeSnapshot,
   };
+
+  assertSettlementInvariants({
+    grossAmount: result.grossAmount,
+    feeAmount: result.feeAmount,
+    netAmount: result.netAmount,
+    feeBps,
+  });
+
+  return result;
 }
 
 /**

@@ -71,6 +71,8 @@ import crypto from 'crypto';
 
 /** Payload for every webhook delivery job. */
 export interface WebhookJobData {
+  /** Stable, deterministic identifier for the source event. */
+  eventId?: string;
   /** The HTTPS (or HTTP in dev) URL to POST to. */
   url: string;
   /** Arbitrary JSON-serialisable event payload. */

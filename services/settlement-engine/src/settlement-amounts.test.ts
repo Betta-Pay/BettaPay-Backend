@@ -14,6 +14,7 @@
 import test from 'tape';
 import { computeSettlementAmounts, resolveVolumeDiscount, FEE_VERSION } from './settlement-amounts.js';
 import type { DiscountTier } from './settlement-amounts.js';
+import { assertSettlementInvariants } from './settlement-properties.js';
 
 // ─── resolveVolumeDiscount ───────────────────────────────────────────────────
 
@@ -161,6 +162,18 @@ test('invariant: feeAmount >= 0 with any discount', (t) => {
   );
   t.ok(parseFloat(feeAmount) >= 0, 'feeAmount never negative');
   t.ok(feeSnapshot.feeBpsApplied >= 0, 'feeBpsApplied never negative');
+  t.end();
+});
+
+test('runtime invariant: inconsistent settlement math throws', (t) => {
+  t.throws(() => {
+    assertSettlementInvariants({
+      grossAmount: '100.00',
+      feeAmount: '10.01',
+      netAmount: '89.99',
+      feeBps: 100,
+    });
+  }, /feeAmount \+ netAmount === grossAmount/i, 'invalid settlement math is rejected at runtime');
   t.end();
 });
 

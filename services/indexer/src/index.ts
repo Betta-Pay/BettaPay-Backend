@@ -1309,7 +1309,7 @@ fastify.post<{ Params: { id: string } }>(
     // merchant's expected auth header and was rejected (#614).
     await webhookQueue.add("deliver", {
       url: job.data.url,
-      event: job.data.event,
+      event: { ...job.data.event, eventId } as Record<string, unknown>,
       signingSecret: job.data.signingSecret,
       headers: job.data.headers,
     });
