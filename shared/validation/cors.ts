@@ -21,6 +21,21 @@ export function parseAllowedOrigins(raw: string): string[] {
  * @envSpecific Wildcard (*) and HTTP origins are only allowed in development.
  * Production enforces HTTPS-only, non-wildcard origins.
  */
+export function hasWildcardOrigin(origins: readonly string[]): boolean {
+  return origins.some((origin) => origin === '*');
+}
+
+export function assertCorsConfigSafe(
+  origins: readonly string[],
+  credentials: boolean = false,
+): void {
+  if (credentials && hasWildcardOrigin(origins)) {
+    throw new Error(
+      'Wildcard CORS origins are not allowed when credentials are enabled. Configure an explicit ALLOWED_ORIGINS allow-list instead.',
+    );
+  }
+}
+
 export function createCorsOriginsSchema(nodeEnv?: string) {
   const { isProduction } = createValidationContext(nodeEnv);
 
@@ -32,16 +47,19 @@ export function createCorsOriginsSchema(nodeEnv?: string) {
       });
     }
 
+    if (hasWildcardOrigin(origins)) {
+      const wildcardIndex = origins.findIndex((origin) => origin === '*');
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [wildcardIndex],
+        message: 'Wildcard CORS origin (*) is not allowed. Configure an explicit ALLOWED_ORIGINS allow-list instead.',
+      });
+      return;
+    }
+
     if (isProduction) {
       origins.forEach((origin, i) => {
-        if (origin === '*') {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: [i],
-            message: 'Wildcard CORS origin (*) is not allowed in production.',
-          });
-        }
-        if (origin !== '*' && !origin.startsWith('https://')) {
+        if (!origin.startsWith('https://')) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: [i],
@@ -51,23 +69,21 @@ export function createCorsOriginsSchema(nodeEnv?: string) {
       });
     } else {
       origins.forEach((origin, i) => {
-        if (origin !== '*') {
-          try {
-            const url = new URL(origin);
-            if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-              ctx.addIssue({
-                code: z.ZodIssueCode.custom,
-                path: [i],
-                message: `"${origin}" is not a valid URL`,
-              });
-            }
-          } catch {
+        try {
+          const url = new URL(origin);
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
             ctx.addIssue({
               code: z.ZodIssueCode.custom,
               path: [i],
               message: `"${origin}" is not a valid URL`,
             });
           }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [i],
+            message: `"${origin}" is not a valid URL`,
+          });
         }
       });
     }
@@ -88,6 +104,13 @@ export function resolveAllowedOrigins(
   let origins = parseAllowedOrigins(raw);
   if (isProduction && (rawEnv.ALLOWED_ORIGINS === undefined || rawEnv.ALLOWED_ORIGINS === '')) {
     origins = [];
+  }
+
+  if (hasWildcardOrigin(origins)) {
+    return {
+      origins: [],
+      error: 'Wildcard CORS origin (*) is not allowed. Configure an explicit ALLOWED_ORIGINS allow-list instead.',
+    };
   }
 
   const schema = createCorsOriginsSchema(nodeEnv);
