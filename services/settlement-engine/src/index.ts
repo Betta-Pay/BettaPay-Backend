@@ -57,6 +57,7 @@ import {
   BulkSettlementBody,
   registerErrorHandler,
   registerRequestId,
+  registerServiceAuth,
   createErrorResponse,
   ErrorCodes,
   FeeRule,
@@ -213,6 +214,8 @@ fastify.register(rateLimit, {
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
+// Inter-service auth: internal endpoints require a valid x-service-token (#117).
+registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
 // ── Settlement processing queue ────────────────────────────────────────────────
 
@@ -1443,6 +1446,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   '/api/settlements/bulk',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 30,
@@ -1661,6 +1665,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 fastify.get<{ Params: { batchId: string } }>(
   '/api/settlements/batch/:batchId/status',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,

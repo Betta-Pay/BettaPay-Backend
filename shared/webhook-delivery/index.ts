@@ -80,11 +80,6 @@ export interface WebhookJobData {
   /** Optional HMAC signing secret.  When present the worker includes an
    *  X-BettaPay-Signature header so the merchant can verify authenticity. */
   signingSecret?: string;
-  /** Optional unique event identifier used for Redis-backed deduplication.
-   *  When set together with a redis client on the worker, the worker will
-   *  attempt a SET NX with 1-hour TTL before dispatch.  If the key already
-   *  exists the delivery is skipped (duplicate detected). */
-  eventId?: string;
   /** Semantic version of the event payload structure. */
   version?: string;
   /**

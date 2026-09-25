@@ -5,6 +5,9 @@ import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -23,6 +26,7 @@ test('bulk-extensive: validation loop for various positive amounts', async (t) =
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/settlements/bulk',
+      headers: AUTH_HEADER,
       payload: {
         merchantId: MOCK_MERCHANT_STANDARD.id,
         settlements: [{ amount, asset: 'USDC' }],
@@ -49,6 +53,7 @@ test('bulk-extensive: validation loop for various invalid amounts', async (t) =>
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/settlements/bulk',
+      headers: AUTH_HEADER,
       payload: {
         merchantId: MOCK_MERCHANT_STANDARD.id,
         settlements: [{ amount, asset: 'USDC' }],
@@ -76,6 +81,7 @@ test('bulk-extensive: batch limit checks on border value 100', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements,
@@ -101,6 +107,7 @@ test('bulk-extensive: merchant rules fallback values verification', async (t) =>
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: 'merch_fallback',
       settlements: [{ amount: '50.00', asset: 'USDC' }],
@@ -127,6 +134,7 @@ test('bulk-extensive: batch tracking overall status transitions validation', asy
   const res1 = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${batchId}/status`,
+    headers: AUTH_HEADER,
   });
   t.equal(JSON.parse(res1.body).status, 'pending');
 
@@ -139,6 +147,7 @@ test('bulk-extensive: batch tracking overall status transitions validation', asy
   const res2 = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${batchId}/status`,
+    headers: AUTH_HEADER,
   });
   t.equal(JSON.parse(res2.body).status, 'completed');
 
@@ -151,6 +160,7 @@ test('bulk-extensive: batch tracking overall status transitions validation', asy
   const res3 = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${batchId}/status`,
+    headers: AUTH_HEADER,
   });
   t.equal(JSON.parse(res3.body).status, 'failed');
 

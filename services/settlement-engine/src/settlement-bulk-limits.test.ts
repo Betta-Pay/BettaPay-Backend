@@ -7,6 +7,9 @@ import {
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -22,6 +25,7 @@ test('bulk-limits: validates item below tight min limit', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
@@ -48,6 +52,7 @@ test('bulk-limits: validates item above tight max limit', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
@@ -75,6 +80,7 @@ test('bulk-limits: daily limit aggregation on empty history', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
@@ -103,6 +109,7 @@ test('bulk-limits: daily limit aggregation with pre-existing settlements', async
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
@@ -129,6 +136,7 @@ test('bulk-limits: decimal precision check under boundary constraints', async (t
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [
@@ -152,6 +160,7 @@ test('bulk-limits: rejects empty bulk batch', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [],
@@ -172,6 +181,7 @@ test('bulk-limits: handles multiple assets in the same daily limit check', async
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_TIGHT_LIMITS.id,
       settlements: [

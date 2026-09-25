@@ -5,6 +5,9 @@ import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -42,6 +45,7 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
   const postRes = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload,
   });
 
@@ -58,6 +62,7 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
   const statusRes = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${postBody.batchId}/status`,
+    headers: AUTH_HEADER,
   });
 
   t.equal(statusRes.statusCode, 200, 'should return 200 OK');
@@ -87,6 +92,7 @@ test('bulk-e2e: pipeline status changes after partial completions', async (t) =>
   const res = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${batchId}/status`,
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 200);

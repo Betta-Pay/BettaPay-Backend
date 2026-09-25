@@ -5,6 +5,9 @@ import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -28,6 +31,7 @@ test('bulk-concurrency: multiple concurrent bulk requests for standard merchant'
     fastify.inject({
       method: 'POST',
       url: '/api/settlements/bulk',
+      headers: AUTH_HEADER,
       payload: {
         merchantId: MOCK_MERCHANT_STANDARD.id,
         settlements: testBatch,
@@ -67,6 +71,7 @@ test('bulk-concurrency: concurrent status check and update simulations', async (
     fastify.inject({
       method: 'GET',
       url: '/api/settlements/batch/batch_con1/status',
+      headers: AUTH_HEADER,
     })
   );
 
@@ -103,6 +108,7 @@ test('bulk-concurrency: simultaneous limit depletion check scenario', async (t) 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload,
   });
 
