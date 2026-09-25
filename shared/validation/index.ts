@@ -235,10 +235,12 @@ export const EnvSchema = z
     DATABASE_POOL_SIZE: z
       .string()
       .transform((s) => parseInt(s, 10))
+      .pipe(z.number().int().min(1).max(10000))
       .default("10"),
     DATABASE_POOL_TIMEOUT: z
       .string()
       .transform((s) => parseInt(s, 10))
+      .pipe(z.number().int().min(1).max(3600))
       .default("10"),
 
     // Redis — optional, falls back to localhost

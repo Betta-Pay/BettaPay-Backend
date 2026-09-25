@@ -520,6 +520,12 @@ export function buildApp(opts: AppOptions = {}) {
     }
   });
 
+  if (env.ALLOWED_ORIGINS.includes('*')) {
+    throw new Error(
+      'CORS misconfiguration: ALLOWED_ORIGINS cannot contain "*" when credentials are enabled.',
+    );
+  }
+
   fastify.register(cors, {
     origin: env.ALLOWED_ORIGINS,
     credentials: true,

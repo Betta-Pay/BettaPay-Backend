@@ -142,11 +142,20 @@ export async function connectWithRetry(
  * @param poolSize - Max connections in the Prisma pool (default: 10).
  * @param timeout  - Max seconds to wait for a connection from the pool (default: 10).
  */
+function validatePrismaPoolSetting(name: string, value: number, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+}
+
 export function buildPrismaConnectionUrl(
   rawUrl: string,
   poolSize: number = 10,
   timeout: number = 10,
 ): string {
+  validatePrismaPoolSetting('DATABASE_POOL_SIZE', poolSize, 1, 10000);
+  validatePrismaPoolSetting('DATABASE_POOL_TIMEOUT', timeout, 1, 3600);
+
   const sep = rawUrl.includes('?') ? '&' : '?';
   return `${rawUrl}${sep}connection_limit=${poolSize}&pool_timeout=${timeout}`;
 }
