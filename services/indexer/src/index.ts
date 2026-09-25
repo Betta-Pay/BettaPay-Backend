@@ -919,6 +919,7 @@ const PerContractReplayBody = z
 fastify.post(
   "/api/events/replay",
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -956,6 +957,7 @@ fastify.post(
 fastify.post<{ Params: { contractId: string }; Body: unknown }>(
   "/api/events/replay/contract/:contractId",
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -1309,7 +1311,7 @@ fastify.post<{ Params: { id: string } }>(
     // merchant's expected auth header and was rejected (#614).
     await webhookQueue.add("deliver", {
       url: job.data.url,
-      event: { ...job.data.event, eventId } as Record<string, unknown>,
+      event: (job.data.event ?? {}) as Record<string, unknown>,
       signingSecret: job.data.signingSecret,
       headers: job.data.headers,
     });

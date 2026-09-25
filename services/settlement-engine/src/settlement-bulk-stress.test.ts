@@ -6,6 +6,9 @@ import { getAssetPrecision, isSupportedAsset } from './settlement-properties.js'
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -43,6 +46,7 @@ test('bulk-stress: handles validation performance check with 100 items', async (
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements,
@@ -71,6 +75,7 @@ test('bulk-stress: process large batches with mixed valid and invalid entries', 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements,

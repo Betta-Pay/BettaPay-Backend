@@ -5,6 +5,9 @@ import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -29,6 +32,7 @@ test('bulk-limits-custom: custom decimals precision formatting check', async (t)
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: customMerchant.id,
       settlements: [
@@ -48,6 +52,7 @@ test('bulk-limits-custom: validates asset formatting with lowercase strings', as
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: [
@@ -68,6 +73,7 @@ test('bulk-limits-custom: rejects request with empty settlements array', async (
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: [], // Empty array
@@ -85,6 +91,7 @@ test('bulk-limits-custom: rejects request with missing settlements key', async (
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
     },
@@ -100,6 +107,7 @@ test('bulk-limits-custom: rejects status checks with invalid character batchId v
   const res = await fastify.inject({
     method: 'GET',
     url: '/api/settlements/batch/batch_@special#char$/status',
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 400, 'should reject non-alphanumeric batchId parameters');

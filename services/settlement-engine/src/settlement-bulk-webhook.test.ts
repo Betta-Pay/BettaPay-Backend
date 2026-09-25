@@ -5,6 +5,9 @@ import { MOCK_MERCHANT_STANDARD, BATCH_VALID_STANDARD } from './test-fixtures.js
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
 
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
   prisma.$queryRaw = async () => [{ sum: null }];
@@ -38,6 +41,7 @@ test('bulk-webhook: verifies webhookUrl is correctly propagated from merchant se
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: customMerchant.id,
       settlements: [
@@ -73,6 +77,7 @@ test('bulk-webhook: checks webhookUrl is null when merchant has no webhook confi
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: simpleMerchant.id,
       settlements: [
@@ -113,6 +118,7 @@ test('bulk-webhook: verifies webhookHeaders is correctly propagated from merchan
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: customMerchant.id,
       settlements: [
@@ -157,6 +163,7 @@ test('bulk-webhook: rejects a reserved header name from merchant settings (does 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: merchantWithBadHeaders.id,
       settlements: [
