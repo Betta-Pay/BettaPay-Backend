@@ -60,6 +60,7 @@ import {
   encryptSensitiveFields,
   decryptSensitiveFields,
   createValidationContext,
+  auditRouteAuthPolicy,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -1003,6 +1004,8 @@ export function buildApp(opts: AppOptions = {}) {
 
   // Zod validation runs inside route handlers after this global preHandler, so
   // schemas receive trimmed, control-character-free, NFC-normalized strings.
+
+  auditRouteAuthPolicy(fastify);
 
   // Routes
   registerGatewayHealthRoutes({

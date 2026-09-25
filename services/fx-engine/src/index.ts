@@ -44,6 +44,7 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
   RateOverrideBody,
+  auditRouteAuthPolicy,
 } from "@bettapay/validation";
 import {
   createHistoryQuerySchema,
@@ -1029,6 +1030,8 @@ function logRateStalenessIfStale(
     );
   }
 }
+
+auditRouteAuthPolicy(fastify);
 
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
