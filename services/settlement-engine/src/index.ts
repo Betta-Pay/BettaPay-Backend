@@ -37,6 +37,7 @@ import { computeSettlementAmounts, SettlementAmountError } from './settlement-am
 import type { DiscountTier } from './settlement-amounts.js';
 import { acquireSemaphore, releaseSemaphore, getActiveCount } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { startSettlementReaper } from './settlement-reaper.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -652,8 +653,24 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       failed: 0,
     };
 
-    const merchants = await prisma.merchant.findMany({ select: { id: true } });
-    const existingMerchantIds = new Set(merchants.map(m => m.id));
+    const existingMerchantIds = new Set<string>();
+    let merchantCursor: string | undefined;
+    for (;;) {
+      const merchantPage = await prisma.merchant.findMany({
+        where: merchantCursor ? { id: { gt: merchantCursor } } : {},
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: 1000,
+      });
+      if (merchantPage.length === 0) break;
+
+      for (const merchant of merchantPage) {
+        existingMerchantIds.add(merchant.id);
+      }
+
+      merchantCursor = merchantPage[merchantPage.length - 1].id;
+      if (merchantPage.length < 1000) break;
+    }
 
     for (const settlement of settlements) {
       const gross = parseBN(settlement.grossAmount);
@@ -1256,6 +1273,7 @@ batchWorker.on('failed', (job, err) => {
 // ============================================================================
 
 let isShuttingDown = false;
+let stopSettlementReaper: (() => Promise<void>) | undefined;
 
 async function gracefulShutdown(signal: string): Promise<void> {
   // Prevent multiple shutdown attempts
@@ -1274,6 +1292,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }, 30000);
 
   try {
+    await stopSettlementReaper?.();
+
     // 1. Close Fastify server (stops accepting new connections)
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
@@ -1364,6 +1384,7 @@ const start = async () => {
     startRedisMemoryMonitor(redis, fastify.log);
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    stopSettlementReaper = startSettlementReaper(prisma, settlementQueue, fastify.log);
     fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);

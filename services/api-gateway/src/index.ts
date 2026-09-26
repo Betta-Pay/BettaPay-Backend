@@ -1573,23 +1573,18 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
 
         // Best-effort cascade: cancel initiated payments
         try {
-          const initiatedPayments = await tx.payment.findMany({
+          const cancelled = await tx.payment.updateMany({
             where: { merchantId: id, status: "initiated" },
+            data: { status: "cancelled" },
           });
-          for (const payment of initiatedPayments) {
-            const cancelled = await tx.payment.update({
-              where: { id: payment.id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              payment.id,
-              { before: payment, after: cancelled },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "payments.bulk-cancelled",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: cancelled.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -1599,23 +1594,18 @@ fastify.delete<{ Params: { id: string } }>('/api/merchants/:id', {
 
         // Best-effort cascade: fail pending settlements
         try {
-          const pendingSettlements = await tx.settlement.findMany({
+          const failed = await tx.settlement.updateMany({
             where: { merchantId: id, status: "pending" },
+            data: { status: "failed", completedAt: new Date() },
           });
-          for (const settlement of pendingSettlements) {
-            const failed = await tx.settlement.update({
-              where: { id: settlement.id },
-              data: { status: "failed", completedAt: new Date() },
-            });
-            await logAuditEvent(
-              "settlement.status.changed",
-              "settlement",
-              settlement.id,
-              { before: settlement, after: failed },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "settlements.bulk-failed",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: failed.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
