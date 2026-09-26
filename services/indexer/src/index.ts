@@ -1281,6 +1281,8 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
         signingSecret: existing.signingSecret ?? undefined,
         headers:
           (existing.headers as Record<string, string> | null) ?? undefined,
+        traceId: (request as any).traceId ?? request.headers["x-trace-id"] ?? undefined,
+        eventId: `webhook_test_${id}_${Date.now()}`,
       },
       { attempts: 1 },
     );

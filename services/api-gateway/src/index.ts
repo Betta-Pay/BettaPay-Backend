@@ -143,6 +143,7 @@ import {
 } from "@bettapay/webhook-delivery";
 import { Queue } from "bullmq";
 import { readServiceVersion } from "@bettapay/validation";
+import { MerchantCache, getCachedMerchant } from "../../shared/validation/merchant-cache.js";
 
 declare module "fastify" {
   export interface FastifyInstance {
@@ -283,6 +284,10 @@ export function getDefaultPrisma(): PrismaClient {
   }
   return defaultPrisma;
 }
+
+// Merchant cache: avoids repeated DB reads for the same merchant during
+// a single payment creation request (#740).
+const merchantCache = new MerchantCache();
 
 // Set by buildApp() when it creates the app's Redis client — shutdown()/start()
 // (defined after buildApp, at module scope) need it but don't have their own
@@ -2118,6 +2123,7 @@ fastify.get('/api/admin/auth/ip-score', {
         tx as unknown as Parameters<typeof logAuditEvent>[5],
       );
     });
+    merchantCache.invalidate(id);
 
     // #744 — Invalidate cached merchant data so the suspended/unsuspended
     // status is visible to read paths immediately.
@@ -2216,6 +2222,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         return merchantUpdate;
       });
+      merchantCache.invalidate(id);
 
       // #744 — Invalidate cached merchant data so updated settings are
       // visible to read paths immediately.
@@ -2309,9 +2316,11 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
-      const merchant = await prisma.merchant.findFirst({
-        where: { id: d.merchantId, deletedAt: null },
-      });
+      const merchant = await getCachedMerchant(
+        d.merchantId,
+        merchantCache,
+        (id) => prisma.merchant.findFirst({ where: { id, deletedAt: null } }),
+      );
       if (!merchant) {
         return reply
           .code(404)

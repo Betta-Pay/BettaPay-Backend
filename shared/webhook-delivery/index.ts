@@ -73,6 +73,8 @@ import crypto from 'crypto';
 export interface WebhookJobData {
   /** Stable, deterministic identifier for the source event. */
   eventId?: string;
+  /** Distributed trace id for correlating webhook delivery across services. */
+  traceId?: string;
   /** The HTTPS (or HTTP in dev) URL to POST to. */
   url: string;
   /** Arbitrary JSON-serialisable event payload. */
@@ -390,14 +392,14 @@ export function createWebhookWorker(
           const claimed = await redisClient.set(dedupKey, '1', 'PX', '3600000', 'NX');
           if (claimed === null) {
             logger?.warn(
-              { url, jobId: job.id, eventId },
+              { url, jobId: job.id, eventId, traceId: job.data.traceId },
               '[webhook-delivery] Duplicate webhook detected — skipping delivery',
             );
             return;
           }
         } catch (err) {
           logger?.error(
-            { url, jobId: job.id, eventId, err: err instanceof Error ? err.message : String(err) },
+            { url, jobId: job.id, eventId, traceId: job.data.traceId, err: err instanceof Error ? err.message : String(err) },
             '[webhook-delivery] Redis dedup check failed — failing closed with backoff to prevent duplicate delivery',
           );
           throw new Error(
@@ -406,7 +408,7 @@ export function createWebhookWorker(
         }
       }
 
-      logger?.info({ url, jobId: job.id, attempt }, '[webhook-delivery] Delivering webhook');
+      logger?.info({ url, jobId: job.id, attempt, eventId, traceId: job.data.traceId }, '[webhook-delivery] Delivering webhook');
 
       const body = canonicalize({ version, event });
       const headers: Record<string, string> = {};
@@ -444,10 +446,10 @@ export function createWebhookWorker(
           );
         }
 
-        logger?.info({ url, jobId: job.id, attempt, status: response.status }, '[webhook-delivery] Webhook delivered');
+        logger?.info({ url, jobId: job.id, attempt, status: response.status, eventId, traceId: job.data.traceId }, '[webhook-delivery] Webhook delivered');
       } catch (err) {
         logger?.warn(
-          { url, jobId: job.id, attempt, err: err instanceof Error ? err.message : String(err) },
+          { url, jobId: job.id, attempt, eventId, traceId: job.data.traceId, err: err instanceof Error ? err.message : String(err) },
           '[webhook-delivery] Delivery attempt failed — BullMQ will retry',
         );
         // Re-throw so BullMQ applies back-off and retry logic.

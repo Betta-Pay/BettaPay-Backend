@@ -51,6 +51,7 @@ import {
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { startSettlementReaper } from './settlement-reaper.js';
+import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -148,6 +149,10 @@ const prisma = prismaBase.$extends({
     },
   },
 }) as unknown as typeof prismaBase;
+
+// Merchant cache: avoids repeated DB reads for the same merchant during
+// a single settlement creation request (#741).
+const merchantCache = new MerchantCache();
 
 type SettlementJobData = {
   id: string;
@@ -1310,7 +1315,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'amount must be > 0'));
     }
 
-    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    const merchant = await getCachedMerchant(
+      d.merchantId,
+      merchantCache,
+      (id) => prisma.merchant.findUnique({ where: { id } }),
+    );
 
     // ── Pre-validation ──────────────────────────────────────────────────────
     if (!merchant) {
@@ -1492,7 +1501,11 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }
 
-    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    const merchant = await getCachedMerchant(
+      d.merchantId,
+      merchantCache,
+      (id) => prisma.merchant.findUnique({ where: { id } }),
+    );
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
