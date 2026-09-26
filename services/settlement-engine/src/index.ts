@@ -80,6 +80,7 @@ import {
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
   propagateTracingHeaders,
+  auditRouteAuthPolicy,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -216,6 +217,7 @@ registerErrorHandler(fastify);
 registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+auditRouteAuthPolicy(fastify);
 
 // ── Settlement processing queue ────────────────────────────────────────────────
 
