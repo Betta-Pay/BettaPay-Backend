@@ -385,7 +385,7 @@ test('POST /api/settlements/bulk: rejects same idempotency key with different pa
 
   t.equal(res.statusCode, 409, 'returns 409 Conflict');
   const body = JSON.parse(res.body);
-  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.equal(body.error.code, 'IDEMPOTENCY_PAYLOAD_MISMATCH');
   t.ok(body.error.message.includes('different payload'), 'error message indicates payload mismatch');
   t.end();
 });
