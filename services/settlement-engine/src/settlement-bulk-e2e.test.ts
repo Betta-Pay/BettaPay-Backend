@@ -15,6 +15,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
 }
 
 test('bulk-e2e: complete successful pipeline simulation', async (t) => {
@@ -28,9 +29,9 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
     createdRecords.push(args.data);
     return args.data;
   };
-  settlementQueue.add = async (name: string, data: any) => {
-    enqueuedJobs.push(data);
-    return { id: 'job_test_123' } as any;
+  settlementQueue.addBulk = async (jobs: any[]) => {
+    for (const job of jobs) enqueuedJobs.push(job.data);
+    return jobs.map(() => ({ id: 'job_test_123' })) as any;
   };
 
   const payload = {

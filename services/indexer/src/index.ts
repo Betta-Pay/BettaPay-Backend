@@ -23,7 +23,7 @@ import {
   WEBHOOK_DEFAULTS,
 } from "@bettapay/webhook-delivery";
 import { closeWorkerWithTimeout, trackActiveJob } from "./worker-shutdown.js";
-import { PrismaClient, WebhookSubscription } from "@prisma/client";
+import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -793,6 +793,35 @@ export async function persistEvent(
     "[Indexer] Event indexed",
   );
 
+  const subs = await loadWebhookSubscriptions();
+  if (subs.length)
+    await (prisma as any).indexedEventWebhookDelivery.createMany({
+      data: subs.map((sub) => ({
+        id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+        indexedEventId: id,
+        subscriptionId: sub.id,
+        url: sub.url,
+        event: record,
+        // Encrypt signingSecret on write (#617)
+        signingSecret: sub.signingSecret
+          ? encryptField(sub.signingSecret)
+          : undefined,
+        headers: (sub.headers as Record<string, string> | null) ?? undefined,
+      })),
+      skipDuplicates: true,
+    });
+
+  // #712 — dispatch is no longer run per event. The poll loop runs a single
+  // dispatch pass per cycle, after batching all of the cycle's writes.
+  return record as Record<string, unknown>;
+}
+
+/**
+ * Returns the webhook subscription list, reusing the 30-second in-memory cache
+ * when it is warm (#511 renews the TTL on a hit when the flag is enabled).
+ * Shared by the single-event and batched persist paths.
+ */
+async function loadWebhookSubscriptions(): Promise<WebhookSubscription[]> {
   const now = Date.now();
   if (
     cacheState.subscriptions &&
@@ -812,27 +841,74 @@ export async function persistEvent(
     const freshSubs = await prisma.webhookSubscription.findMany();
     cacheState.subscriptions = { data: freshSubs, cachedAt: now };
   }
+  return cacheState.subscriptions.data;
+}
 
-  const subs = cacheState.subscriptions.data;
-  if (subs.length)
-    await (prisma as any).indexedEventWebhookDelivery.createMany({
-      data: subs.map((sub) => ({
-        id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
-        indexedEventId: id,
-        subscriptionId: sub.id,
-        url: sub.url,
-        event: record,
-        // Encrypt signingSecret on write (#617)
-        signingSecret: sub.signingSecret
-          ? encryptField(sub.signingSecret)
-          : undefined,
-        headers: (sub.headers as Record<string, string> | null) ?? undefined,
-      })),
-      skipDuplicates: true,
-    });
-  await dispatchPendingWebhookDeliveries();
+/**
+ * #713 — Persist a whole poll cycle's events with one `createMany` instead of a
+ * `create` per event, preserving the composite-unique P2002-skip semantics via
+ * `skipDuplicates`. Webhook deliveries are created in a single batch for the
+ * events that actually landed. Returns the inserted count and the highest
+ * ledger among them so the caller can advance its cursor.
+ */
+async function flushIndexedEvents(
+  data: Prisma.IndexedEventCreateManyInput[],
+): Promise<{ inserted: number; maxInsertedLedger: number | null }> {
+  if (data.length === 0) return { inserted: 0, maxInsertedLedger: null };
 
-  return record as Record<string, unknown>;
+  await prisma.indexedEvent.createMany({ data, skipDuplicates: true });
+
+  // `createMany` does not report which rows were skipped, so read back the ids
+  // that landed. Deliveries must exist only for newly-persisted events, exactly
+  // as the per-event path did after a successful create.
+  const insertedRows = await prisma.indexedEvent.findMany({
+    where: { id: { in: data.map((row) => row.id) } },
+    select: { id: true },
+  });
+  const insertedIds = new Set(insertedRows.map((row) => row.id));
+  const records = data.filter((row) => insertedIds.has(row.id));
+
+  for (const record of records) {
+    fastify.log.info(
+      {
+        id: record.id,
+        type: record.type,
+        contractName: record.contractName,
+        ledger: record.ledger,
+      },
+      "[Indexer] Event indexed",
+    );
+  }
+
+  if (records.length > 0) {
+    const subs = await loadWebhookSubscriptions();
+    if (subs.length) {
+      await (prisma as any).indexedEventWebhookDelivery.createMany({
+        data: records.flatMap((record) =>
+          subs.map((sub) => ({
+            id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+            indexedEventId: record.id,
+            subscriptionId: sub.id,
+            url: sub.url,
+            event: record,
+            signingSecret: sub.signingSecret
+              ? encryptField(sub.signingSecret)
+              : undefined,
+            headers: (sub.headers as Record<string, string> | null) ?? undefined,
+          })),
+        ),
+        skipDuplicates: true,
+      });
+    }
+  }
+
+  const maxInsertedLedger = records.reduce<number | null>((max, record) => {
+    const ledger = typeof record.ledger === "number" ? record.ledger : null;
+    if (ledger === null) return max;
+    return max === null ? ledger : Math.max(max, ledger);
+  }, null);
+
+  return { inserted: records.length, maxInsertedLedger };
 }
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
@@ -1481,6 +1557,12 @@ async function pollEvents() {
     const timeoutMs = env.POLL_TIMEOUT_MS;
 
     if (response.events && response.events.length > 0) {
+      // #713 — accumulate the cycle's validated events and write them in one
+      // batch instead of one create per event (and one delivery createMany per
+      // event). Decode/validate are unchanged; every event still becomes its
+      // own row, including events carrying a validationError.
+      const pendingEvents: Prisma.IndexedEventCreateManyInput[] = [];
+
       for (const evt of response.events) {
         if (aborted) break;
         const elapsed = Date.now() - pollStart;
@@ -1506,22 +1588,38 @@ async function pollEvents() {
 
         const validationError = validatePayload(topics[0], decodedPayload);
 
-        const result = await persistEvent(
+        pendingEvents.push({
+          id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
           stellarId,
-          topics,
-          topics[0],
-          resolvedContractId,
+          contractId: resolvedContractId,
           contractName,
+          topics,
+          type: topics[0],
           rawValue,
-          decodedPayload,
-          evt.ledger,
-          validationError,
-        );
-        if (latestLedgerCursor !== undefined && result !== null) {
-          latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
-        }
+          decodedPayload:
+            decodedPayload !== null ? (decodedPayload as any) : undefined,
+          validationError: validationError ?? undefined,
+          ledger: evt.ledger,
+          indexedAt: new Date(),
+        });
 
         eventsFetchedCounter.inc({ contractId: resolvedContractId });
+      }
+
+      if (pendingEvents.length > 0) {
+        const { maxInsertedLedger } = await flushIndexedEvents(pendingEvents);
+        if (latestLedgerCursor !== undefined && maxInsertedLedger !== null) {
+          latestLedgerCursor = Math.max(
+            latestLedgerCursor,
+            maxInsertedLedger + 1,
+          );
+        }
+      }
+
+      // #712 — one dispatch pass per poll cycle, after all writes for the cycle
+      // have landed. Aborted cycles leave deliveries pending for the next pass.
+      if (!aborted) {
+        await dispatchPendingWebhookDeliveries();
       }
     } else if (
       latestLedgerSequence !== undefined &&

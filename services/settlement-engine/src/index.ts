@@ -28,7 +28,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
 import * as crypto from 'crypto';
-import { Queue, Worker, type Job } from 'bullmq';
+import { Queue, Worker, type BulkJobOptions, type Job } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -1103,21 +1103,33 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       }
     }
 
-    // 1. Query local settlements
-    const localRecords = await prisma.settlement.findMany({
-      where: localWhere,
-      select: {
-        id: true,
-        merchantId: true,
-        grossAmount: true,
-        totalAmount: true,
-        feeAmount: true,
-        netAmount: true,
-        feeBps: true,
-        asset: true,
-        status: true,
-      },
-    });
+    // 1. Query local settlements, paged by id so memory stays bounded (#711).
+    //    The merchant and date-range filters apply unchanged to every page, and
+    //    the aggregation below sees exactly the same rows as before.
+    const localRecords: SettlementRecord[] = [];
+    let sCursor: string | undefined;
+    for (;;) {
+      const page = await prisma.settlement.findMany({
+        where: { ...localWhere, ...(sCursor ? { id: { gt: sCursor } } : {}) },
+        orderBy: { id: 'asc' },
+        take: 500,
+        select: {
+          id: true,
+          merchantId: true,
+          grossAmount: true,
+          totalAmount: true,
+          feeAmount: true,
+          netAmount: true,
+          feeBps: true,
+          asset: true,
+          status: true,
+        },
+      });
+      if (page.length === 0) break;
+      localRecords.push(...(page as unknown as SettlementRecord[]));
+      sCursor = page[page.length - 1].id;
+      if (page.length < 500) break;
+    }
 
     // 2. Fetch api-gateway records via HTTP call
     const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
@@ -1644,18 +1656,27 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       });
 
-      // Enqueue job for each successfully created settlement record
-      for (const item of validItems) {
-        const jobData: SettlementJobData = {
-          id: item.id,
-          merchantId: d.merchantId,
-          grossAmount: item.grossAmount,
-          asset: item.asset,
-        };
-        await settlementQueue.add('process-settlement', jobData).catch((err) => {
-          request.log.error({ err, settlementId: item.id }, 'Failed to enqueue bulk settlement job');
-        });
-      }
+      // Enqueue one job per created settlement in a single round trip (#714).
+      // `addBulk` is all-or-nothing for the call itself, which matches the
+      // surrounding transaction's semantics: either every job is accepted by
+      // the queue or the failure is logged once and the request still returns.
+      const jobs: { name: string; data: SettlementJobData; opts: BulkJobOptions }[] =
+        validItems.map((item) => ({
+          name: 'process-settlement',
+          data: {
+            id: item.id,
+            merchantId: d.merchantId,
+            grossAmount: item.grossAmount,
+            asset: item.asset,
+          },
+          opts: {} as BulkJobOptions,
+        }));
+      await settlementQueue.addBulk(jobs).catch((err) => {
+        request.log.error(
+          { err, count: jobs.length, batchId },
+          'Failed to enqueue bulk settlement jobs',
+        );
+      });
     }
 
     const responsePayload = {

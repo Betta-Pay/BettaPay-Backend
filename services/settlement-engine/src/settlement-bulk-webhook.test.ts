@@ -15,6 +15,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
 }
 
 test('bulk-webhook: verifies webhookUrl is correctly propagated from merchant settings on creation', async (t) => {
