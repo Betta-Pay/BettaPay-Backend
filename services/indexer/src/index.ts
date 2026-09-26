@@ -35,6 +35,7 @@ import {
   registerErrorHandler,
   registerRequestId,
   registerServiceAuth,
+  auditRouteAuthPolicy,
   PaginationQuery,
   EventListQuery,
   DateRangeQuery,
@@ -913,6 +914,12 @@ async function flushIndexedEvents(
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
+// Surfaces any route that reaches the network without an auth hook (#664).
+// Warn-only by default: it logs and never throws, so it is safe in any merge
+// order and changes no request behaviour. Must be registered before the route
+// definitions below so Fastify's onRoute hook sees all of them.
+auditRouteAuthPolicy(fastify);
+
 fastify.get("/api/health", async (_request, reply) => {
   const health = await buildIndexerHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1`,
@@ -1170,8 +1177,12 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 );
 
 // Issue #229 — replay job progress status
+// Internal endpoint — job introspection leaks worker activity to anonymous
+// callers, so it requires a valid x-service-token like the other replay
+// routes (#659).
 fastify.get<{ Params: { jobId: string } }>(
   "/api/events/replay/:jobId/status",
+  { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { jobId } = request.params;
     try {

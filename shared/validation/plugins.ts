@@ -122,7 +122,10 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
 
     // Generic fallback for unhandled errors — assign a referenceId so the
     // client can quote it when reporting the problem, and the server log entry
-    // ties back to exactly that request.
+    // ties back to exactly that request. The body uses the standard error
+    // envelope (#666) so clients can branch on `error.code` during an incident
+    // exactly as they do for every other failure; the referenceId travels in
+    // `error.details` rather than replacing the envelope.
     const referenceId = crypto.randomUUID();
     const errorClass = classifyError(error);
     const errObj = error instanceof Error ? error : new Error(String(error));
@@ -131,12 +134,14 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       'Unhandled internal error',
     );
 
-    return reply.code(500).send({
-      error: 'Internal Server Error',
-      statusCode: 500,
-      referenceId,
-      reqId,
-    });
+    return reply.code(500).send(
+      createErrorResponse(
+        ErrorCodes.INTERNAL_ERROR,
+        'Internal Server Error',
+        { referenceId },
+        reqId,
+      ),
+    );
   });
 
   // Belt-and-suspenders: Fastify's onError lifecycle hook fires after the
@@ -157,12 +162,14 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       'Panic recovery: unhandled error reached onError hook',
     );
 
-    return reply.code(500).send({
-      error: 'Internal Server Error',
-      statusCode: 500,
-      referenceId,
-      reqId: request.id,
-    });
+    return reply.code(500).send(
+      createErrorResponse(
+        ErrorCodes.INTERNAL_ERROR,
+        'Internal Server Error',
+        { referenceId },
+        request.id,
+      ),
+    );
   });
 }
 
