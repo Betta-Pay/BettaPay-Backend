@@ -76,6 +76,7 @@ model Payment {
   fxQuoteExpiresAt        DateTime?
 
   @@index([merchantId, status, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
   // #622 — supports the idempotency-key cleanup job's scan for expired keys.
   @@index([idempotencyKeyExpiresAt])
 }

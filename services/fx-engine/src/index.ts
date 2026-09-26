@@ -1140,9 +1140,12 @@ fastify.get("/api/health", async (_request, reply) => {
 
 fastify.get("/api/rates", async (_request, _reply) => {
   logRateStalenessIfStale(fastify.log);
+  const stale = Date.now() - cache.cachedAt > env.MAX_STALE_SECONDS * 1000;
   return {
     rates: cache.rates,
     updatedAt: new Date(cache.cachedAt).toISOString(),
+    stale,
+    source: fallbackStartTime !== null ? "seed" : stale ? "cache" : "live",
   };
 });
 
@@ -1638,6 +1641,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       valid,
       stale: !valid,
       quoteId: stored.quoteId,
+      fallbackAccepted: fallbackStartTime !== null,
       from: stored.from,
       to: stored.to,
       rate: stored.rate,
