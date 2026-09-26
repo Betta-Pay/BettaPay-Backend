@@ -15,6 +15,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
 }
 
 test('bulk-concurrency: multiple concurrent bulk requests for standard merchant', async (t) => {

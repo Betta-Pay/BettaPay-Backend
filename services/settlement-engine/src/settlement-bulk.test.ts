@@ -22,6 +22,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
   redis.set = async () => 'OK' as any;
   redis.get = async () => null as any;
 }
@@ -119,9 +120,9 @@ test('POST /api/settlements/bulk: processes valid batch successfully', async (t)
     createdRecords.push(args.data);
     return args.data;
   };
-  settlementQueue.add = async (name: string, data: any) => {
-    enqueuedJobs.push(data);
-    return {} as any;
+  settlementQueue.addBulk = async (jobs: any[]) => {
+    for (const job of jobs) enqueuedJobs.push(job.data);
+    return jobs.map(() => ({ id: 'job_test_123' })) as any;
   };
 
   const res = await fastify.inject({
