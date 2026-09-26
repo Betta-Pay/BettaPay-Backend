@@ -2,7 +2,7 @@
   "name": "bettapay-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "BettaPay backend services \u2014 API gateway, FX engine, settlement engine, indexer",
+  "description": "BettaPay backend services — API gateway, FX engine, settlement engine, indexer",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
@@ -22,11 +22,12 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test",
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts",
     "test:load": "k6 run test/load/gateway-scenarios.js",
     "test:mutation": "pnpm -w dlx stryker run"
   },
   "devDependencies": {
+    "@fastify/swagger": "^9.9.0",
     "@types/pg": "^8.20.0",
     "@types/tape": "^5.6.4",
     "cross-env": "^7.0.3",

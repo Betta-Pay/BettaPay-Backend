@@ -142,6 +142,7 @@ import {
   type WebhookJobData,
 } from "@bettapay/webhook-delivery";
 import { Queue } from "bullmq";
+import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
 
 declare module "fastify" {
@@ -245,6 +246,7 @@ export interface AppOptions {
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
   redis?: ReturnType<typeof createRedisClient>;
+  domainEventsQueue?: Queue | { add: (...args: any[]) => Promise<any> };
   logger?: any;
   fetchImpl?: typeof fetch;
   interServiceSecret?: string | string[];
@@ -544,6 +546,21 @@ export function buildApp(opts: AppOptions = {}) {
       expiresIn: env.JWT_EXPIRES_IN,
     },
   });
+
+  fastify.register(swagger, {
+    openapi: {
+      info: { title: "BettaPay API", version: SERVICE_VERSION },
+      servers: [{ url: "http://localhost:3000" }],
+    },
+  });
+
+  fastify.get(
+    "/api/docs/json",
+    {
+      config: { rateLimit: false },
+    },
+    async (_req, reply) => reply.send(fastify.swagger()),
+  );
 
   // Rate limiting: global default and route overrides.
   // Issue #559 — the primary bucket is keyed per authenticated merchant
@@ -1023,12 +1040,31 @@ export function buildApp(opts: AppOptions = {}) {
 
   // --- Wallet Auth Challenge Store ----------------------------------------------
   // #386 — exponential backoff retry strategy
-  const redis = createRedisClient(env.REDIS_URL, fastify.log);
+  const redis = opts.redis ?? createRedisClient(env.REDIS_URL, fastify.log);
   sharedRedis = redis;
+
+  const domainEvents =
+    opts.domainEventsQueue ??
+    new Queue("domain-events", { connection: redis });
+
+  if (typeof (domainEvents as any)?.on === "function") {
+    (domainEvents as any).on("error", (err: unknown) => {
+      fastify.log.warn({ err }, "domain-events queue error (non-fatal)");
+    });
+  }
+  if ((domainEvents as any)?.connection) {
+    (domainEvents as any).connection.on("error", () => {});
+  }
 
   // Release the Redis connection when the app closes so tests (and workers)
   // don't leak sockets and hang the process.
   fastify.addHook("onClose", async () => {
+    if (typeof (domainEvents as any)?.close === "function") {
+      await (domainEvents as any).close().catch(() => {});
+      if ((domainEvents as any)?.connection) {
+        (domainEvents as any).connection.on("error", () => {});
+      }
+    }
     await redis.quit().catch(() => {});
     redis.disconnect();
   });
@@ -2415,6 +2451,28 @@ fastify.get('/api/admin/auth/ip-score', {
           ? "Idempotency miss — payment created"
           : "Payment created (no idempotency key)",
       );
+
+      /* after successful payment commit: */
+      await domainEvents
+        .add(
+          "payment.created",
+          {
+            type: "payment.created",
+            id: payment.id,
+            merchantId: payment.merchantId,
+            amount: payment.amount,
+            asset: payment.asset,
+            traceId: (request as unknown as { traceId?: string }).traceId,
+            occurredAt: new Date().toISOString(),
+          },
+          { removeOnComplete: 10_000 },
+        )
+        .catch((err: unknown) => {
+          request.log.warn(
+            { err, paymentId: payment.id },
+            "Domain event emit failed (non-fatal)",
+          );
+        });
 
       if (d.convertTo) {
         return reply.code(201).send({ data: { ...payment, fxQuote } });
