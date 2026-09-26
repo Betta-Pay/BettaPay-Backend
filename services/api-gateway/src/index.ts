@@ -3068,7 +3068,7 @@ fastify.get('/api/admin/auth/ip-score', {
         if (newDailyTotal > dailyLimit) {
           return reply.code(422).send(
             createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
+              "QUOTA_EXCEEDED",
               `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
