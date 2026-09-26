@@ -1,0 +1,16 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "BettaPay API",
+    "version": "0.1.0"
+  },
+  "components": {
+    "schemas": {}
+  },
+  "paths": {},
+  "servers": [
+    {
+      "url": "http://localhost:3000"
+    }
+  ]
+}
