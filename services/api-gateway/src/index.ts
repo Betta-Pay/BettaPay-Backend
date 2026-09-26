@@ -3396,6 +3396,7 @@ async function warmupDownstreamServices(
 // Graceful shutdown
 let mainApp: ReturnType<typeof Fastify> | null = null;
 let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
+let mainWebhookQueue: ReturnType<typeof createWebhookQueue> | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string) {
@@ -3406,6 +3407,17 @@ async function shutdown(signal: string) {
   app.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
+    // Stop crons first so no new jobs are enqueued
+    stopAbandonedPaymentsCron();
+    stopIdempotencyKeyCleanupCron();
+
+    // Close the webhook queue after crons stop, before Prisma disconnect
+    if (mainWebhookQueue) {
+      await mainWebhookQueue.close().catch((err: unknown) => {
+        app.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
+      });
+    }
+
     await app.close();
     if (metricsServer) {
       await new Promise<void>((resolve) =>
@@ -3413,8 +3425,6 @@ async function shutdown(signal: string) {
       );
     }
     await getDefaultPrisma().$disconnect();
-    stopAbandonedPaymentsCron();
-    stopIdempotencyKeyCleanupCron();
     process.exit(0);
   } catch (err) {
     app.log.error(err, "Error during shutdown");
@@ -3459,6 +3469,7 @@ const start = async () => {
       const webhookQueue = createWebhookQueue("gateway-expired-webhooks", {
         url: env.REDIS_URL,
       });
+      mainWebhookQueue = webhookQueue;
       startAbandonedPaymentsCron(
         prisma,
         app.log,

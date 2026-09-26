@@ -1,5 +1,6 @@
 import type { FeeAuditSnapshot } from "./settlement-amounts.js";
 import { feeSnapshotSchema } from "@bettapay/validation";
+import type { FastifyBaseLogger } from "fastify";
 
 /** The subset of a Settlement row that the webhook payload is built from. */
 export interface SettlementWebhookSource {
@@ -42,6 +43,7 @@ export interface SettlementWebhookSource {
  */
 export function buildSettlementWebhookData(
   s: SettlementWebhookSource,
+  log?: FastifyBaseLogger,
 ): Record<string, unknown> {
   let feeSnapshot: FeeAuditSnapshot | null = null;
 
@@ -51,14 +53,13 @@ export function buildSettlementWebhookData(
     if (validationResult.success) {
       feeSnapshot = validationResult.data as FeeAuditSnapshot;
     } else {
-      console.error(
-        "Corrupt feeSnapshot detected in settlement, returning null",
+      log?.error(
         {
           settlementId: s.id,
           merchantId: s.merchantId,
-          corruptSnapshot: s.feeSnapshot,
           validationError: validationResult.error.message,
         },
+        "Corrupt feeSnapshot detected in settlement, returning null",
       );
     }
   }
