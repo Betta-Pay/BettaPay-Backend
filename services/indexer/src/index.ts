@@ -896,25 +896,85 @@ fastify.get(
 
 // Issue #68 — replay historical events for a ledger range (all contracts)
 // Issue #76 — extended to iterate over all configured contract IDs
-const ReplayBody = z
-  .object({
-    fromLedger: z.number().int().min(1),
-    toLedger: z.number().int().min(1),
-  })
-  .refine((d) => d.fromLedger <= d.toLedger, {
-    message: "fromLedger must be <= toLedger",
-  });
+// Issue #762 — canonical param names are startLedger/endLedger on both replay
+// endpoints; fromLedger/toLedger remain accepted as deprecated aliases for one
+// release. Replay range semantics are unchanged.
+const LedgerInt = z.number().int().min(1);
+
+const ReplayRangeFields = {
+  startLedger: LedgerInt.optional(),
+  endLedger: LedgerInt.optional(),
+  /** @deprecated alias for startLedger — accepted for one release (#762). */
+  fromLedger: LedgerInt.optional(),
+  /** @deprecated alias for endLedger — accepted for one release (#762). */
+  toLedger: LedgerInt.optional(),
+};
+
+/**
+ * Resolves the canonical replay range from a body that may use either the
+ * canonical startLedger/endLedger names or the deprecated fromLedger/toLedger
+ * aliases. Canonical names win when both are supplied.
+ *
+ * @internal exported for testing only
+ */
+export function resolveReplayRange(input: {
+  startLedger?: number;
+  endLedger?: number;
+  fromLedger?: number;
+  toLedger?: number;
+}): { startLedger: number; endLedger: number } {
+  return {
+    startLedger: input.startLedger ?? input.fromLedger!,
+    endLedger: input.endLedger ?? input.toLedger!,
+  };
+}
+
+const ReplayRangeRefine = (
+  d: {
+    startLedger?: number;
+    endLedger?: number;
+    fromLedger?: number;
+    toLedger?: number;
+  },
+  ctx: z.RefinementCtx,
+) => {
+  const { startLedger, endLedger } = resolveReplayRange(d);
+  if (startLedger === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "startLedger is required (fromLedger accepted as a deprecated alias)",
+      path: ["startLedger"],
+    });
+  }
+  if (endLedger === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "endLedger is required (toLedger accepted as a deprecated alias)",
+      path: ["endLedger"],
+    });
+  }
+  if (
+    startLedger !== undefined &&
+    endLedger !== undefined &&
+    startLedger > endLedger
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "startLedger must be <= endLedger",
+    });
+  }
+};
+
+const ReplayBody = z.object(ReplayRangeFields).superRefine(ReplayRangeRefine);
 
 // Issue #343 — per-contract replay body
 const PerContractReplayBody = z
   .object({
-    startLedger: z.number().int().min(1),
-    endLedger: z.number().int().min(1),
+    ...ReplayRangeFields,
     force: z.boolean().optional().default(false),
   })
-  .refine((d) => d.startLedger <= d.endLedger, {
-    message: "startLedger must be <= endLedger",
-  });
+  .superRefine(ReplayRangeRefine);
 
 fastify.post(
   "/api/events/replay",
@@ -928,7 +988,11 @@ fastify.post(
     },
   },
   async (request, reply) => {
-    const { fromLedger, toLedger } = ReplayBody.parse(request.body);
+    const { startLedger, endLedger } = resolveReplayRange(
+      ReplayBody.parse(request.body),
+    );
+    const fromLedger = startLedger;
+    const toLedger = endLedger;
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
@@ -936,7 +1000,13 @@ fastify.post(
         error: {
           code: "VALIDATION_ERROR",
           message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: { fromLedger, toLedger, maxRange: MAX_REPLAY_LEDGER_RANGE },
+          details: {
+            startLedger,
+            endLedger,
+            fromLedger,
+            toLedger,
+            maxRange: MAX_REPLAY_LEDGER_RANGE,
+          },
         },
       });
     }
@@ -946,6 +1016,8 @@ fastify.post(
     return reply.code(202).send({
       jobId: job.id,
       status: "queued",
+      startLedger,
+      endLedger,
       fromLedger,
       toLedger,
       range,
@@ -979,9 +1051,9 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       });
     }
 
-    const { startLedger, endLedger, force } = PerContractReplayBody.parse(
-      request.body,
-    );
+    const parsedContractReplay = PerContractReplayBody.parse(request.body);
+    const { startLedger, endLedger } = resolveReplayRange(parsedContractReplay);
+    const force = parsedContractReplay.force ?? false;
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
@@ -992,6 +1064,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
           details: {
             startLedger,
             endLedger,
+            fromLedger: startLedger,
+            toLedger: endLedger,
             maxRange: MAX_REPLAY_LEDGER_RANGE,
           },
         },
@@ -1011,6 +1085,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       contractId,
       startLedger,
       endLedger,
+      fromLedger: startLedger,
+      toLedger: endLedger,
       force,
       range,
     });

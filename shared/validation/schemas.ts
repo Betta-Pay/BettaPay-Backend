@@ -413,8 +413,10 @@ export const CreatePaymentBody = z
     amount: AmountString,
     asset: CurrencyCode,
     convertTo: CurrencyCode.optional(),
-    payerId: z.string().optional(),
-    reference: z.string().optional(),
+    // #763 — free-form optionals previously relied on the global trim with no
+    // length caps, so oversized strings hit DB limits as 500s instead of 400s.
+    payerId: z.string().max(128, "payerId must not exceed 128 characters").optional(),
+    reference: z.string().max(255, "reference must not exceed 255 characters").optional(),
     idempotencyKey: IdempotencyKeySchema.optional(),
   })
   .superRefine((data, ctx) => addAmountPrecisionIssue(data.amount, data.asset, ctx));
