@@ -49,9 +49,11 @@ export async function buildGatewayHealthResponse(
     startTime,
     dependencies: [postgresql],
     upstream: [fxEngine, settlementEngine, indexer],
-    // Readiness contract: the gateway cannot serve payments/quotes without its
-    // database AND its downstream engines, so all of them gate the 503.
-    criticalDependencyNames: ['postgresql', 'fx-engine', 'settlement-engine', 'indexer'],
+    // Only postgresql is truly critical — a dead downstream should degrade
+    // the gateway (200 + degraded) rather than 503 the entire payment path.
+    // Upstream services are probed and reported in the `upstream` block but
+    // gate `degraded` status instead of `unhealthy`/503.
+    criticalDependencyNames: ['postgresql'],
   });
 
   // Include abandoned payments count in non-test environments

@@ -307,6 +307,12 @@ export const HealthResponse = z.object({
   lastDependencyCheck: z.string(),
   dependencies: z.array(DependencyHealth),
   upstream: z.array(DependencyHealth).optional(),
+  business: z
+    .object({
+      abandonedPayments: z.number().int().nonnegative(),
+    })
+    .optional()
+    .describe("Non-critical telemetry; absent in test env"),
 });
 export type HealthResponse = z.infer<typeof HealthResponse>;
 
