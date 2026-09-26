@@ -3063,6 +3063,16 @@ fastify.get('/api/admin/auth/ip-score', {
   );
 
   fastify.get("/api/deployments", async (request, reply) => {
+    // #761 — explorer links must follow the configured network, not assume
+    // testnet, or a mainnet receipt points a member at the wrong ledger
+    // viewer during an incident.
+    const isMainnet = env.STELLAR_NETWORK_PASSPHRASE.toLowerCase().includes(
+      "public global",
+    );
+    const explorerContractBase = isMainnet
+      ? "https://stellar.expert/explorer/public/contract"
+      : "https://lab.stellar.org/r/testnet/contract";
+
     return {
       data: {
         network: env.STELLAR_NETWORK_PASSPHRASE,
@@ -3070,12 +3080,12 @@ fastify.get('/api/admin/auth/ip-score', {
           {
             name: "Settlement contract",
             contractId: env.SETTLEMENT_CONTRACT_ID,
-            explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
+            explorerUrl: `${explorerContractBase}/${env.SETTLEMENT_CONTRACT_ID}`,
           },
           {
             name: "Governance contract",
             contractId: env.GOVERNANCE_CONTRACT_ID,
-            explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
+            explorerUrl: `${explorerContractBase}/${env.GOVERNANCE_CONTRACT_ID}`,
           },
         ],
         updatedAt: new Date().toISOString(),
@@ -3459,8 +3469,7 @@ const start = async () => {
     }
     await app.listen({ port: PORT, host: "0.0.0.0" });
   } catch (err) {
-    if (mainApp) mainApp.log.error(err);
-    else console.error(err);
+    mainApp?.log.error({ err }, "Gateway startup warning");
     process.exit(1);
   }
 };

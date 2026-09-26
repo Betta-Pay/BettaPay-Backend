@@ -605,14 +605,37 @@ export function validateEnv(env: Record<string, unknown>): Env {
   }
 }
 
+// #759 — routes the config-validation failure message through a structured
+// logger instead of a bare console write, so it's subject to the same level
+// control and shape as the rest of a service's logs. `log` is optional (no
+// new required parameter for existing `validateEnvOrExit` callers); when
+// omitted, falls back to `console.error` so the message is never silently
+// dropped for callers that haven't wired a logger through yet.
+export function reportValidationConfigIssue(
+  message: string,
+  log?: { error(obj: unknown, msg: string): void },
+): void {
+  if (log) {
+    log.error({}, message);
+  } else {
+    console.error(message);
+  }
+}
+
 // Wraps validateEnv() for use at service startup: logs a single clean,
 // human-readable message (no stack trace) and exits with code 1 on failure,
 // so misconfiguration is caught fast instead of surfacing later at runtime.
-export function validateEnvOrExit(env: Record<string, unknown>): Env {
+export function validateEnvOrExit(
+  env: Record<string, unknown>,
+  log?: { error(obj: unknown, msg: string): void },
+): Env {
   try {
     return validateEnv(env);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    reportValidationConfigIssue(
+      error instanceof Error ? error.message : String(error),
+      log,
+    );
     return process.exit(1);
   }
 }

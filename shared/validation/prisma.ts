@@ -71,11 +71,18 @@ export function shouldEnablePrismaQueryLogging(): boolean {
   return process.env.LOG_LEVEL === 'debug' || process.env.NODE_ENV === 'development';
 }
 
-export function getPrismaLogLevels(): PrismaLogLevel[] {
+// #760 — this announcement previously went straight to console.log,
+// bypassing the structured-logger level control every other Prisma log line
+// in this module goes through. `log` is optional (defaults to a noop) so
+// existing no-arg callers keep compiling and stay quiet under production
+// levels exactly as before.
+export function getPrismaLogLevels(
+  log: { debug: (obj: object, msg?: string) => void } = { debug: () => {} },
+): PrismaLogLevel[] {
   const override = parsePrismaLogLevelsOverride(process.env.PRISMA_LOG_LEVELS);
   const levels = override ?? defaultPrismaLogLevelsForEnv(process.env.NODE_ENV);
   const source = override ? 'PRISMA_LOG_LEVELS override' : `NODE_ENV=${process.env.NODE_ENV ?? 'development'} default`;
-  console.log(`[Prisma] log levels: ${levels.join(', ')} (${source})`);
+  log.debug({ levels, source }, '[Prisma] log levels');
   return levels;
 }
 
