@@ -155,6 +155,13 @@ declare module "fastify" {
   }
 }
 
+// Set by the auth rejection paths so the onResponse audit hook (#665) can
+// persist a queryable row for every authentication failure. Modelled as an
+// intersection rather than a FastifyRequest augmentation: Fastify's request
+// interface is generic, and merging a non-generic declaration into it is an
+// error.
+type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
+
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -907,6 +914,13 @@ export function buildApp(opts: AppOptions = {}) {
     }
   }
 
+  // Flags a request as an authentication rejection so the onResponse audit
+  // hook (#665) can persist a queryable row. Only the fact of the rejection is
+  // recorded downstream — never the credential that caused it.
+  function markAuthRejected(request: FastifyRequest): void {
+    (request as AuthFailureMarkedRequest).authFailed = true;
+  }
+
   // Authentication hook — verifies the JWT, rejects revoked tokens (jti
   // blocklist), and keeps the per-merchant session index fresh.
   fastify.decorate(
@@ -916,12 +930,14 @@ export function buildApp(opts: AppOptions = {}) {
         await request.jwtVerify();
         const payload = request.user as MerchantJwtPayload;
         if (payload.jti && (await isJtiRevoked(payload.jti))) {
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
         }
       } catch (err) {
         request.log.error(err);
+        markAuthRejected(request);
         return reply
           .code(401)
           .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -940,6 +956,7 @@ export function buildApp(opts: AppOptions = {}) {
             { jti, merchantId },
             "[Auth] JWT session missing or revoked",
           );
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -1028,6 +1045,33 @@ export function buildApp(opts: AppOptions = {}) {
   // schemas receive trimmed, control-character-free, NFC-normalized strings.
 
   auditRouteAuthPolicy(fastify);
+
+  // Persist authentication rejections to the audit log (#665). Auth probing was
+  // log-only, so security review had no queryable rejection history; this adds
+  // one without ever changing what the caller sees.
+  //
+  // Best-effort end to end: `logAuditEvent` already swallows DB errors, and the
+  // explicit catch guarantees an audit-layer problem can never surface on the
+  // response path. No tokens, headers, cookies or query strings are recorded —
+  // only the route, the caller's IP reputation score and the timestamp (ip and
+  // createdAt are filled in by the audit logger itself).
+  fastify.addHook("onResponse", async (request, reply) => {
+    const rejected = (request as AuthFailureMarkedRequest).authFailed === true;
+    if (!rejected && reply.statusCode !== 401) return;
+
+    // Route pattern (e.g. "/api/auth/refresh") rather than the raw URL, so
+    // rejections group by endpoint and no query-string credential is stored.
+    const path = request.routeOptions?.url ?? request.url.split("?")[0];
+    const ipReputationScore = await getAuthIpScore(request.ip);
+
+    await logAuditEvent(
+      "auth.rejected",
+      "request",
+      request.id,
+      { path, method: request.method, ipReputationScore, rejectedAt: new Date().toISOString() },
+      request,
+    ).catch(() => null);
+  });
 
   // Routes
   registerGatewayHealthRoutes({
@@ -1363,23 +1407,27 @@ export function buildApp(opts: AppOptions = {}) {
   } catch (err) {
     request.log.error(err);
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const payload = request.user as MerchantJwtPayload;
   if (!payload.merchantId || !payload.ownerId || !payload.jti || !payload.exp) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   if (await isJtiRevoked(payload.jti)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const remainingLifetime = payload.exp - Math.floor(Date.now() / 1000);
   if (remainingLifetime <= 0) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
@@ -1447,6 +1495,7 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   // Verify against the *stored* challenge string, never the client-supplied one.
   if (!verifyWalletSignature(d.address, stored.challenge, d.signature)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
 
