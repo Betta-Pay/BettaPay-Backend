@@ -1660,18 +1660,39 @@ async function shutdown(signal: string) {
 
   fastify.log.info(`Received ${signal}, shutting down gracefully...`);
 
+  // #752 — force-exit timeout: if the close sequence hangs for >30s,
+  // exit hard so the container/orchestrator can reclaim resources.
+  const FORCE_EXIT_MS = 30_000;
+  const forceExit = setTimeout(() => {
+    fastify.log.error("FX shutdown timed out — forcing exit");
+    process.exit(1);
+  }, FORCE_EXIT_MS);
+  forceExit.unref?.();
+
   try {
     if (refreshIntervalHandle !== null) {
       clearTimeout(refreshIntervalHandle);
       refreshIntervalHandle = null;
     }
-    await cleanupWorker.close();
+    if (fallbackWarningIntervalHandle !== null) {
+      clearInterval(fallbackWarningIntervalHandle);
+      fallbackWarningIntervalHandle = null;
+    }
+    // #753 — bound worker.close() with a 10s timeout race so a wedged
+    // connection cannot block the entire shutdown sequence.
+    await Promise.race([
+      cleanupWorker.close(),
+      new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+    ]);
     await cleanupQueue.close();
     await fastify.close();
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
+
+    clearTimeout(forceExit);
     process.exit(0);
   } catch (err) {
     fastify.log.error(err, "Error during shutdown");
+    clearTimeout(forceExit);
     process.exit(1);
   }
 }

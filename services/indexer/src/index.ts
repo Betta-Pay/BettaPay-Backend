@@ -1826,28 +1826,58 @@ const start = async () => {
   }
 };
 
-process.on("SIGTERM", async () => {
-  await prisma.$disconnect();
-  await replayQueue.close();
-  await closeWorkerWithTimeout(
-    replayWorker,
-    "indexer-replays",
-    fastify.log,
-    getActiveReplayJob,
-  );
-  await webhookQueue.close();
-  await closeWorkerWithTimeout(
-    webhookWorker,
-    "indexer-webhooks",
-    fastify.log,
-    getActiveWebhookJob,
-  );
-  await dlqQueue.close();
-  await replayProgressRedis.quit().catch(() => {});
-  await fastify.close();
-  await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
-  process.exit(0);
-});
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  fastify.log.info({ signal }, "Shutting down indexer");
+
+  // #751 — force-exit timeout: if the close sequence hangs for >30s,
+  // exit hard so the container/orchestrator can reclaim resources.
+  const FORCE_EXIT_MS = 30_000;
+  const forceExit = setTimeout(() => {
+    fastify.log.error("Indexer shutdown timed out — forcing exit");
+    process.exit(1);
+  }, FORCE_EXIT_MS);
+  forceExit.unref?.();
+
+  try {
+    // Stop poll/replay loops before closing connections
+    stopCleanupScheduler();
+
+    await prisma.$disconnect();
+    await replayQueue.close();
+    await closeWorkerWithTimeout(
+      replayWorker,
+      "indexer-replays",
+      fastify.log,
+      getActiveReplayJob,
+    );
+    await webhookQueue.close();
+    await closeWorkerWithTimeout(
+      webhookWorker,
+      "indexer-webhooks",
+      fastify.log,
+      getActiveWebhookJob,
+    );
+    await dlqQueue.close();
+    await replayProgressRedis.quit().catch(() => {});
+    await fastify.close();
+    await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
+
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (err) {
+    fastify.log.error(err, "Error during shutdown");
+    clearTimeout(forceExit);
+    process.exit(1);
+  }
+};
+
+let shuttingDown = false;
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 if (process.env.NODE_ENV !== "test") {
   start();
