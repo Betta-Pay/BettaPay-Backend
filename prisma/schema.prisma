@@ -118,6 +118,7 @@ model Settlement {
   @@index([merchantId, initiatedAt(sort: Desc)])
   @@index([merchantId, status, initiatedAt(sort: Desc)])
   @@index([supersededById])
+  @@index([batchId])
   // #622 — supports the idempotency-key cleanup job's scan for expired keys.
   @@index([idempotencyKeyExpiresAt])
 }

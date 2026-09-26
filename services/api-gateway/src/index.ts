@@ -2119,6 +2119,12 @@ fastify.get('/api/admin/auth/ip-score', {
       );
     });
 
+    // #744 — Invalidate cached merchant data so the suspended/unsuspended
+    // status is visible to read paths immediately.
+    await redis.del(`merchant:${id}`).catch((err: unknown) => {
+      request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
+    });
+
     const updated = await prisma.merchant.findUnique({ where: { id } });
     const { secretHash: _hash, ...safeMerchant } = updated!;
     return { code: 200 as const, body: { data: safeMerchant } };
@@ -2209,6 +2215,12 @@ fastify.get('/api/admin/auth/ip-score', {
           tx as unknown as Parameters<typeof logAuditEvent>[5],
         );
         return merchantUpdate;
+      });
+
+      // #744 — Invalidate cached merchant data so updated settings are
+      // visible to read paths immediately.
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
       });
 
       return reply.code(200).send({ data: { merchant: updated } });
@@ -2879,12 +2891,28 @@ fastify.get('/api/admin/auth/ip-score', {
         (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
       // #319 — Validate each asset against SupportedAsset table
-      for (const item of items) {
-        const supportedAsset = await prisma.supportedAsset.findUnique({
-          where: { code: item.asset },
-        });
+      // #743 — Cache the allowlist with a 5-minute TTL to avoid re-reading
+      // the reference table on every settlement-create call.
+      let assetSet: Set<string>;
+      const cachedCodes = await redis
+        .get("supported-asset-codes")
+        .catch(() => null);
+      if (cachedCodes) {
+        assetSet = new Set<string>(JSON.parse(cachedCodes) as string[]);
+      } else {
+        const codes = (
+          await prisma.supportedAsset.findMany({
+            select: { code: true },
+          })
+        ).map((a) => a.code);
+        assetSet = new Set<string>(codes);
+        await redis
+          .set("supported-asset-codes", JSON.stringify([...assetSet]), "EX", 300)
+          .catch(() => {});
+      }
 
-        if (!supportedAsset || !supportedAsset.isActive) {
+      for (const item of items) {
+        if (!assetSet.has(item.asset)) {
           return reply
             .code(422)
             .send(
@@ -3160,6 +3188,14 @@ fastify.get('/api/admin/auth/ip-score', {
   // GET /api/assets — list all supported assets
   fastify.get("/api/assets", async (request, reply) => {
     try {
+      // #742 — Cache the asset list in Redis with a 5-minute TTL to avoid
+      // re-querying a tiny reference table on every call. Falls back to the
+      // database on cache miss or Redis failure.
+      const cached = await redis.get("supported-assets").catch(() => null);
+      if (cached) {
+        return { data: JSON.parse(cached) };
+      }
+
       const assets = await prisma.supportedAsset.findMany({
         where: { isActive: true },
         select: {
@@ -3170,6 +3206,10 @@ fastify.get('/api/admin/auth/ip-score', {
           isActive: true,
         },
       });
+
+      await redis
+        .set("supported-assets", JSON.stringify(assets), "EX", 300)
+        .catch(() => {});
 
       return { data: assets };
     } catch (error) {
@@ -3206,6 +3246,12 @@ fastify.get('/api/admin/auth/ip-score', {
           { before: null, after: asset },
           request,
         );
+
+        // Invalidate asset caches so the new asset is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
 
         return reply.code(201).send({ data: asset });
       } catch (error: any) {
@@ -3260,6 +3306,12 @@ fastify.get('/api/admin/auth/ip-score', {
           request,
         );
 
+        // Invalidate asset caches so the update is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
+
         return { data: asset };
       } catch (error: any) {
         if (error.code === "P2025") {
@@ -3301,6 +3353,12 @@ fastify.get('/api/admin/auth/ip-score', {
           { before, after: null },
           request,
         );
+
+        // Invalidate asset caches so the deletion is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
 
         return reply.code(204).send();
       } catch (error: any) {
