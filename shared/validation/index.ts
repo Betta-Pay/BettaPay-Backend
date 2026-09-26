@@ -617,5 +617,7 @@ export function validateEnvOrExit(env: Record<string, unknown>): Env {
   }
 }
 
-export * from "./prisma-pool-metrics.js";
-export * from "./encryption.js";
+export * from './prisma-pool-metrics.js';
+export * from './encryption.js';
+export * from './batch-scan.js';
+export * from './idempotency.js';
