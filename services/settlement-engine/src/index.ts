@@ -1341,7 +1341,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant.settings);
