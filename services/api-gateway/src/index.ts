@@ -1467,7 +1467,14 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     stored = await consumeWalletChallenge(redis, d.address);
   } catch (err) {
     request.log.error({ err }, 'Failed to read wallet challenge from Redis');
-    return reply.code(503).send({ error: 'Authentication service unavailable' });
+    return reply
+      .code(503)
+      .send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          'Authentication service unavailable',
+        ),
+      );
   }
 
   if (!stored) {
@@ -1477,7 +1484,14 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
       .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
   }
 
-  if (stored.address !== d.address || Date.now() > stored.expiresAt) {
+  if (Date.now() > stored.expiresAt) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(400)
+      .send(createErrorResponse("CHALLENGE_EXPIRED", 'Challenge expired'));
+  }
+
+  if (stored.address !== d.address) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
@@ -2819,15 +2833,21 @@ fastify.get('/api/admin/auth/ip-score', {
       try {
         d = UpdateSettlementStatusBody.parse(request.body);
       } catch (error) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
-              "Invalid request body",
-              error,
-            ),
-          );
+        if (error instanceof z.ZodError) {
+          return reply
+            .code(400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.VALIDATION_ERROR,
+                "Invalid request body",
+                error.issues.map((issue) => ({
+                  path: issue.path,
+                  message: issue.message,
+                })),
+              ),
+            );
+        }
+        throw error;
       }
 
       const { id } = request.params;
