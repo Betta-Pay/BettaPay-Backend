@@ -921,10 +921,11 @@ async function flushIndexedEvents(
 auditRouteAuthPolicy(fastify);
 
 fastify.get("/api/health", async (_request, reply) => {
-  const health = await buildIndexerHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+  const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
     redisHealthState,
+
+    
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),
