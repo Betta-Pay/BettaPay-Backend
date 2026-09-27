@@ -43,6 +43,11 @@ import {
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor,
+  type MirrorDelegate,
+} from './domain-events-consumer.js';
+import {
   acquireSemaphore,
   releaseSemaphore,
   startSemaphoreRenewal,
@@ -519,6 +524,18 @@ const worker = new Worker(
   },
 );
 
+// Domain events consumer (#770): mirrors payment.created events emitted by
+// the gateway. Runs in parallel with the reconcile endpoint; an empty queue
+// is an idle poll and a missing mirror table is a guarded no-op.
+const domainWorker = new Worker(
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor(
+    () => (prisma as unknown as { paymentMirror?: MirrorDelegate }).paymentMirror,
+    fastify.log,
+  ),
+  { connection: redis, concurrency: 10 },
+);
+
 const MAX_SETTLEMENT_RETRY_COUNT = 3;
 
 export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT_RETRY_COUNT): void {
@@ -603,6 +620,9 @@ webhookQueue.on('error', (err) => {
 });
 webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
+});
+domainWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'Domain events worker error');
 });
 
 fastify.get('/api/health', async (_request, reply) => {
@@ -1953,6 +1973,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
     await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
+    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
     fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues
@@ -2065,6 +2086,7 @@ export async function closeTestResources(): Promise<void> {
   await step('worker', () => worker.close());
   await step('batchWorker', () => batchWorker.close());
   await step('webhookWorker', () => webhookWorker.close());
+  await step('domainWorker', () => domainWorker.close());
   await step('settlementQueue', () => settlementQueue.close());
   await step('settlementDLQ', () => settlementDLQ.close());
   await step('batchQueue', () => batchQueue.close());
