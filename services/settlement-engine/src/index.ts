@@ -1490,7 +1490,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         if (claimed === null) {
           const existingHash = await redis.get(`idempotency:bulk:${idempotencyKey}`);
           if (existingHash && existingHash !== payloadHash) {
-            return reply.code(409).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Idempotency key already used with a different payload'));
+            return reply.code(409).send(createErrorResponse('IDEMPOTENCY_PAYLOAD_MISMATCH', 'Idempotency key already used with a different payload'));
           }
 
           const existingResponse = await redis.get(`idempotency:bulk_res:${idempotencyKey}`);

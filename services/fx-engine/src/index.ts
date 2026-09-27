@@ -832,6 +832,9 @@ interface StoredQuote {
 
 export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
+  // Explicit 1MB cap — matches api-gateway and settlement-engine so the limit
+  // is auditable rather than relying on Fastify's implicit default.
+  bodyLimit: 1_048_576,
 });
 
 registerRequestId(fastify);
@@ -933,6 +936,8 @@ async function runRateHistoryCleanup(): Promise<number> {
 const cleanupQueue = new Queue("rate-history-cleanup", {
   connection: bullMqConnection,
   defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: "exponential", delay: 60_000 },
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 50 },
   },
