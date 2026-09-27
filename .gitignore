@@ -59,3 +59,4 @@ pgsql/
 # local artifacts
 build-output.txt
 *.tsbuildinfo
+fix.md

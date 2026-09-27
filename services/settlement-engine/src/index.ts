@@ -429,8 +429,11 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
       await settlementQueue.add('process-settlement', job.data, {
         delay: requeueDelayMs,
-        attempts: job.opts.attempts,
-        backoff: job.opts.backoff,
+        priority: job.opts.priority,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2_000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
       });
       return;
     }
