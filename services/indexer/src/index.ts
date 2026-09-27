@@ -73,7 +73,7 @@ import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
 import * as promClient from "prom-client";
 
 export const env = validateEnvOrExit(process.env);
-const PORT = Number(process.env.PORT ?? "3000");
+const PORT = Number(process.env.PORT ?? "3003");
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
