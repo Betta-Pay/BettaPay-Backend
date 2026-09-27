@@ -286,6 +286,7 @@ export const EnvSchema = z
     CONTRACT_NAMES: z.string().optional(),
 
     // Service URLs (used by gateway to proxy requests)
+    API_GATEWAY_URL: z.string().url().default("http://localhost:3000"),
     FX_ENGINE_URL: z.string().url().default("http://localhost:3002"),
     SETTLEMENT_ENGINE_URL: z.string().url().default("http://localhost:3001"),
     INDEXER_URL: z.string().url().default("http://localhost:3003"),
