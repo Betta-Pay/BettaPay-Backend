@@ -52,6 +52,11 @@ export const ErrorCodes = {
   // #317 — returned when a suspended merchant attempts to create a payment
   // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
   MERCHANT_SUSPENDED: "MERCHANT_SUSPENDED",
+  // Returned when a state-transition request is a no-op because the entity is
+  // already in the requested state (e.g. suspending a suspended merchant).
+  // Distinct from INVALID_REQUEST so operators can tell a retry-safe no-op
+  // apart from a genuinely malformed request.
+  MERCHANT_STATE_CONFLICT: "MERCHANT_STATE_CONFLICT",
   QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
   QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
 } as const;

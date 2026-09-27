@@ -144,7 +144,7 @@ import {
 import { Queue } from "bullmq";
 import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
-import { MerchantCache, getCachedMerchant } from "../../shared/validation/merchant-cache.js";
+import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
 declare module "fastify" {
   export interface FastifyInstance {
@@ -2196,10 +2196,19 @@ fastify.get('/api/admin/auth/ip-score', {
       status === "suspended"
         ? "Merchant is already suspended"
         : "Merchant is already active";
+    // Retry-safe no-op: the merchant is already in the requested state, so
+    // there is nothing to write and no audit event to emit. Uses a dedicated
+    // code so operators can distinguish it from a malformed request; 409 is
+    // preserved.
     if (merchant.status === status)
       return {
         code: 409 as const,
-        body: createErrorResponse(ErrorCodes.INVALID_REQUEST, conflictMessage),
+        body: createErrorResponse(
+          ErrorCodes.MERCHANT_STATE_CONFLICT,
+          conflictMessage,
+          { current: merchant.status },
+          request.id,
+        ),
       };
 
     await prisma.$transaction(async (tx) => {
