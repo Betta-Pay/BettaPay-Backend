@@ -1038,7 +1038,10 @@ function logRateStalenessIfStale(
 
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", async (_request, reply) => {
+// Upstream health probes (gateway aggregation, Render) share the global
+// 200/min bucket. Exempt so a traffic spike on another route cannot 429 the
+// liveness probe and get the service killed.
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
     redisHealthState,

@@ -82,6 +82,10 @@ import rateLimit from "@fastify/rate-limit";
 
 const fastifyInstance = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
+  // Explicit 1MB cap. Fastify's default is 1MB but the implicit value is not
+  // visible at the call site; stated explicitly so the limit is auditable and
+  // matches the other services.
+  bodyLimit: 1_048_576,
 });
 export const fastify = fastifyInstance;
 registerRequestId(fastify);
