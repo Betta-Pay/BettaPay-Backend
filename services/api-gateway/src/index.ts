@@ -116,7 +116,7 @@ import {
 import type { Merchant } from "@prisma/client";
 import type { ApiResponse, PaginatedResponse } from "@bettapay/shared-types";
 import { buildPaginationMeta } from "@bettapay/shared-types";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -2498,30 +2498,48 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      const payment = await prisma.$transaction(async (tx) => {
-        const created = await tx.payment.create({
-          data: {
-            id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
-            merchantId: d.merchantId,
-            payerId: d.payerId,
-            amount: d.amount,
-            asset: d.asset,
-            reference: d.reference,
-            status: "initiated",
-            idempotencyKey: idempotencyKey ?? undefined,
-            idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-          },
+      let payment;
+      try {
+        payment = await prisma.$transaction(async (tx) => {
+          const created = await tx.payment.create({
+            data: {
+              id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
+              merchantId: d.merchantId,
+              payerId: d.payerId,
+              amount: d.amount,
+              asset: d.asset,
+              reference: d.reference,
+              status: "initiated",
+              idempotencyKey: idempotencyKey ?? undefined,
+              idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+            },
+          });
+          await logAuditEvent(
+            "payment.created",
+            "payment",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "payment.created",
-          "payment",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
+      } catch (err: unknown) {
+        if (
+          idempotencyKey !== null &&
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        ) {
+          const raced = await prisma.payment.findFirst({
+            where: { idempotencyKey, idempotencyKeyExpiresAt: { gt: new Date() } },
+          });
+          if (raced) {
+            request.log.info({ idempotencyKey, paymentId: raced.id }, "Idempotency race lost — returning winner");
+            return reply.code(200).send({ data: raced });
+          }
+        }
+        throw err;
+      }
 
       request.log.info(
         { idempotencyKey, paymentId: payment.id },

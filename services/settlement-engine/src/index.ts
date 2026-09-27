@@ -1090,11 +1090,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
-    }
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
     reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
-    return reply.code(400).send({ error: 'Failed to perform reconciliation' });
+    return reply.code(422).send(
+      createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Reconciliation diff failed', undefined, request.id),
+    );
   }
 });
 

@@ -920,7 +920,7 @@ async function flushIndexedEvents(
 // definitions below so Fastify's onRoute hook sees all of them.
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", async (_request, reply) => {
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
     redisHealthState,
@@ -1379,7 +1379,12 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       connection: sharedRedis,
     });
     try {
-      await job.waitUntilFinished(queueEvents);
+      const finished = await Promise.race([
+        job.waitUntilFinished(queueEvents),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
+        ),
+      ]);
 
       const testedAt = new Date();
       await prisma.webhookSubscription.update({
