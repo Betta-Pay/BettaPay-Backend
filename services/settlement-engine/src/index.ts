@@ -607,7 +607,7 @@ webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
 });
 
-fastify.get('/api/health', async (_request, reply) => {
+fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
@@ -1543,7 +1543,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {

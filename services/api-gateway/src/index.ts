@@ -1481,7 +1481,9 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     await recordAuthIpFailure(request);
     return reply
       .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .send(
+        createErrorResponse('CHALLENGE_REUSED', 'Wallet challenge already used', undefined, request.id),
+      );
   }
 
   if (Date.now() > stored.expiresAt) {
@@ -1494,8 +1496,10 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   if (stored.address !== d.address) {
     await recordAuthIpFailure(request);
     return reply
-      .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .code(400)
+      .send(
+        createErrorResponse('CHALLENGE_MISMATCH', 'Wallet challenge mismatch', undefined, request.id),
+      );
   }
 
   // If the client echoed a challenge, it must be the one we issued.
