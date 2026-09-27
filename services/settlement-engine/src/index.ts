@@ -1151,7 +1151,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     }
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);

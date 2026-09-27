@@ -451,6 +451,33 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val > 0, {
         message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
       }),
+
+    // Abandoned-payments cron — a payment with no activity past this many
+    // minutes is considered abandoned. Also the correlation mechanism for
+    // the webhook reliability metric. Default matches the gateway health
+    // check's current inline fallback (api-gateway/src/health.ts).
+    ABANDONMENT_THRESHOLD_MINUTES: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1440"),
+    // How often the abandoned-payments cron runs (ms). Default matches the
+    // cron's current inline `setInterval` value (api-gateway/src/abandoned-payments-cron.ts).
+    ABANDONED_PAYMENTS_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+    // How often the idempotency-key cleanup cron runs (ms). Default matches
+    // the cron's current inline fallback (api-gateway/src/idempotency-key-cleanup-cron.ts).
+    IDEMPOTENCY_KEY_CLEANUP_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+
+    // Rate-limit kill-switch. Validated here so a typo like "False" (capital
+    // F) fails fast at boot instead of silently being treated as enabled —
+    // the gateway's own disable check (api-gateway/src/index.ts) only matches
+    // exactly 'false' or '0' and is left untouched.
+    RATE_LIMIT_ENABLED: z.enum(["true", "false", "1", "0"]).default("true"),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
