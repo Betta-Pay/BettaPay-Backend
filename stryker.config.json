@@ -1,0 +1,15 @@
+{
+  "$schema": "https://stryker-mutator.io/schema/stryker-config.json",
+  "mutate": [
+    "services/settlement-engine/src/settlement-amounts.ts",
+    "shared/validation/schemas.ts"
+  ],
+  "testRunner": "node",
+  "commandRunner": {
+    "command": "pnpm -w test"
+  },
+  "reporters": ["html", "clear-text", "progress"],
+  "coverageAnalysis": "perTest",
+  "timeoutMS": 5000,
+  "concurrency": 4
+}

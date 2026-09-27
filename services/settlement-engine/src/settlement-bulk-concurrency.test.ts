@@ -1,9 +1,12 @@
 import test from 'tape';
-import { fastify, prisma, settlementQueue } from './index.js';
+import { fastify, prisma, settlementQueue, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
 
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
@@ -12,6 +15,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
 }
 
 test('bulk-concurrency: multiple concurrent bulk requests for standard merchant', async (t) => {
@@ -28,6 +32,7 @@ test('bulk-concurrency: multiple concurrent bulk requests for standard merchant'
     fastify.inject({
       method: 'POST',
       url: '/api/settlements/bulk',
+      headers: AUTH_HEADER,
       payload: {
         merchantId: MOCK_MERCHANT_STANDARD.id,
         settlements: testBatch,
@@ -40,9 +45,9 @@ test('bulk-concurrency: multiple concurrent bulk requests for standard merchant'
   for (const res of responses) {
     t.equal(res.statusCode, 201, 'all concurrent requests should be processed independently');
     const body = JSON.parse(res.body);
-    t.equal(body.total, 2);
-    t.equal(body.created, 2);
-    t.equal(body.errors.length, 0);
+    t.equal(body.data.total, 2);
+    t.equal(body.data.created, 2);
+    t.equal(body.data.errors.length, 0);
   }
 
   t.end();
@@ -67,6 +72,7 @@ test('bulk-concurrency: concurrent status check and update simulations', async (
     fastify.inject({
       method: 'GET',
       url: '/api/settlements/batch/batch_con1/status',
+      headers: AUTH_HEADER,
     })
   );
 
@@ -75,11 +81,11 @@ test('bulk-concurrency: concurrent status check and update simulations', async (
   for (const res of responses) {
     t.equal(res.statusCode, 200);
     const body = JSON.parse(res.body);
-    t.equal(body.batchId, 'batch_con1');
-    t.equal(body.total, 3);
-    t.equal(body.pending, 1);
-    t.equal(body.completed, 1);
-    t.equal(body.failed, 1);
+    t.equal(body.data.batchId, 'batch_con1');
+    t.equal(body.data.total, 3);
+    t.equal(body.data.pending, 1);
+    t.equal(body.data.completed, 1);
+    t.equal(body.data.failed, 1);
   }
 
   t.end();
@@ -103,15 +109,24 @@ test('bulk-concurrency: simultaneous limit depletion check scenario', async (t) 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload,
   });
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 2);
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 1);
-  t.ok(body.errors[0].reason.includes('daily settlement limit exceeded'));
+  t.equal(body.data.total, 2);
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 1);
+  t.ok(body.data.errors[0].reason.includes('Daily settlement limit exceeded'));
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

@@ -1,4 +1,4 @@
-# <img src="./docs_logo.png" width="30" /> BettaPay Backend
+# BettaPay Backend
 
 Node.js backend services for the BettaPay Stellar payment infrastructure.
 
@@ -105,3 +105,7 @@ To create a new migration during development:
 ```bash
 npx prisma migrate dev --name <migration_name>
 ```
+
+## Recent Changes
+- Ongoing improvements and fixes as part of active development.
+- See commit history and open issues for detailed change tracking.

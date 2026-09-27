@@ -19,10 +19,20 @@ test('parseAllowedOrigins splits and normalizes comma-separated values', () => {
   ]);
 });
 
-test('resolveAllowedOrigins uses dev defaults when unset', () => {
+test('resolveAllowedOrigins uses a safe explicit dev default and never wildcards', () => {
   const { origins, error } = resolveAllowedOrigins({ NODE_ENV: 'development' });
   assert.strictEqual(error, undefined);
   assert.deepStrictEqual(origins, parseAllowedOrigins(DEV_ALLOWED_ORIGINS_DEFAULT));
+  assert.ok(!origins.includes('*'), 'default list must never include a wildcard origin');
+});
+
+test('resolveAllowedOrigins rejects wildcard origins even in development', () => {
+  const { origins, error } = resolveAllowedOrigins({
+    NODE_ENV: 'development',
+    ALLOWED_ORIGINS: '*',
+  });
+  assert.deepStrictEqual(origins, []);
+  assert.match(error ?? '', /Wildcard CORS origin/);
 });
 
 test('resolveAllowedOrigins requires explicit value in production', () => {

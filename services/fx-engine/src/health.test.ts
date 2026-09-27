@@ -10,26 +10,27 @@ interface RateFeedEntry {
 
 function computeRateFeeds(
   rates: Record<string, number>,
-  cachedAt: number,
+  globalCachedAt: number,
+  rateCachedAt: Record<string, number>,
   feedTtlMs: number,
   now: number,
 ): Record<string, RateFeedEntry> {
-  const ageMs = now - cachedAt;
   const rateKeys = Object.keys(rates);
-
   const feeds: Record<string, RateFeedEntry> = {};
 
   if (rateKeys.length === 0) {
     const fallbackCurrencies = ['USDC', 'EURT', 'NGN'];
     for (const currency of fallbackCurrencies) {
+      const ageMs = now - (rateCachedAt[currency] ?? globalCachedAt);
       feeds[currency] = {
         status: 'down',
-        lastUpdated: new Date(cachedAt).toISOString(),
+        lastUpdated: new Date(rateCachedAt[currency] ?? globalCachedAt).toISOString(),
         ageMs,
       };
     }
   } else {
     for (const currency of rateKeys) {
+      const ageMs = now - (rateCachedAt[currency] ?? globalCachedAt);
       let status: 'healthy' | 'stale' | 'down';
       if (ageMs >= 2 * feedTtlMs) {
         status = 'down';
@@ -40,7 +41,7 @@ function computeRateFeeds(
       }
       feeds[currency] = {
         status,
-        lastUpdated: new Date(cachedAt).toISOString(),
+        lastUpdated: new Date(rateCachedAt[currency] ?? globalCachedAt).toISOString(),
         ageMs,
       };
     }
@@ -64,7 +65,8 @@ const now = 1_000_000_000_000;
 test('rateFeeds: all fresh — feedStatus healthy', (t) => {
   const rates = { USDC: 1500, EURT: 1700, NGN: 1 };
   const cachedAt = now - 30_000; // 30s ago, < TTL
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = { USDC: cachedAt, EURT: cachedAt, NGN: cachedAt };
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'healthy');
   t.equal(feeds['EURT'].status, 'healthy');
@@ -75,10 +77,11 @@ test('rateFeeds: all fresh — feedStatus healthy', (t) => {
   t.end();
 });
 
-test('rateFeeds: one stale — feedStatus degraded', (t) => {
+test('rateFeeds: all stale — feedStatus degraded', (t) => {
   const rates = { USDC: 1500, EURT: 1700, NGN: 1 };
   const cachedAt = now - 90_000; // 90s ago, >= TTL, < 2*TTL
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = { USDC: cachedAt, EURT: cachedAt, NGN: cachedAt };
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'stale');
   t.equal(feeds['EURT'].status, 'stale');
@@ -88,10 +91,11 @@ test('rateFeeds: one stale — feedStatus degraded', (t) => {
   t.end();
 });
 
-test('rateFeeds: one down — feedStatus down', (t) => {
+test('rateFeeds: all down — feedStatus down', (t) => {
   const rates = { USDC: 1500, EURT: 1700, NGN: 1 };
   const cachedAt = now - 120_000; // 120s ago, >= 2*TTL
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = { USDC: cachedAt, EURT: cachedAt, NGN: cachedAt };
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'down');
   t.equal(feeds['EURT'].status, 'down');
@@ -104,7 +108,8 @@ test('rateFeeds: one down — feedStatus down', (t) => {
 test('rateFeeds: no rates — all down', (t) => {
   const rates = {};
   const cachedAt = now;
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = {};
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'down');
   t.equal(feeds['EURT'].status, 'down');
@@ -116,7 +121,8 @@ test('rateFeeds: no rates — all down', (t) => {
 test('rateFeeds: boundary at exactly TTL is stale', (t) => {
   const rates = { USDC: 1500 };
   const cachedAt = now - TTL;
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = { USDC: cachedAt };
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'stale');
   t.end();
@@ -125,20 +131,27 @@ test('rateFeeds: boundary at exactly TTL is stale', (t) => {
 test('rateFeeds: boundary at exactly 2*TTL is down', (t) => {
   const rates = { USDC: 1500 };
   const cachedAt = now - 2 * TTL;
-  const feeds = computeRateFeeds(rates, cachedAt, TTL, now);
+  const rateCachedAt = { USDC: cachedAt };
+  const feeds = computeRateFeeds(rates, cachedAt, rateCachedAt, TTL, now);
 
   t.equal(feeds['USDC'].status, 'down');
   t.end();
 });
 
-test('rateFeeds: mixed statuses — aggregate reflects worst', (t) => {
-  // This scenario can't happen with a single cachedAt (all rates update together),
-  // but we test the aggregate function directly.
-  const feeds = {
-    USDC: { status: 'healthy' as const, lastUpdated: '', ageMs: 0 },
-    EURT: { status: 'stale' as const, lastUpdated: '', ageMs: 0 },
-    NGN:  { status: 'down' as const, lastUpdated: '', ageMs: 0 },
+test('rateFeeds: mixed statuses — aggregate reflects worst and partial degradation works', (t) => {
+  const rates = { USDC: 1500, EURT: 1700, NGN: 1 };
+  const globalCachedAt = now - 120_000;
+  // USDC is fresh, EURT is stale, NGN is down
+  const rateCachedAt = {
+    USDC: now - 30_000,
+    EURT: now - 90_000,
+    NGN: now - 120_000,
   };
+  const feeds = computeRateFeeds(rates, globalCachedAt, rateCachedAt, TTL, now);
+  
+  t.equal(feeds['USDC'].status, 'healthy');
+  t.equal(feeds['EURT'].status, 'stale');
+  t.equal(feeds['NGN'].status, 'down');
   t.equal(computeFeedStatus(feeds), 'down');
   t.end();
 });

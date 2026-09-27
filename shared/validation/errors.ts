@@ -18,13 +18,17 @@ export interface ErrorResponse {
     code: string;
     message: string;
     details?: unknown;
+    reqId?: string;
   };
 }
 
-export function createErrorResponse(code: string, message: string, details?: unknown): ErrorResponse {
+export function createErrorResponse(code: string, message: string, details?: unknown, reqId?: string): ErrorResponse {
   const error: ErrorResponse['error'] = { code, message };
   if (details !== undefined) {
     error.details = details;
+  }
+  if (reqId !== undefined) {
+    error.reqId = reqId;
   }
   return { error };
 }

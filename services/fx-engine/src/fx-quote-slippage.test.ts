@@ -87,3 +87,22 @@ test('Market rate unavailable — accepted by expiry (fail-open)', (t) => {
   t.notOk(expired, 'rejected when expired even if market unavailable');
   t.end();
 });
+
+test('Over-slippage masked by rounding is caught with full precision', (t) => {
+  // If quotedRate was rounded to 8 decimal places:
+  // e.g. unrounded was 1000.000000004
+  const quotedRate = 1000.000000004;
+  // currentRate is 1005.000001 (slightly more than 50bps deviation from the unrounded rate)
+  const currentRate = 1005.000001;
+  const valid = verify({
+    quotedRate,
+    currentRate,
+    slippageBps: 50,
+    expiresAt: Date.now() + 60_000,
+    now: Date.now(),
+    marketRateAvailable: true,
+  });
+  t.notOk(valid, 'rejected when true deviation exceeds slippage limit before rounding');
+  t.end();
+});
+

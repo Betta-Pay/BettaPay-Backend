@@ -13,7 +13,7 @@
 import test from 'tape';
 import fc from 'fast-check';
 import BigNumber from 'bignumber.js';
-import { computeSettlementAmounts, SettlementAmountError, MAX_SETTLEMENT_AMOUNT } from './settlement-amounts.js';
+import { computeSettlementAmounts, SettlementAmountError, MAX_SETTLEMENT_AMOUNT, getMaxSettlementAmountForAsset, FEE_VERSION } from './settlement-amounts.js';
 
 /** Count decimal places in a monetary string (0 when there is no fractional part). */
 function decimalPlaces(amount: string): number {
@@ -197,4 +197,69 @@ test('property: amounts near MAX boundary either pass or correctly throw', (t) =
       { numRuns: 200 },
     );
   });
+});
+
+// ─── FEE_VERSION constant (#482) ──────────────────────────────────────────
+
+test('FEE_VERSION is a non-empty string matching expected shape', (t) => {
+  t.equal(typeof FEE_VERSION, 'string', 'FEE_VERSION is a string');
+  t.ok(FEE_VERSION.length > 0, 'FEE_VERSION is non-empty');
+  t.ok(/^\d+\.\d+$/.test(FEE_VERSION), 'FEE_VERSION matches semver-like shape (e.g. "1.0")');
+  t.end();
+});
+
+// ─── Per-asset max settlement amount (#481) ──────────────────────────────
+
+test('getMaxSettlementAmountForAsset: returns legacy max when asset is undefined', (t) => {
+  t.equal(getMaxSettlementAmountForAsset(), MAX_SETTLEMENT_AMOUNT, 'undefined asset → legacy max');
+  t.end();
+});
+
+test('getMaxSettlementAmountForAsset: returns legacy max for unknown asset', (t) => {
+  t.equal(getMaxSettlementAmountForAsset('UNKNOWN'), MAX_SETTLEMENT_AMOUNT, 'unknown asset → legacy max');
+  t.end();
+});
+
+test('getMaxSettlementAmountForAsset: USDC (7 decimals) → 10^15', (t) => {
+  const max = getMaxSettlementAmountForAsset('USDC');
+  t.equal(max, '1000000000000000', 'USDC max = 10^8 × 10^7 = 10^15');
+  t.end();
+});
+
+test('getMaxSettlementAmountForAsset: NGN (2 decimals) → 10^10', (t) => {
+  const max = getMaxSettlementAmountForAsset('NGN');
+  t.equal(max, '10000000000', 'NGN max = 10^8 × 10^2 = 10^10');
+  t.end();
+});
+
+test('per-asset max: USDC amount at cap is allowed', (t) => {
+  t.plan(1);
+  const usdcMax = getMaxSettlementAmountForAsset('USDC');
+  t.doesNotThrow(() => {
+    computeSettlementAmounts(usdcMax, 100, 0, [], 'USDC');
+  }, 'USDC at its per-asset max should be allowed');
+});
+
+test('per-asset max: NGN amount exceeding per-asset cap throws', (t) => {
+  t.plan(2);
+  const overMax = new BigNumber(getMaxSettlementAmountForAsset('NGN')).plus(1).toString();
+  t.throws(
+    () => computeSettlementAmounts(overMax, 100, 0, [], 'NGN'),
+    /exceeds maximum/,
+    'NGN above its per-asset max should throw',
+  );
+  t.throws(
+    () => computeSettlementAmounts(overMax, 100, 0, [], 'NGN'),
+    SettlementAmountError,
+    'Error should be instance of SettlementAmountError',
+  );
+});
+
+test('per-asset max: 7-decimal asset hits stricter cap than legacy', (t) => {
+  const usdcMax = new BigNumber(getMaxSettlementAmountForAsset('USDC'));
+  const legacyMax = new BigNumber(MAX_SETTLEMENT_AMOUNT);
+  t.ok(usdcMax.isEqualTo(legacyMax), 'USDC (7 decimals) max equals legacy max (10^15)');
+  const ngnMax = new BigNumber(getMaxSettlementAmountForAsset('NGN'));
+  t.ok(ngnMax.isLessThan(legacyMax), 'NGN (2 decimals) max is less than legacy max');
+  t.end();
 });

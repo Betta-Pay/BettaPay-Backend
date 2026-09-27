@@ -2,7 +2,7 @@ import test from 'tape';
 import { createTestApp, generateTestJwt } from './test-utils.js';
 
 test('authenticate decorator should return generic 401 on invalid JWT on gateway app', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
 
   try {
     // Test 1: Invalid JWT token should return 401 with generic message on a protected gateway endpoint

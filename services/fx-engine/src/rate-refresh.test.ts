@@ -241,6 +241,101 @@ test('setInterval-driven loop: refetches at the configured interval', async (t) 
   t.end();
 });
 
+// ── Cross-rate batch-ID validation (issue #??? ) ──────────────────────────
+
+interface RateEntry {
+  value: number;
+  rateBatchId: string;
+}
+
+function computeCrossRate(
+  from: string,
+  to: string,
+  rates: Record<string, RateEntry>,
+  warn: (obj: Record<string, unknown>, msg: string) => void,
+): number {
+  const fromEntry = rates[from];
+  const toEntry   = rates[to];
+
+  if (!fromEntry) {
+    throw new Error(`No rate batch information for ${from}`);
+  }
+  if (!toEntry) {
+    throw new Error(`No rate batch information for ${to}`);
+  }
+
+  if (fromEntry.rateBatchId !== toEntry.rateBatchId) {
+    warn(
+      { from, to, fromBatch: fromEntry.rateBatchId, toBatch: toEntry.rateBatchId },
+      'Cross-rate computed with rates from different fetch cycles',
+    );
+  }
+
+  return fromEntry.value / toEntry.value;
+}
+
+test('cross-rate: same batch — computed without warning', (t) => {
+  const batchId = '550e8400-e29b-41d4-a716-446655440000';
+  const rates: Record<string, RateEntry> = {
+    USDC: { value: 1500, rateBatchId: batchId },
+    EURT: { value: 1700, rateBatchId: batchId },
+    NGN:  { value: 1,    rateBatchId: batchId },
+  };
+  const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+  const logger = { warn: (obj: Record<string, unknown>, msg: string) => warnings.push({ obj, msg }) };
+
+  const result = computeCrossRate('USDC', 'EURT', rates, logger.warn);
+
+  t.equal(result, 1500 / 1700, 'cross-rate computed correctly (USDC/EURT)');
+  t.equal(result, 0.8823529411764706, 'cross-rate matches expected value');
+  t.equal(warnings.length, 0, 'no warning logged for same batch');
+  t.end();
+});
+
+test('cross-rate: different batches — computed with warning logged', (t) => {
+  const rates: Record<string, RateEntry> = {
+    USDC: { value: 1500, rateBatchId: 'batch-a-0000-0000-0000-000000000001' },
+    EURT: { value: 1700, rateBatchId: 'batch-b-0000-0000-0000-000000000002' },
+    NGN:  { value: 1,    rateBatchId: 'batch-a-0000-0000-0000-000000000001' },
+  };
+  const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+  const logger = { warn: (obj: Record<string, unknown>, msg: string) => warnings.push({ obj, msg }) };
+
+  const result = computeCrossRate('USDC', 'EURT', rates, logger.warn);
+
+  t.equal(result, 1500 / 1700, 'cross-rate still computed correctly with mixed batches');
+  t.equal(warnings.length, 1, 'exactly one warning logged');
+  if (warnings.length > 0) {
+    t.equal(warnings[0].obj.from, 'USDC', 'warning obj includes from currency');
+    t.equal(warnings[0].obj.to, 'EURT', 'warning obj includes to currency');
+    t.ok(
+      warnings[0].msg.includes('different fetch cycles'),
+      'warning message mentions different fetch cycles',
+    );
+  }
+  t.end();
+});
+
+test('cross-rate: only one rate available — error thrown', (t) => {
+  const rates: Record<string, RateEntry> = {
+    USDC: { value: 1500, rateBatchId: 'batch-a-0000-0000-0000-000000000001' },
+    // EURT is missing entirely
+    NGN:  { value: 1,    rateBatchId: 'batch-a-0000-0000-0000-000000000001' },
+  };
+  const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+  const logger = { warn: (obj: Record<string, unknown>, msg: string) => warnings.push({ obj, msg }) };
+
+  try {
+    computeCrossRate('USDC', 'EURT', rates, logger.warn);
+    t.fail('expected error for missing EURT rate');
+  } catch (err) {
+    const e = err as Error;
+    t.ok(e.message.includes('EURT'), `error mentions the missing currency: ${e.message}`);
+    t.equal(warnings.length, 0, 'no warning logged when one rate is missing');
+  }
+  t.end();
+});
+
 test('jitter: delays are within ±25% range and mean approximates the base interval', (t) => {
   const BASE_INTERVAL = 100;
   const SAMPLES = 1000;

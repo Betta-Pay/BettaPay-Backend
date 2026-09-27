@@ -83,6 +83,50 @@ export function createDownstreamAbortSignal(
   };
 }
 
+const PRIVATE_IP_PATTERNS = [
+  /^127\./,
+  /^10\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^192\.168\./,
+  /^169\.254\./,
+  /^0\./,
+  /^::1$/,
+  /^fc00:/i,
+  /^fe80:/i,
+];
+
+export function isPrivateOrReservedHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (lower === 'localhost') return true;
+  return PRIVATE_IP_PATTERNS.some((p) => p.test(lower));
+}
+
+export class SsrfRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SsrfRejectedError';
+  }
+}
+
+export function validateUpstreamUrl(urlString: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    throw new SsrfRejectedError(`Invalid upstream URL: ${urlString}`);
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new SsrfRejectedError(`Rejected upstream URL with scheme ${parsed.protocol}`);
+  }
+
+  if (isPrivateOrReservedHost(parsed.hostname)) {
+    throw new SsrfRejectedError(`Rejected upstream URL targeting private/reserved host: ${parsed.hostname}`);
+  }
+
+  return parsed;
+}
+
 export async function fetchUpstream(
   request: FastifyRequest,
   url: string,
@@ -90,6 +134,8 @@ export async function fetchUpstream(
   logger: FastifyBaseLogger,
   defaultTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
 ): Promise<Response> {
+  validateUpstreamUrl(url);
+
   const { signal, cleanup } = createDownstreamAbortSignal(request, logger, url, defaultTimeoutMs);
 
   // Propagate tracing headers (x-request-id / x-trace-id) to the downstream service (#118).

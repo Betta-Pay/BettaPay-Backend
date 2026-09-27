@@ -263,3 +263,33 @@ test('cleanupOldEvents — no old events dry-run returns wouldDelete=0 with mock
   }
   t.end();
 });
+
+test('cleanupOldEvents — skips entries with active webhook jobs', async (t) => {
+  env.EVENT_RETENTION_DAYS = 30;
+
+  const { webhookQueue } = await import('./index.js');
+  const origGetJobs = webhookQueue.getJobs.bind(webhookQueue);
+  const origDeleteMany = prisma.indexedEvent.deleteMany.bind(prisma.indexedEvent);
+
+  webhookQueue.getJobs = (async () => [
+    { data: { event: { id: 'evt_123' } } },
+    { data: { event: { id: 'evt_456' } } },
+  ]) as any;
+
+  let capturedWhere: any = null;
+  prisma.indexedEvent.deleteMany = (async (args: any) => {
+    capturedWhere = args.where;
+    return { count: 2 };
+  }) as any;
+
+  try {
+    const deletedCount = await cleanupOldEvents(false);
+    t.equal(deletedCount, 2, 'returns count from deleteMany');
+    t.ok(capturedWhere, 'captured where clause');
+    t.deepEqual(capturedWhere.id, { notIn: ['evt_123', 'evt_456'] }, 'excludes active event IDs');
+  } finally {
+    webhookQueue.getJobs = origGetJobs;
+    prisma.indexedEvent.deleteMany = origDeleteMany;
+  }
+  t.end();
+});

@@ -147,6 +147,12 @@ test('buildPrismaConnectionUrl uses defaults when no poolSize or timeout given',
   assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=10&pool_timeout=10');
 });
 
+test('buildPrismaConnectionUrl rejects invalid pool ranges early', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay';
+  assert.throws(() => buildPrismaConnectionUrl(url, 0, 10), /DATABASE_POOL_SIZE.*1/);
+  assert.throws(() => buildPrismaConnectionUrl(url, 10, 0), /DATABASE_POOL_TIMEOUT.*1/);
+});
+
 import {
   resetRotation,
   hasRotated,

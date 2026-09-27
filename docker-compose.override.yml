@@ -1,0 +1,14 @@
+# Local-only port remaps (auto-loaded by `docker compose up`).
+# Reason: host already runs system Postgres on 5432 and the Next.js
+# frontend on 3000, so we avoid clobbering them.
+# Internal container ports are unchanged — services still talk to
+# each other via postgres:5432, gateway:3000, etc.
+# Frontend should use NEXT_PUBLIC_API_URL=http://localhost:3100
+services:
+  postgres:
+    ports: !override
+      - "5435:5432"
+  api-gateway:
+    ports: !override
+      - "3100:3000"
+      - "4000:4000"

@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/worker-shutdown.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/webhook-cache.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/startup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts"
+    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/worker-shutdown.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/webhook-cache.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/startup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-limit-backoff.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/dlq-replay-headers.test.ts"
   },
   "dependencies": {
     "@bettapay/webhook-delivery": "workspace:*",

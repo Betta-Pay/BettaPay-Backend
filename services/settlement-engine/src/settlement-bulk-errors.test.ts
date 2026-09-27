@@ -1,9 +1,12 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD, BATCH_VALID_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
 
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
@@ -22,6 +25,7 @@ test('bulk-errors: returns 404 on merchant lookup database error', async (t) => 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_VALID_STANDARD,
@@ -42,6 +46,7 @@ test('bulk-errors: handles queryRaw throwing connection errors on daily aggregat
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_VALID_STANDARD,
@@ -63,6 +68,7 @@ test('bulk-errors: handles transaction rollback on batch insertion database cras
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_VALID_STANDARD,
@@ -79,6 +85,7 @@ test('bulk-errors: rejects malformed payload layout with 400', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: '', // invalid format
       settlements: [
@@ -99,11 +106,20 @@ test('bulk-errors: status checks fail on malformed batchId', async (t) => {
   const res = await fastify.inject({
     method: 'GET',
     url: '/api/settlements/batch/invalid_batch_format_123/status',
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 400);
   const body = JSON.parse(res.body);
   t.equal(body.error.code, 'VALIDATION_ERROR');
   t.equal(body.error.message, 'Invalid batchId format');
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

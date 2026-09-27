@@ -16,28 +16,32 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import crypto from "crypto";
-import { Queue, Worker } from "bullmq";
+import { Queue, Worker, QueueEvents } from "bullmq";
 import {
   createWebhookQueue,
   createWebhookWorker,
   WEBHOOK_DEFAULTS,
 } from "@bettapay/webhook-delivery";
 import { closeWorkerWithTimeout, trackActiveJob } from "./worker-shutdown.js";
-import { PrismaClient, WebhookSubscription } from "@prisma/client";
+import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { z } from "zod";
 import {
+  encryptField,
+  decryptField,
   validateEnvOrExit,
   registerErrorHandler,
   registerRequestId,
   registerServiceAuth,
+  auditRouteAuthPolicy,
   PaginationQuery,
   EventListQuery,
   DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
+  WebhookHeadersSchema,
   buildPrismaConnectionUrl,
   connectWithRetry,
   createLoggerOptions,
@@ -50,6 +54,7 @@ import {
   createAuditLogger,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   startPrismaPoolMetricsCollector,
@@ -60,6 +65,8 @@ import {
   fxExecutedEvent,
   billPaidEvent,
   anchorSettledEvent,
+  isFeatureEnabled,
+  logFeatureFlags,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -164,6 +171,25 @@ const BASE_BACKOFF = 1000;
 const MAX_BACKOFF = env.MAX_BACKOFF_INTERVAL_MS;
 let currentBackoff: number = BASE_BACKOFF;
 
+// Per-ledger timeout retry state (#565)
+let consecutiveSkips = 0;
+const MAX_CONSECUTIVE_SKIPS = 5;
+
+// ── Shared Redis client ──────────────────────────────────────────────────────
+const redisHealthState: import("@bettapay/validation").RedisHealthState = {
+  connected: false,
+  errors: 0,
+  reconnects: 0,
+};
+
+const sharedRedis = createRedisClient(env.REDIS_URL, fastify.log, {
+  shared: true,
+  healthState: redisHealthState,
+});
+fastify.addHook("onClose", async () => {
+  await sharedRedis.quit().catch(() => {});
+});
+
 const indexerPollBackoffGauge = new promClient.Gauge({
   name: "indexer_poll_backoff_ms",
   help: "Current indexer polling backoff interval in milliseconds",
@@ -185,6 +211,17 @@ const indexerLastIndexedLedgerGauge = new promClient.Gauge({
 const indexerNetworkTipLedgerGauge = new promClient.Gauge({
   name: "indexer_network_tip_ledger",
   help: "Current network tip ledger sequence number",
+});
+
+// Per-ledger timeout metrics (#565)
+const indexerLedgerTimeoutsCounter = new promClient.Counter({
+  name: "indexer_ledger_timeouts_total",
+  help: "Total number of per-ledger timeouts (stuck ledgers skipped)",
+});
+
+const indexerLedgerSkipsCounter = new promClient.Counter({
+  name: "indexer_ledger_skips_total",
+  help: "Total number of ledger retries/skips due to stuck ledgers",
 });
 
 function parseRetryAfterMs(err: unknown): number | null {
@@ -231,41 +268,28 @@ export function calculateBackoffAfterError(err: unknown): number {
   return currentBackoff;
 }
 
-// ── BullMQ webhook delivery queue ────────────────────────────────────────────
-
-const redisConn = new URL(env.REDIS_URL);
-const connectionParams = {
-  host: redisConn.hostname,
-  port: parseInt(redisConn.port || "6379", 10),
-  maxRetriesPerRequest: 3,
-};
-
 // ── Webhook delivery queue & worker (shared @bettapay/webhook-delivery) ───────
+// (Resolved previous merge conflict markers here)
 //
 // Queue name kept as 'indexer-webhooks' so any jobs already in Redis from the
 // previous inline implementation are picked up without data loss (migration
 // safety — see shared/webhook-delivery/index.ts for details).
-export const webhookQueue = createWebhookQueue(
-  "indexer-webhooks",
-  connectionParams,
-);
-const webhookWorker = createWebhookWorker(
-  "indexer-webhooks",
-  connectionParams,
-  {
-    logger: {
-      info: (obj, msg) => fastify.log.info(obj, msg),
-      warn: (obj, msg) => fastify.log.warn(obj, msg),
-      error: (obj, msg) => fastify.log.error(obj, msg),
-    },
+export const webhookQueue = createWebhookQueue("indexer-webhooks", sharedRedis);
+// Ensure only one webhook worker is created to prevent duplicate deliveries
+const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
+  logger: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    warn: (obj, msg) => fastify.log.warn(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
   },
-);
+});
 const getActiveWebhookJob = trackActiveJob(webhookWorker);
 
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
+// The queue relies on the unconditionally initialized canonical sharedRedis client
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
 const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
-  connection: connectionParams,
+  connection: sharedRedis,
   defaultJobOptions: {
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 1000 },
@@ -318,7 +342,7 @@ webhookQueue.on("error", (err) => {
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
 const replayQueue = new Queue("indexer-replays", {
-  connection: connectionParams,
+  connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
     backoff: { type: "exponential", delay: 2000 },
@@ -348,7 +372,7 @@ async function updateReplayProgress(
   },
 ): Promise<void> {
   try {
-    await replayProgressRedis.set(
+    await sharedRedis.set(
       `${PROGRESS_KEY_PREFIX}${jobId}`,
       JSON.stringify(data),
       "EX",
@@ -378,7 +402,7 @@ const replayWorker = new Worker(
       status: "running",
     });
 
-    let processedLedgers = 0;
+    let processedCount = 0;
 
     try {
       // If contractId is specified, only replay that contract; otherwise replay all
@@ -403,6 +427,9 @@ const replayWorker = new Worker(
             "[Indexer] Deleted existing events for forced replay",
           );
         }
+
+        const processedLedgerSet = new Set<number>();
+        let currentLedger = -1;
 
         while (cursor <= toLedger) {
           const response = await server.getEvents({
@@ -440,7 +467,21 @@ const replayWorker = new Worker(
               );
 
           for (const evt of response.events) {
-            if (evt.ledger > toLedger) break;
+            if (evt.ledger > toLedger) continue;
+
+            if (currentLedger !== -1 && currentLedger !== evt.ledger) {
+              processedLedgerSet.add(currentLedger);
+            }
+            currentLedger = evt.ledger;
+
+            if (processedLedgerSet.has(evt.ledger)) {
+              fastify.log.warn(
+                { ledger: evt.ledger },
+                "[Indexer] Skipping out-of-order or duplicate ledger",
+              );
+              continue;
+            }
+
             cursor = Math.max(cursor, evt.ledger + 1);
 
             const topics = Array.isArray(evt.topic)
@@ -505,13 +546,13 @@ const replayWorker = new Worker(
               throw err;
             }
 
-            processedLedgers = Math.max(
-              processedLedgers,
+            processedCount = Math.max(
+              processedCount,
               evt.ledger - fromLedger + 1,
             );
             await updateReplayProgress(job.id!, {
               totalLedgers,
-              processedLedgers,
+              processedLedgers: processedCount,
               status: "running",
             });
           }
@@ -527,7 +568,7 @@ const replayWorker = new Worker(
 
       await updateReplayProgress(job.id!, {
         totalLedgers,
-        processedLedgers,
+        processedLedgers: processedCount,
         status: "completed",
       });
     } catch (err) {
@@ -538,7 +579,7 @@ const replayWorker = new Worker(
       );
       await updateReplayProgress(job.id!, {
         totalLedgers,
-        processedLedgers,
+        processedLedgers: processedCount,
         status: "failed",
         error: errMsg,
       });
@@ -546,7 +587,7 @@ const replayWorker = new Worker(
     }
   },
   {
-    connection: connectionParams,
+    connection: sharedRedis,
     concurrency: 1,
   },
 );
@@ -660,6 +701,52 @@ export const cacheState: {
   subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null;
 } = { subscriptions: null };
 
+export async function dispatchPendingWebhookDeliveries(): Promise<void> {
+  const store = (prisma as any).indexedEventWebhookDelivery;
+  let pending: any[];
+  try {
+    pending = await store.findMany({
+      where: { status: "pending" },
+      orderBy: { createdAt: "asc" },
+      take: 100,
+    });
+  } catch (err) {
+    fastify.log.warn(
+      { err: String(err) },
+      "[Indexer] Unable to load pending webhook deliveries",
+    );
+    return;
+  }
+  for (const delivery of pending) {
+    try {
+      // Decrypt signingSecret on read (#617)
+      const decryptedSecret = delivery.signingSecret
+        ? decryptField(delivery.signingSecret)
+        : undefined;
+      await webhookQueue.add(
+        "deliver",
+        {
+          url: delivery.url,
+          event: delivery.event,
+          version: "1.0",
+          signingSecret: decryptedSecret,
+          headers: delivery.headers ?? undefined,
+        },
+        { jobId: `indexed-event-delivery-${delivery.id}` },
+      );
+      await store.update({
+        where: { id: delivery.id },
+        data: { status: "processed", processedAt: new Date() },
+      });
+    } catch (err) {
+      fastify.log.warn(
+        { deliveryId: delivery.id, err: String(err) },
+        "[Indexer] Webhook enqueue failed; delivery remains pending",
+      );
+    }
+  }
+}
+
 export async function persistEvent(
   stellarId: string | null,
   topics: string[],
@@ -707,12 +794,47 @@ export async function persistEvent(
     "[Indexer] Event indexed",
   );
 
+  const subs = await loadWebhookSubscriptions();
+  if (subs.length)
+    await (prisma as any).indexedEventWebhookDelivery.createMany({
+      data: subs.map((sub) => ({
+        id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+        indexedEventId: id,
+        subscriptionId: sub.id,
+        url: sub.url,
+        event: record,
+        // Encrypt signingSecret on write (#617)
+        signingSecret: sub.signingSecret
+          ? encryptField(sub.signingSecret)
+          : undefined,
+        headers: (sub.headers as Record<string, string> | null) ?? undefined,
+      })),
+      skipDuplicates: true,
+    });
+
+  // #712 — dispatch is no longer run per event. The poll loop runs a single
+  // dispatch pass per cycle, after batching all of the cycle's writes.
+  return record as Record<string, unknown>;
+}
+
+/**
+ * Returns the webhook subscription list, reusing the 30-second in-memory cache
+ * when it is warm (#511 renews the TTL on a hit when the flag is enabled).
+ * Shared by the single-event and batched persist paths.
+ */
+async function loadWebhookSubscriptions(): Promise<WebhookSubscription[]> {
   const now = Date.now();
   if (
     cacheState.subscriptions &&
     now - cacheState.subscriptions.cachedAt < 30000
   ) {
     fastify.log.debug("[Indexer] Webhook subscriptions cache hit");
+    // #511 — renew TTL on read for hot entries so frequently-used subscription
+    // lists never expire under load. Gated behind a feature flag so the old
+    // fixed-30 s behaviour can be restored without a code change.
+    if (isFeatureEnabled('webhook_cache_ttl_refresh')) {
+      cacheState.subscriptions.cachedAt = now;
+    }
   } else {
     fastify.log.debug(
       "[Indexer] Webhook subscriptions cache miss, fetching from DB",
@@ -720,25 +842,90 @@ export async function persistEvent(
     const freshSubs = await prisma.webhookSubscription.findMany();
     cacheState.subscriptions = { data: freshSubs, cachedAt: now };
   }
+  return cacheState.subscriptions.data;
+}
 
-  const subs = cacheState.subscriptions.data;
-  for (const sub of subs) {
-    await webhookQueue.add("deliver", {
-      url: sub.url,
-      event: record as Record<string, unknown>,
-      signingSecret: sub.signingSecret ?? undefined,
-    });
+/**
+ * #713 — Persist a whole poll cycle's events with one `createMany` instead of a
+ * `create` per event, preserving the composite-unique P2002-skip semantics via
+ * `skipDuplicates`. Webhook deliveries are created in a single batch for the
+ * events that actually landed. Returns the inserted count and the highest
+ * ledger among them so the caller can advance its cursor.
+ */
+async function flushIndexedEvents(
+  data: Prisma.IndexedEventCreateManyInput[],
+): Promise<{ inserted: number; maxInsertedLedger: number | null }> {
+  if (data.length === 0) return { inserted: 0, maxInsertedLedger: null };
+
+  await prisma.indexedEvent.createMany({ data, skipDuplicates: true });
+
+  // `createMany` does not report which rows were skipped, so read back the ids
+  // that landed. Deliveries must exist only for newly-persisted events, exactly
+  // as the per-event path did after a successful create.
+  const insertedRows = await prisma.indexedEvent.findMany({
+    where: { id: { in: data.map((row) => row.id) } },
+    select: { id: true },
+  });
+  const insertedIds = new Set(insertedRows.map((row) => row.id));
+  const records = data.filter((row) => insertedIds.has(row.id));
+
+  for (const record of records) {
+    fastify.log.info(
+      {
+        id: record.id,
+        type: record.type,
+        contractName: record.contractName,
+        ledger: record.ledger,
+      },
+      "[Indexer] Event indexed",
+    );
   }
 
-  return record as Record<string, unknown>;
+  if (records.length > 0) {
+    const subs = await loadWebhookSubscriptions();
+    if (subs.length) {
+      await (prisma as any).indexedEventWebhookDelivery.createMany({
+        data: records.flatMap((record) =>
+          subs.map((sub) => ({
+            id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+            indexedEventId: record.id,
+            subscriptionId: sub.id,
+            url: sub.url,
+            event: record,
+            signingSecret: sub.signingSecret
+              ? encryptField(sub.signingSecret)
+              : undefined,
+            headers: (sub.headers as Record<string, string> | null) ?? undefined,
+          })),
+        ),
+        skipDuplicates: true,
+      });
+    }
+  }
+
+  const maxInsertedLedger = records.reduce<number | null>((max, record) => {
+    const ledger = typeof record.ledger === "number" ? record.ledger : null;
+    if (ledger === null) return max;
+    return max === null ? ledger : Math.max(max, ledger);
+  }, null);
+
+  return { inserted: records.length, maxInsertedLedger };
 }
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
+// Surfaces any route that reaches the network without an auth hook (#664).
+// Warn-only by default: it logs and never throws, so it is safe in any merge
+// order and changes no request behaviour. Must be registered before the route
+// definitions below so Fastify's onRoute hook sees all of them.
+auditRouteAuthPolicy(fastify);
+
 fastify.get("/api/health", async (_request, reply) => {
-  const health = await buildIndexerHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
-    pingRedis: () => redisHealth.ping(),
+  const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    pingRedis: () => sharedRedis.ping(),
+    redisHealthState,
+
+    
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),
@@ -793,29 +980,90 @@ fastify.get(
 
 // Issue #68 — replay historical events for a ledger range (all contracts)
 // Issue #76 — extended to iterate over all configured contract IDs
-const ReplayBody = z
-  .object({
-    fromLedger: z.number().int().min(1),
-    toLedger: z.number().int().min(1),
-  })
-  .refine((d) => d.fromLedger <= d.toLedger, {
-    message: "fromLedger must be <= toLedger",
-  });
+// Issue #762 — canonical param names are startLedger/endLedger on both replay
+// endpoints; fromLedger/toLedger remain accepted as deprecated aliases for one
+// release. Replay range semantics are unchanged.
+const LedgerInt = z.number().int().min(1);
+
+const ReplayRangeFields = {
+  startLedger: LedgerInt.optional(),
+  endLedger: LedgerInt.optional(),
+  /** @deprecated alias for startLedger — accepted for one release (#762). */
+  fromLedger: LedgerInt.optional(),
+  /** @deprecated alias for endLedger — accepted for one release (#762). */
+  toLedger: LedgerInt.optional(),
+};
+
+/**
+ * Resolves the canonical replay range from a body that may use either the
+ * canonical startLedger/endLedger names or the deprecated fromLedger/toLedger
+ * aliases. Canonical names win when both are supplied.
+ *
+ * @internal exported for testing only
+ */
+export function resolveReplayRange(input: {
+  startLedger?: number;
+  endLedger?: number;
+  fromLedger?: number;
+  toLedger?: number;
+}): { startLedger: number; endLedger: number } {
+  return {
+    startLedger: input.startLedger ?? input.fromLedger!,
+    endLedger: input.endLedger ?? input.toLedger!,
+  };
+}
+
+const ReplayRangeRefine = (
+  d: {
+    startLedger?: number;
+    endLedger?: number;
+    fromLedger?: number;
+    toLedger?: number;
+  },
+  ctx: z.RefinementCtx,
+) => {
+  const { startLedger, endLedger } = resolveReplayRange(d);
+  if (startLedger === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "startLedger is required (fromLedger accepted as a deprecated alias)",
+      path: ["startLedger"],
+    });
+  }
+  if (endLedger === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "endLedger is required (toLedger accepted as a deprecated alias)",
+      path: ["endLedger"],
+    });
+  }
+  if (
+    startLedger !== undefined &&
+    endLedger !== undefined &&
+    startLedger > endLedger
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "startLedger must be <= endLedger",
+    });
+  }
+};
+
+const ReplayBody = z.object(ReplayRangeFields).superRefine(ReplayRangeRefine);
 
 // Issue #343 — per-contract replay body
 const PerContractReplayBody = z
   .object({
-    startLedger: z.number().int().min(1),
-    endLedger: z.number().int().min(1),
+    ...ReplayRangeFields,
     force: z.boolean().optional().default(false),
   })
-  .refine((d) => d.startLedger <= d.endLedger, {
-    message: "startLedger must be <= endLedger",
-  });
+  .superRefine(ReplayRangeRefine);
 
 fastify.post(
   "/api/events/replay",
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -824,7 +1072,11 @@ fastify.post(
     },
   },
   async (request, reply) => {
-    const { fromLedger, toLedger } = ReplayBody.parse(request.body);
+    const { startLedger, endLedger } = resolveReplayRange(
+      ReplayBody.parse(request.body),
+    );
+    const fromLedger = startLedger;
+    const toLedger = endLedger;
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
@@ -832,7 +1084,13 @@ fastify.post(
         error: {
           code: "VALIDATION_ERROR",
           message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: { fromLedger, toLedger, maxRange: MAX_REPLAY_LEDGER_RANGE },
+          details: {
+            startLedger,
+            endLedger,
+            fromLedger,
+            toLedger,
+            maxRange: MAX_REPLAY_LEDGER_RANGE,
+          },
         },
       });
     }
@@ -842,6 +1100,8 @@ fastify.post(
     return reply.code(202).send({
       jobId: job.id,
       status: "queued",
+      startLedger,
+      endLedger,
       fromLedger,
       toLedger,
       range,
@@ -853,6 +1113,7 @@ fastify.post(
 fastify.post<{ Params: { contractId: string }; Body: unknown }>(
   "/api/events/replay/contract/:contractId",
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -874,9 +1135,9 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       });
     }
 
-    const { startLedger, endLedger, force } = PerContractReplayBody.parse(
-      request.body,
-    );
+    const parsedContractReplay = PerContractReplayBody.parse(request.body);
+    const { startLedger, endLedger } = resolveReplayRange(parsedContractReplay);
+    const force = parsedContractReplay.force ?? false;
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
@@ -887,6 +1148,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
           details: {
             startLedger,
             endLedger,
+            fromLedger: startLedger,
+            toLedger: endLedger,
             maxRange: MAX_REPLAY_LEDGER_RANGE,
           },
         },
@@ -906,6 +1169,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       contractId,
       startLedger,
       endLedger,
+      fromLedger: startLedger,
+      toLedger: endLedger,
       force,
       range,
     });
@@ -913,8 +1178,12 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 );
 
 // Issue #229 — replay job progress status
+// Internal endpoint — job introspection leaks worker activity to anonymous
+// callers, so it requires a valid x-service-token like the other replay
+// routes (#659).
 fastify.get<{ Params: { jobId: string } }>(
   "/api/events/replay/:jobId/status",
+  { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { jobId } = request.params;
     try {
@@ -964,18 +1233,25 @@ fastify.post(
 );
 
 // Issue #70 — webhook subscription CRUD
+// #569 — headers is optional: merchant-configured custom headers (idempotency
+// keys, auth tokens, etc.) sent with every delivery attempt, including retries.
 const WebhookBody = z.object({
   url: WebhookUrlSchema,
+  headers: WebhookHeadersSchema.optional(),
 });
 
 fastify.post(
   "/api/webhooks",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
-    const { url } = WebhookBody.parse(request.body);
+    const { url, headers } = WebhookBody.parse(request.body);
     const sub = await prisma.$transaction(async (tx) => {
       const created = await tx.webhookSubscription.create({
-        data: { id: "wh_" + crypto.randomUUID().replace(/-/g, ""), url },
+        data: {
+          id: "wh_" + crypto.randomUUID().replace(/-/g, ""),
+          url,
+          headers: headers ?? undefined,
+        },
       });
       await logAuditEvent(
         "webhook.registered",
@@ -1034,6 +1310,117 @@ fastify.delete<{ Params: { id: string } }>(
   },
 );
 
+fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
+  "/api/webhooks/:id/test",
+  { preValidation: [fastify.serviceAuth] },
+  async (request, reply) => {
+    const { id } = request.params;
+    const { merchantId: callerMerchantId } = request.query;
+    const existing = await prisma.webhookSubscription.findUnique({
+      where: { id },
+    });
+
+    if (!existing) {
+      return reply.code(404).send({
+        error: {
+          code: "NOT_FOUND",
+          message: `Webhook subscription ${id} not found`,
+        },
+      });
+    }
+
+    // #624: this route sits behind serviceAuth (any trusted internal caller,
+    // not a merchant-identity check), so it has no auth boundary of its own
+    // for *which* merchant is allowed to test *which* subscription. The
+    // merchant-facing api-gateway route already rejects a cross-merchant
+    // test before ever calling this one, and forwards its own verified
+    // caller as `?merchantId=`. Re-checking it here is defense in depth: a
+    // future internal caller that skips that pre-check (or a stale/replayed
+    // request) cannot silently poison another merchant's subscription
+    // status. A subscription without a merchantId (a global/system
+    // subscription) has no owner to check against here — see the analogous
+    // gap already called out for the gateway route in issue #624.
+    if (
+      existing.merchantId &&
+      callerMerchantId &&
+      existing.merchantId !== callerMerchantId
+    ) {
+      return reply.code(403).send({
+        error: {
+          code: "FORBIDDEN",
+          message: "Cannot test webhook subscription owned by another merchant",
+        },
+      });
+    }
+
+    const payload = {
+      type: "test",
+      timestamp: new Date().toISOString(),
+      subscriptionId: id,
+      test: true,
+    };
+
+    const job = await webhookQueue.add(
+      "deliver",
+      {
+        url: existing.url,
+        event: payload,
+        version: "1.0",
+        signingSecret: existing.signingSecret ?? undefined,
+        headers:
+          (existing.headers as Record<string, string> | null) ?? undefined,
+        traceId: (request as any).traceId ?? request.headers["x-trace-id"] ?? undefined,
+        eventId: `webhook_test_${id}_${Date.now()}`,
+      },
+      { attempts: 1 },
+    );
+
+    const queueEvents = new QueueEvents("indexer-webhooks", {
+      connection: sharedRedis,
+    });
+    try {
+      await job.waitUntilFinished(queueEvents);
+
+      const testedAt = new Date();
+      await prisma.webhookSubscription.update({
+        where: { id },
+        data: {
+          lastTestedAt: testedAt,
+          lastTestStatus: "success",
+          lastTestStatusCode: 200,
+        },
+      });
+      return { success: true, statusCode: 200 };
+    } catch (err: any) {
+      let statusCode = null;
+      let errorMsg = err.message || String(err);
+      const match = errorMsg.match(/HTTP (\d+) from/);
+      if (match) {
+        statusCode = parseInt(match[1], 10);
+        errorMsg = `HTTP ${statusCode}`;
+      } else if (errorMsg.includes("connect ECONNREFUSED")) {
+        errorMsg = "connect ECONNREFUSED";
+      }
+
+      const testedAt = new Date();
+      await prisma.webhookSubscription.update({
+        where: { id },
+        data: {
+          lastTestedAt: testedAt,
+          lastTestStatus: "failed",
+          lastTestStatusCode: statusCode,
+        },
+      });
+
+      const response: any = { success: false, error: errorMsg };
+      if (statusCode) response.statusCode = statusCode;
+      return response;
+    } finally {
+      await queueEvents.close();
+    }
+  },
+);
+
 // ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
 
 fastify.get(
@@ -1082,11 +1469,17 @@ fastify.post<{ Params: { id: string } }>(
       });
     }
 
-    // Re-enqueue on the main webhook delivery queue
+    // Re-enqueue on the main webhook delivery queue. Custom headers
+    // (Authorization, X-Idempotency-Key, ...) live on job.data.headers
+    // alongside url/event/signingSecret (see dispatchPendingWebhookDeliveries
+    // and the webhookWorker "failed" handler that spreads job.data into the
+    // DLQ) — omitting it here meant a replayed delivery arrived without the
+    // merchant's expected auth header and was rejected (#614).
     await webhookQueue.add("deliver", {
       url: job.data.url,
-      event: job.data.event,
+      event: (job.data.event ?? {}) as Record<string, unknown>,
       signingSecret: job.data.signingSecret,
+      headers: job.data.headers,
     });
 
     // Remove from DLQ
@@ -1128,19 +1521,60 @@ async function pollEvents() {
       return;
     }
 
-    const response = await server.getEvents({
-      startLedger: latestLedgerCursor ?? 0,
-      filters: CONTRACT_IDS.map((contractId) => ({
-        type: "contract" as const,
-        contractIds: [contractId],
-        topics: [],
-      })),
-      limit: 100,
-    });
+    const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
+
+    // Wrap server.getEvents() with per-ledger timeout (#565)
+    let response: Awaited<ReturnType<typeof server.getEvents>>;
+    try {
+      response = await Promise.race([
+        server.getEvents({
+          startLedger: latestLedgerCursor ?? 0,
+          filters: CONTRACT_IDS.map((contractId) => ({
+            type: "contract" as const,
+            contractIds: [contractId],
+            topics: [],
+          })),
+          limit: 100,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("PER_LEDGER_TIMEOUT")), perLedgerTimeoutMs),
+        ),
+      ]);
+      consecutiveSkips = 0;
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message === "PER_LEDGER_TIMEOUT") {
+        indexerLedgerTimeoutsCounter.inc();
+        consecutiveSkips++;
+        fastify.log.warn(
+          { consecutiveSkips, perLedgerTimeoutMs },
+          "[Indexer] Per-ledger timeout — skipping stuck ledger",
+        );
+        if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+          currentBackoff = Math.min(currentBackoff * 2, MAX_BACKOFF);
+          indexerPollBackoffGauge.set(currentBackoff);
+          fastify.log.error(
+            { consecutiveSkips, backoff: currentBackoff },
+            "[Indexer] Too many consecutive timeouts — backing off",
+          );
+        }
+        indexerLedgerSkipsCounter.inc();
+        pollCyclesCounter.inc({ status: "timeout" });
+        pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
+        setTimeout(pollEvents, currentBackoff);
+        return;
+      }
+      throw err;
+    }
 
     const timeoutMs = env.POLL_TIMEOUT_MS;
 
     if (response.events && response.events.length > 0) {
+      // #713 — accumulate the cycle's validated events and write them in one
+      // batch instead of one create per event (and one delivery createMany per
+      // event). Decode/validate are unchanged; every event still becomes its
+      // own row, including events carrying a validationError.
+      const pendingEvents: Prisma.IndexedEventCreateManyInput[] = [];
+
       for (const evt of response.events) {
         if (aborted) break;
         const elapsed = Date.now() - pollStart;
@@ -1166,22 +1600,38 @@ async function pollEvents() {
 
         const validationError = validatePayload(topics[0], decodedPayload);
 
-        const result = await persistEvent(
+        pendingEvents.push({
+          id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
           stellarId,
-          topics,
-          topics[0],
-          resolvedContractId,
+          contractId: resolvedContractId,
           contractName,
+          topics,
+          type: topics[0],
           rawValue,
-          decodedPayload,
-          evt.ledger,
-          validationError,
-        );
-        if (latestLedgerCursor !== undefined && result !== null) {
-          latestLedgerCursor = Math.max(latestLedgerCursor, evt.ledger + 1);
-        }
+          decodedPayload:
+            decodedPayload !== null ? (decodedPayload as any) : undefined,
+          validationError: validationError ?? undefined,
+          ledger: evt.ledger,
+          indexedAt: new Date(),
+        });
 
         eventsFetchedCounter.inc({ contractId: resolvedContractId });
+      }
+
+      if (pendingEvents.length > 0) {
+        const { maxInsertedLedger } = await flushIndexedEvents(pendingEvents);
+        if (latestLedgerCursor !== undefined && maxInsertedLedger !== null) {
+          latestLedgerCursor = Math.max(
+            latestLedgerCursor,
+            maxInsertedLedger + 1,
+          );
+        }
+      }
+
+      // #712 — one dispatch pass per poll cycle, after all writes for the cycle
+      // have landed. Aborted cycles leave deliveries pending for the next pass.
+      if (!aborted) {
+        await dispatchPendingWebhookDeliveries();
       }
     } else if (
       latestLedgerSequence !== undefined &&
@@ -1298,6 +1748,16 @@ export async function cleanupOldEvents(
       retentionDays,
       oldestEventDate: oldest?.indexedAt.toISOString() ?? "",
     };
+  }
+
+  // Issue 507: Skip cleanup for entries with active webhook jobs
+  const jobs = await webhookQueue.getJobs(["active", "waiting", "delayed"]);
+  const activeEventIds = jobs
+    .map((j) => (j.data as any)?.event?.id)
+    .filter((id) => typeof id === "string");
+
+  if (activeEventIds.length > 0) {
+    (where as any).id = { notIn: activeEventIds };
   }
 
   const { count } = await prisma.indexedEvent.deleteMany({ where });
@@ -1440,9 +1900,27 @@ export async function discoverStartLedger(): Promise<number> {
 
 const start = async () => {
   try {
-    // #391 — wait for both dependencies before accepting traffic
-    await connectWithRetry(prisma, fastify.log);
-    await waitForRedis(redisHealth, fastify.log);
+    // #519 — log active feature flags at startup so the deployed flag set is
+    // always visible in the service logs.
+    logFeatureFlags(fastify.log);
+
+    await runStartupChecks({
+      service: "indexer",
+      version: SERVICE_VERSION,
+      logger: fastify.log,
+      checks: [
+        {
+          name: "prisma",
+          fn: () => connectWithRetry(prisma, fastify.log),
+          critical: true,
+        },
+        {
+          name: "redis",
+          fn: () => waitForRedis(redisHealth, fastify.log),
+          critical: true,
+        },
+      ],
+    });
 
     // #387 — Redis memory monitoring
     startRedisMemoryMonitor(redisHealth, fastify.log);
@@ -1460,28 +1938,58 @@ const start = async () => {
   }
 };
 
-process.on("SIGTERM", async () => {
-  await prisma.$disconnect();
-  await replayQueue.close();
-  await closeWorkerWithTimeout(
-    replayWorker,
-    "indexer-replays",
-    fastify.log,
-    getActiveReplayJob,
-  );
-  await webhookQueue.close();
-  await closeWorkerWithTimeout(
-    webhookWorker,
-    "indexer-webhooks",
-    fastify.log,
-    getActiveWebhookJob,
-  );
-  await dlqQueue.close();
-  await replayProgressRedis.quit().catch(() => {});
-  await fastify.close();
-  await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
-  process.exit(0);
-});
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  fastify.log.info({ signal }, "Shutting down indexer");
+
+  // #751 — force-exit timeout: if the close sequence hangs for >30s,
+  // exit hard so the container/orchestrator can reclaim resources.
+  const FORCE_EXIT_MS = 30_000;
+  const forceExit = setTimeout(() => {
+    fastify.log.error("Indexer shutdown timed out — forcing exit");
+    process.exit(1);
+  }, FORCE_EXIT_MS);
+  forceExit.unref?.();
+
+  try {
+    // Stop poll/replay loops before closing connections
+    stopCleanupScheduler();
+
+    await prisma.$disconnect();
+    await replayQueue.close();
+    await closeWorkerWithTimeout(
+      replayWorker,
+      "indexer-replays",
+      fastify.log,
+      getActiveReplayJob,
+    );
+    await webhookQueue.close();
+    await closeWorkerWithTimeout(
+      webhookWorker,
+      "indexer-webhooks",
+      fastify.log,
+      getActiveWebhookJob,
+    );
+    await dlqQueue.close();
+    await replayProgressRedis.quit().catch(() => {});
+    await fastify.close();
+    await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
+
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (err) {
+    fastify.log.error(err, "Error during shutdown");
+    clearTimeout(forceExit);
+    process.exit(1);
+  }
+};
+
+let shuttingDown = false;
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 if (process.env.NODE_ENV !== "test") {
   start();

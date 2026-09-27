@@ -1,16 +1,20 @@
 import test from 'tape';
-import { createTestApp, generateTestJwt } from './test-utils.js';
+import { createTestApp, generateTestJwt, createMockFxClient } from './test-utils.js';
+import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
 
 test('POST /api/payments fetches an FX quote when convertTo is provided', async (t) => {
   let quoteRequest: { from: string; to: string; amount: string } | undefined;
-  const mockFxClient = {
+  const mockFxClient = createMockFxClient({
     getQuote: async (request: { from: string; to: string; amount: string }) => {
       quoteRequest = request;
       return { quoteId: 'quote_1', result: '15455.0000' };
     },
-  };
+  });
 
-  const { app, mockPrisma } = createTestApp({ fxClient: mockFxClient as any });
+  const { app, mockPrisma } = await createTestApp(
+    { fxClient: mockFxClient as any },
+    { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] },
+  );
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -18,7 +22,7 @@ test('POST /api/payments fetches an FX quote when convertTo is provided', async 
     url: '/api/payments',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      merchantId: 'merch_1',
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
       amount: '10.00',
       asset: 'USDC',
       convertTo: 'NGN',
@@ -28,9 +32,9 @@ test('POST /api/payments fetches an FX quote when convertTo is provided', async 
   const body = JSON.parse(res.body);
   t.equal(res.statusCode, 201, 'creates the payment');
   t.same(quoteRequest, { from: 'USDC', to: 'NGN', amount: '10.00' }, 'requests the matching quote');
-  t.equal(body.fxQuote.quoteId, 'quote_1', 'includes the quote in the response');
+  t.equal(body.data.fxQuote.quoteId, 'quote_1', 'includes the quote in the response');
 
-  const stored = await mockPrisma.payment.findUnique({ where: { id: body.id } });
+  const stored = await mockPrisma.payment.findUnique({ where: { id: body.data.id } });
   t.ok(stored, 'persists payment in mock database');
 
   await app.close();
@@ -39,14 +43,17 @@ test('POST /api/payments fetches an FX quote when convertTo is provided', async 
 
 test('POST /api/payments does not call FX when convertTo is absent', async (t) => {
   let calls = 0;
-  const mockFxClient = {
+  const mockFxClient = createMockFxClient({
     getQuote: async () => {
       calls += 1;
       return { quoteId: 'quote_1' };
     },
-  };
+  });
 
-  const { app } = createTestApp({ fxClient: mockFxClient as any });
+  const { app } = await createTestApp(
+    { fxClient: mockFxClient as any },
+    { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] },
+  );
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -54,7 +61,7 @@ test('POST /api/payments does not call FX when convertTo is absent', async (t) =
     url: '/api/payments',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      merchantId: 'merch_1',
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
       amount: '10.00',
       asset: 'USDC',
     },
@@ -63,18 +70,21 @@ test('POST /api/payments does not call FX when convertTo is absent', async (t) =
   const body = JSON.parse(res.body);
   t.equal(res.statusCode, 201, 'creates the payment');
   t.equal(calls, 0, 'does not call fx-engine');
-  t.notOk('fxQuote' in body, 'preserves the legacy response shape');
+  t.notOk('fxQuote' in body.data, 'preserves the legacy response shape');
 
   await app.close();
   t.end();
 });
 
 test('POST /api/payments still creates payment when FX quote is unavailable', async (t) => {
-  const mockFxClient = {
+  const mockFxClient = createMockFxClient({
     getQuote: async () => null,
-  };
+  });
 
-  const { app } = createTestApp({ fxClient: mockFxClient as any });
+  const { app } = await createTestApp(
+    { fxClient: mockFxClient as any },
+    { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] },
+  );
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -82,7 +92,7 @@ test('POST /api/payments still creates payment when FX quote is unavailable', as
     url: '/api/payments',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      merchantId: 'merch_1',
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
       amount: '10.00',
       asset: 'USDC',
       convertTo: 'EURT',
@@ -91,8 +101,8 @@ test('POST /api/payments still creates payment when FX quote is unavailable', as
 
   const body = JSON.parse(res.body);
   t.equal(res.statusCode, 201, 'creates the payment despite quote failure');
-  t.equal(body.fxQuote, null, 'surfaces graceful fallback in the response');
-  t.equal(body.status, 'initiated', 'payment remains initiated');
+  t.equal(body.data.fxQuote, null, 'surfaces graceful fallback in the response');
+  t.equal(body.data.status, 'initiated', 'payment remains initiated');
 
   await app.close();
   t.end();

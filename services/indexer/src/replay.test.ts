@@ -73,9 +73,30 @@ test('replay: GET /api/events/replay/:jobId/status endpoint', (t) => {
   t.end();
 });
 
+// #659 — replay job introspection must not be readable by anonymous callers.
+test('replay: status endpoint requires a service token', (t) => {
+  const routeBlock = content.slice(
+    content.indexOf('"/api/events/replay/:jobId/status"'),
+    content.indexOf('"/api/events/cleanup"'),
+  );
+  t.ok(
+    routeBlock.includes('preValidation: [fastify.serviceAuth]'),
+    'status route is guarded by serviceAuth',
+  );
+  t.end();
+});
+
 test('replay: graceful shutdown closes replay queue and worker', (t) => {
   t.ok(content.includes('replayQueue.close()'), 'replayQueue closed on shutdown');
   t.ok(content.includes('replayWorker.close()'), 'replayWorker closed on shutdown');
   t.ok(content.includes('replayProgressRedis.quit()'), 'replayProgressRedis quit on shutdown');
+  t.end();
+});
+
+test('replay: dedupes out-of-order and duplicate ledgers by sequence', (t) => {
+  t.ok(content.includes('const processedLedgers = new Set<number>()'), 'tracks processed ledgers');
+  t.ok(content.includes('processedLedgers.add(currentLedger)'), 'adds to processed ledgers');
+  t.ok(content.includes('processedLedgers.has(evt.ledger)'), 'checks for duplicate ledgers');
+  t.ok(content.includes('[Indexer] Skipping out-of-order or duplicate ledger'), 'logs warning for skipped ledgers');
   t.end();
 });

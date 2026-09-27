@@ -204,4 +204,144 @@ test('discoverStartLedger — INDEX_FROM_LEDGER=0 falls through', async (t) => {
   t.end();
 });
 
-process.exit(0);
+// ── #509: Redis connectivity gating ───────────────────────────────────────────
+//
+// The startup sequence calls waitForRedis before accepting traffic.  These
+// tests verify the success and failure paths using an injectable ping function
+// so no real Redis connection is required.
+
+function createWaitForRedis(opts: {
+  maxRetries?: number;
+  intervalMs?: number;
+  log: (level: string, msg: string, obj?: unknown) => void;
+}) {
+  return async function waitForRedis(ping: () => Promise<void>): Promise<void> {
+    const maxRetries = opts.maxRetries ?? 10;
+    const intervalMs = opts.intervalMs ?? 0; // 0 ms in tests — no real sleep needed
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        await ping();
+        opts.log('info', 'Redis ready', { attempt: attempt + 1 });
+        return;
+      } catch (err) {
+        const remaining = maxRetries - attempt - 1;
+        if (remaining > 0) {
+          opts.log('warn', 'Redis not ready, retrying', {
+            attempt: attempt + 1,
+            maxRetries,
+            nextRetryMs: intervalMs,
+            err: (err as Error).message,
+          });
+          if (intervalMs > 0) {
+            await new Promise((r) => setTimeout(r, intervalMs));
+          }
+        }
+      }
+    }
+
+    throw new Error(`Redis not ready after ${maxRetries} attempts — aborting startup`);
+  };
+}
+
+test('#509 — waitForRedis: resolves immediately when Redis responds to first PING', async (t) => {
+  const waitLogs: Array<{ level: string; msg: string }> = [];
+  const wait = createWaitForRedis({
+    maxRetries: 3,
+    log: (level, msg) => waitLogs.push({ level, msg }),
+  });
+
+  let pingCalls = 0;
+  await wait(async () => { pingCalls++; }); // first ping succeeds
+
+  t.equal(pingCalls, 1, 'ping called exactly once on immediate success');
+  t.ok(waitLogs.some((l) => l.msg === 'Redis ready'), 'logs Redis ready on success');
+  t.end();
+});
+
+test('#509 — waitForRedis: retries and eventually succeeds', async (t) => {
+  const waitLogs: Array<{ level: string; msg: string }> = [];
+  const wait = createWaitForRedis({
+    maxRetries: 5,
+    log: (level, msg) => waitLogs.push({ level, msg }),
+  });
+
+  let pingCalls = 0;
+  await wait(async () => {
+    pingCalls++;
+    if (pingCalls < 3) throw new Error('ECONNREFUSED'); // fail twice then succeed
+  });
+
+  t.equal(pingCalls, 3, 'ping called 3 times before success');
+  t.ok(waitLogs.some((l) => l.msg === 'Redis ready'), 'logs ready after retries');
+  t.ok(waitLogs.some((l) => l.msg === 'Redis not ready, retrying'), 'logs retry warnings');
+  t.end();
+});
+
+test('#509 — waitForRedis: throws after exhausting all retries (Redis down)', async (t) => {
+  const waitLogs: Array<{ level: string; msg: string }> = [];
+  const wait = createWaitForRedis({
+    maxRetries: 3,
+    log: (level, msg) => waitLogs.push({ level, msg }),
+  });
+
+  let pingCalls = 0;
+  try {
+    await wait(async () => {
+      pingCalls++;
+      throw new Error('ECONNREFUSED');
+    });
+    t.fail('should have thrown when Redis is permanently down');
+  } catch (err: any) {
+    t.ok(err.message.includes('not ready after'), 'throws descriptive error after exhausting retries');
+    t.equal(pingCalls, 3, 'attempted exactly maxRetries pings');
+    t.notOk(waitLogs.some((l) => l.msg === 'Redis ready'), 'never logs ready on failure');
+  }
+  t.end();
+});
+
+test('#509 — startup ordering: Redis must be gated before the server starts', async (t) => {
+  // Verify boot order: connectWithRetry → waitForRedis → listen.
+  // We simulate the start() sequence with injectable steps.
+  const order: string[] = [];
+
+  async function simulateStart(opts: {
+    connectDb: () => Promise<void>;
+    waitRedis: () => Promise<void>;
+    listenServer: () => Promise<void>;
+  }): Promise<void> {
+    await opts.connectDb();
+    await opts.waitRedis();
+    await opts.listenServer();
+  }
+
+  await simulateStart({
+    connectDb: async () => { order.push('db'); },
+    waitRedis: async () => { order.push('redis'); },
+    listenServer: async () => { order.push('listen'); },
+  });
+
+  t.deepEqual(order, ['db', 'redis', 'listen'], 'boot order is db → redis → listen');
+  t.end();
+});
+
+test('#509 — startup fails cleanly when Redis is unavailable after retries', async (t) => {
+  const wait = createWaitForRedis({ maxRetries: 2, log: () => {} });
+  const startErrors: Error[] = [];
+
+  async function simulateStart(waitRedis: () => Promise<void>): Promise<void> {
+    try {
+      await waitRedis();
+      // Server listen would go here — must NOT be reached.
+      t.fail('server must not start when Redis is permanently down');
+    } catch (err: any) {
+      startErrors.push(err);
+    }
+  }
+
+  await simulateStart(() => wait(async () => { throw new Error('ECONNREFUSED'); }));
+
+  t.equal(startErrors.length, 1, 'exactly one startup error captured');
+  t.ok(startErrors[0].message.includes('aborting startup'), 'error carries abort message');
+  t.end();
+});

@@ -27,23 +27,52 @@ export interface StartMetricsServerOptions {
   /** Returns the current metrics payload (e.g. prom-client's `register.metrics()`). */
   getMetrics: () => Promise<string> | string;
   log: MinimalLogger;
+  /**
+   * Optional Bearer token for scrape authentication (#528).
+   * When set, requests must include `Authorization: Bearer <token>`.
+   * If omitted, metrics are served unauthenticated (network isolation required).
+   */
+  scrapeToken?: string;
 }
 
 /**
- * Starts a minimal, dedicated HTTP server that serves only `GET /metrics` —
- * intentionally with no auth, no rate limiting, and no request logging, so a
- * Prometheus scraper can hit it without exposing or throttling application
- * endpoints. Runs on its own port (see resolveMetricsPort) so this data never
- * shares the application's listener.
+ * Starts a minimal, dedicated HTTP server that serves only `GET /metrics`.
+ * 
+ * Security (#528):
+ *  - When `scrapeToken` is provided, requests must include
+ *    `Authorization: Bearer <token>`. Unauthorized requests receive 401.
+ *  - When `scrapeToken` is omitted, metrics are served unauthenticated.
+ *    **Network isolation is required** (e.g., bind to 127.0.0.1 or use
+ *    firewall rules) to prevent metric leakage.
+ * 
+ * Runs on its own port (see resolveMetricsPort) so this data never shares
+ * the application's listener, and has no rate limiting or request logging
+ * to keep scrape overhead minimal.
  */
 export function startMetricsServer(options: StartMetricsServerOptions): Server {
   const port = resolveMetricsPort(options.appPort);
+  const { scrapeToken } = options;
 
   const server = http.createServer((req, res) => {
     if (req.method !== 'GET' || req.url !== '/metrics') {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not Found');
       return;
+    }
+
+    // Bearer token authentication (#528)
+    if (scrapeToken) {
+      const authHeader = req.headers.authorization;
+      const expectedAuth = `Bearer ${scrapeToken}`;
+      
+      if (authHeader !== expectedAuth) {
+        res.writeHead(401, { 
+          'Content-Type': 'text/plain',
+          'WWW-Authenticate': 'Bearer realm="metrics"'
+        });
+        res.end('Unauthorized');
+        return;
+      }
     }
 
     Promise.resolve(options.getMetrics())
@@ -59,7 +88,8 @@ export function startMetricsServer(options: StartMetricsServerOptions): Server {
   });
 
   server.listen(port, '0.0.0.0', () => {
-    options.log.info({ port }, `Metrics server listening on :${port}/metrics`);
+    const authStatus = scrapeToken ? '(auth required)' : '(unauthenticated - ensure network isolation)';
+    options.log.info({ port, authenticated: !!scrapeToken }, `Metrics server listening on :${port}/metrics ${authStatus}`);
   });
 
   return server;

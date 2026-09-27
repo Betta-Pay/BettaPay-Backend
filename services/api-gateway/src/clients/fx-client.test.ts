@@ -1,5 +1,6 @@
 import test from 'tape';
 import { createFxClient } from './fx-client.js';
+import { UpstreamReadTimeoutError } from '../upstream-fetch.js';
 
 const BASE = 'http://fx.test:3002';
 
@@ -84,7 +85,7 @@ test('getQuote returns null on non-OK response', async (t) => {
   t.end();
 });
 
-test('getQuote returns null on timeout', async (t) => {
+test('getQuote throws UpstreamReadTimeoutError on timeout with no cached quote', async (t) => {
   const client = createFxClient({
     baseUrl: BASE,
     timeoutMs: 10,
@@ -96,7 +97,40 @@ test('getQuote returns null on timeout', async (t) => {
       }),
   });
 
-  const quote = await client.getQuote({ from: 'USDC', to: 'NGN', amount: '10' });
-  t.equal(quote, null, 'timeout degrades to no quote');
+  try {
+    await client.getQuote({ from: 'USDC', to: 'NGN', amount: '10' });
+    t.fail('expected UpstreamReadTimeoutError to be thrown');
+  } catch (err) {
+    t.ok(err instanceof UpstreamReadTimeoutError, 'timeout surfaces UpstreamReadTimeoutError');
+  }
+  t.end();
+});
+
+test('getQuote serves stale cached quote on timeout after a previous success', async (t) => {
+  let shouldTimeout = false;
+  const client = createFxClient({
+    baseUrl: BASE,
+    timeoutMs: 10,
+    fetchImpl: async (_url, init) => {
+      if (shouldTimeout) {
+        return new Promise((_resolve, reject) => {
+          init!.signal!.addEventListener('abort', () =>
+            reject(new DOMException('Aborted', 'AbortError')),
+          );
+        });
+      }
+      return jsonResponse(quoteBody);
+    },
+  });
+
+  // Prime the last-good cache with a successful response.
+  const first = await client.getQuote({ from: 'USDC', to: 'NGN', amount: '10' });
+  t.ok(first, 'first call returns a live quote');
+
+  // Subsequent call times out but the stale cache entry is served.
+  shouldTimeout = true;
+  const cached = await client.getQuote({ from: 'USDC', to: 'NGN', amount: '10' });
+  t.ok(cached, 'stale cached quote is served on timeout');
+  t.equal(cached?.quoteId, 'quote_1', 'serves the previously cached quote');
   t.end();
 });

@@ -110,7 +110,7 @@ jobs:
         run: pnpm exec prisma generate
 
       - name: Apply database schema
-        run: pnpm exec prisma db push --skip-generate
+        run: pnpm exec prisma db push
 
       - name: Build project
         run: pnpm build
@@ -194,7 +194,10 @@ jobs:
           cat /tmp/rollback.sql
 
       - name: Apply rollback
-        run: pnpm exec prisma db execute --file /tmp/rollback.sql
+        run: |
+          pnpm exec prisma db execute --file /tmp/rollback.sql
+          # Remove the migration record so the re-apply step can run it again.
+          psql "$DATABASE_URL" -c "DELETE FROM \"_prisma_migrations\" WHERE \"migration_name\" = '${{ steps.latest_migration.outputs.name }}';"
 
       - name: Verify rollback succeeded (schema matches pre-migration state)
         run: |

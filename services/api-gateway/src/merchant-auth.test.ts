@@ -1,6 +1,8 @@
 import test from 'tape';
 import crypto from 'crypto';
 import sinon from 'sinon';
+import Fastify from 'fastify';
+import fastifyJwt from '@fastify/jwt';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OAuth2Client } from 'google-auth-library';
 import { CreateMerchantBody, AuthTokenBody, createErrorResponse, ErrorCodes } from '@bettapay/validation';
@@ -205,8 +207,8 @@ test('valid credentials return JWT', async (t) => {
   const secret = 'merchant-super-secret-key';
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const hashed = hashSecret(secret);
-  const { app } = createTestApp({}, {
-    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  const { app } = buildApp({
+    initialMerchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
   });
 
   try {
@@ -222,7 +224,7 @@ test('valid credentials return JWT', async (t) => {
 
     const payload = app.jwt.decode(body.token) as any;
     t.equal(payload.merchantId, merchantId, 'JWT contains correct merchant ID');
-    t.equal(payload.ownerId, ownerId, 'JWT contains correct owner ID');
+    t.equal(payload.ownerId, 'user-1', 'JWT contains correct owner ID');
   } catch (err: any) {
     t.fail(err);
   } finally {
@@ -235,8 +237,8 @@ test('invalid secret returns 401', async (t) => {
   const secret = 'merchant-super-secret-key';
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const hashed = hashSecret(secret);
-  const { app } = createTestApp({}, {
-    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  const { app } = buildApp({
+    initialMerchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
   });
 
   try {
@@ -258,7 +260,7 @@ test('invalid secret returns 401', async (t) => {
 });
 
 test('unknown merchant returns 401', async (t) => {
-  const { app } = createTestApp({}, { merchants: [] });
+  const { app } = buildApp();
 
   try {
     const res = await app.inject({
@@ -279,15 +281,13 @@ test('unknown merchant returns 401', async (t) => {
 });
 
 test('merchant creation hashes secrets and plaintext secrets are never persisted', async (t) => {
-  const { app, mockPrisma } = createTestApp({}, { merchants: [] });
-  const token = generateTestJwt(app);
+  const { app, db } = buildApp();
 
   try {
     // 1. Creation with custom secret
     const res1 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
-      headers: { authorization: `Bearer ${token}` },
       payload: {
         id: 'm-new-1',
         name: 'New Merchant',
@@ -311,7 +311,6 @@ test('merchant creation hashes secrets and plaintext secrets are never persisted
     const res2 = await app.inject({
       method: 'POST',
       url: '/api/merchants',
-      headers: { authorization: `Bearer ${token}` },
       payload: {
         id: 'm-new-2',
         name: 'Generated Merchant',
@@ -342,8 +341,8 @@ test('seeded admin merchant authenticates successfully', async (t) => {
   const adminSecret = 'admin-secret-dev-value';
   const adminSecretHash = hashSecret(adminSecret);
 
-  const { app } = createTestApp({}, {
-    merchants: [{
+  const { app } = buildApp({
+    initialMerchants: [{
       id: adminAddress,
       name: 'BettaPay Merchant LLC',
       ownerId: 'admin-user-001',
@@ -374,8 +373,8 @@ test('regression test: arbitrary secrets can no longer obtain a JWT', async (t) 
   const merchantId = VALID_STELLAR_PUBLIC_KEY;
   const secret = 'merchant-super-secret-key';
   const hashed = hashSecret(secret);
-  const { app } = createTestApp({}, {
-    merchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
+  const { app } = buildApp({
+    initialMerchants: [{ id: merchantId, ownerId: 'user-1', secretHash: hashed }],
   });
 
   try {

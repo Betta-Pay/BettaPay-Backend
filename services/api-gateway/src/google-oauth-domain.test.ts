@@ -4,6 +4,7 @@ import Fastify from 'fastify';
 import fastifyJwt from '@fastify/jwt';
 import { OAuth2Client } from 'google-auth-library';
 import { createErrorResponse, ErrorCodes } from '@bettapay/validation';
+import { normalizeAndValidateEmail } from './index.js';
 
 function buildGoogleAuthApp(opts: { allowedDomains?: string[] } = {}) {
   const app = Fastify({ logger: false });
@@ -32,21 +33,27 @@ function buildGoogleAuthApp(opts: { allowedDomains?: string[] } = {}) {
       if (!payload) {
         return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed: invalid token payload'));
       }
-      const email = payload.email;
-      if (!email) {
+      const rawEmail = payload.email;
+      if (!rawEmail) {
         return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google token payload'));
       }
 
+      const validated = normalizeAndValidateEmail(rawEmail);
+      if (!validated) {
+        return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Invalid email format'));
+      }
+
+      const { email: normalizedEmail, domain } = validated;
+
       if (allowedDomains.length > 0) {
-        const domain = email.split('@')[1]?.toLowerCase();
         if (!domain || !allowedDomains.includes(domain)) {
           return reply.code(403).send(createErrorResponse(ErrorCodes.INVALID_ORIGIN, 'Email domain not allowed', { domain }));
         }
       }
 
-      let merchant = db.find(m => m.ownerId === email && !m.deletedAt);
+      let merchant = db.find(m => m.ownerId === normalizedEmail && !m.deletedAt);
       if (!merchant) {
-        merchant = { id: `google_test`, name: email.split('@')[0] + ' Merchant', ownerId: email, settings: {} };
+        merchant = { id: `google_test`, name: normalizedEmail.split('@')[0] + ' Merchant', ownerId: normalizedEmail, settings: {} };
         db.push(merchant);
       }
 
@@ -111,6 +118,52 @@ test('Google OAuth: domain in allowlist succeeds', async (t) => {
     await app.close();
     t.end();
   }
+});
+
+test('Google OAuth: adversarial email bypass attempts are rejected or normalized', async (t) => {
+  const { app } = buildGoogleAuthApp({ allowedDomains: ['example.com'] });
+
+  // Test 1: Subdomain spoofing attempt user@example.com.evil.com
+  let verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({ email: 'user@example.com.evil.com' }),
+  } as any);
+
+  let res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/google',
+    payload: { token: 'valid-token' },
+  });
+  t.equal(res.statusCode, 403, 'subdomain spoofing email rejected with 403');
+  verifyStub.restore();
+
+  // Test 2: Double @ symbol malformed email
+  verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({ email: 'user@evil.com@example.com' }),
+  } as any);
+
+  res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/google',
+    payload: { token: 'valid-token' },
+  });
+  t.equal(res.statusCode, 400, 'double @ malformed email rejected with 400');
+  verifyStub.restore();
+
+  // Test 3: Fullwidth unicode dot normalized to standard dot and succeeds
+  verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({ email: 'user@example\uFF0Ecom' }),
+  } as any);
+
+  res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/google',
+    payload: { token: 'valid-token' },
+  });
+  t.equal(res.statusCode, 200, 'fullwidth dot normalized and accepted');
+  verifyStub.restore();
+
+  await app.close();
+  t.end();
 });
 
 test('Google OAuth: no domain restriction allows all emails', async (t) => {

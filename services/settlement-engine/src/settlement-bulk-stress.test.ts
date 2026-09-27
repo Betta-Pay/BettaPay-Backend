@@ -1,10 +1,13 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 import { getAssetPrecision, isSupportedAsset } from './settlement-properties.js';
 
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
 
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
@@ -20,7 +23,7 @@ test('bulk-stress: support property functions checks', (t) => {
   t.notOk(isSupportedAsset('INVALID_ASSET'));
 
   const usdcConfig = getAssetPrecision('USDC');
-  t.equal(usdcConfig.decimals, 6);
+  t.equal(usdcConfig.decimals, 7);
   t.equal(usdcConfig.roundingMode, 'down');
 
   const fallbackConfig = getAssetPrecision('UNKNOWN');
@@ -43,6 +46,7 @@ test('bulk-stress: handles validation performance check with 100 items', async (
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements,
@@ -52,7 +56,7 @@ test('bulk-stress: handles validation performance check with 100 items', async (
   const duration = Date.now() - startTime;
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.created, 100);
+  t.equal(body.data.created, 100);
   t.ok(duration < 2000, `processing 100 settlements took ${duration}ms, must be < 2000ms`);
   t.end();
 });
@@ -71,6 +75,7 @@ test('bulk-stress: process large batches with mixed valid and invalid entries', 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements,
@@ -79,9 +84,17 @@ test('bulk-stress: process large batches with mixed valid and invalid entries', 
 
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
-  t.equal(body.total, 100);
-  t.equal(body.created, 50);
-  t.equal(body.errors.length, 50);
+  t.equal(body.data.total, 100);
+  t.equal(body.data.created, 50);
+  t.equal(body.data.errors.length, 50);
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

@@ -206,6 +206,19 @@ function buildApp(initialMerchants: MerchantRecord[], adminMerchantId = initialM
     return reply.send({ token: signMerchantJwt(payload.merchantId, payload.ownerId) });
   });
 
+  app.post('/api/auth/logout', { preValidation: [app.authenticate] }, async (request, reply) => {
+    const payload = request.user as MerchantJwtPayload;
+    if (!payload.jti || !payload.merchantId) {
+      return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+    }
+
+    const remainingLifetime = (payload.exp ?? 0) - Math.floor(Date.now() / 1000);
+    if (remainingLifetime > 0) {
+      await redis.set(revokedJtiKey(payload.jti), '1', 'EX', remainingLifetime);
+    }
+    return reply.send({ status: 'logged_out' });
+  });
+
   app.post('/api/auth/wallet/verify', { preHandler: [enforceAuthIpReputation] }, async (request, reply) => {
     const d = WalletVerifyBody.parse(request.body);
     if (await redis.exists(usedNonceKey(d.nonce))) {
@@ -369,6 +382,28 @@ test('refresh is rate-limited to 10 requests per minute per merchant', async (t)
 
     const limited = await app.inject({ method: 'POST', url: '/api/auth/refresh', headers: { authorization: 'Bearer ' + token } });
     t.equal(limited.statusCode, 429, '11th refresh is rate-limited');
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('logout revokes the caller\'s token immediately', async (t) => {
+  const keypair = Keypair.random();
+  const merchantId = keypair.publicKey();
+  const { app, signMerchantJwt } = buildApp([{ id: merchantId, ownerId: merchantId, secretHash: hashSecret('secret') }]);
+  await app.ready();
+  const token = signMerchantJwt(merchantId, merchantId);
+
+  try {
+    const before = await app.inject({ method: 'GET', url: '/protected', headers: { authorization: 'Bearer ' + token } });
+    t.equal(before.statusCode, 200, 'token works before logout');
+
+    const loggedOut = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { authorization: 'Bearer ' + token } });
+    t.equal(loggedOut.statusCode, 200, 'logout succeeds');
+
+    const after = await app.inject({ method: 'GET', url: '/protected', headers: { authorization: 'Bearer ' + token } });
+    t.equal(after.statusCode, 401, 'the same token is rejected after logout');
   } finally {
     await app.close();
     t.end();

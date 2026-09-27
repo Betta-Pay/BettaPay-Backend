@@ -1,11 +1,12 @@
 import test from 'tape';
 import { createTestApp, generateTestJwt } from './test-utils.js';
+import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
 
 const VALID_STELLAR_KEY = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
 const INVALID_STELLAR_KEY = 'NOT_A_STELLAR_KEY';
 
 test('validation: POST /api/payments validates merchantId', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -30,7 +31,7 @@ test('validation: POST /api/payments validates merchantId', async (t) => {
 });
 
 test('validation: POST /api/payments validates amount format', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -51,8 +52,34 @@ test('validation: POST /api/payments validates amount format', async (t) => {
   t.end();
 });
 
+test('validation: POST /api/payments rejects amounts beyond asset precision with 422', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
+      amount: '1.123456789012345678901234567890',
+      asset: 'USDC',
+    },
+  });
+
+  t.equal(res.statusCode, 422, 'should reject 30-decimal USDC amount with 422');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.ok(
+    body.error.details.some((detail: any) => detail.path.includes('amount')),
+    'should report the precision issue on amount',
+  );
+  await app.close();
+  t.end();
+});
+
 test('validation: POST /api/payments validates asset format', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -73,8 +100,10 @@ test('validation: POST /api/payments validates asset format', async (t) => {
   t.end();
 });
 
-test('validation: POST /api/payments validates payerId if provided', async (t) => {
-  const { app } = createTestApp();
+test('validation: POST /api/payments accepts a free-form payerId', async (t) => {
+  // payerId is free-form by design (merchant-facing identifier, not a Stellar
+  // address) — a non-Stellar value must be accepted.
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -82,22 +111,22 @@ test('validation: POST /api/payments validates payerId if provided', async (t) =
     url: '/api/payments',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      merchantId: VALID_STELLAR_KEY,
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
       amount: '10.00',
       asset: 'USDC',
-      payerId: INVALID_STELLAR_KEY,
+      payerId: 'payer-ref-123',
     },
   });
 
-  t.equal(res.statusCode, 400, 'should reject invalid payerId Stellar key format');
+  t.equal(res.statusCode, 201, 'accepts a free-form payerId');
   const body = JSON.parse(res.body);
-  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.equal(body.data.payerId, 'payer-ref-123', 'stores the payerId as provided');
   await app.close();
   t.end();
 });
 
 test('validation: POST /api/payments validates convertTo is not empty and is uppercase', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -120,21 +149,22 @@ test('validation: POST /api/payments validates convertTo is not empty and is upp
 });
 
 test('validation: POST /api/merchants validates id and ownerId Stellar addresses', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
-  // 1. Invalid id Stellar address
+  // 1. Empty id is rejected (id must be a non-empty string; the Stellar
+  //    format requirement applies to ownerId)
   const res1 = await app.inject({
     method: 'POST',
     url: '/api/merchants',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      id: INVALID_STELLAR_KEY,
+      id: '',
       name: 'Test Merchant',
       ownerId: VALID_STELLAR_KEY,
     },
   });
-  t.equal(res1.statusCode, 400, 'should reject invalid merchant id address');
+  t.equal(res1.statusCode, 400, 'should reject empty merchant id');
 
   // 2. Invalid ownerId Stellar address
   const res2 = await app.inject({
@@ -166,7 +196,7 @@ test('validation: POST /api/merchants validates id and ownerId Stellar addresses
 });
 
 test('validation: PATCH /api/merchants/:id/settings validates feeBps constraints', async (t) => {
-  const { app } = createTestApp({}, {
+  const { app } = await createTestApp({}, {
     merchants: [{ id: 'm1', settings: {} }],
   });
   const token = generateTestJwt(app);
@@ -203,7 +233,7 @@ test('validation: PATCH /api/merchants/:id/settings validates feeBps constraints
 });
 
 test('validation: POST /api/settlements validates merchantId format', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -211,7 +241,7 @@ test('validation: POST /api/settlements validates merchantId format', async (t) 
     url: '/api/settlements',
     headers: { authorization: `Bearer ${token}` },
     payload: {
-      merchantId: INVALID_STELLAR_KEY,
+      merchantId: 'not valid!', // fails the alphanumeric merchantId format rule
       items: [{ amount: '50.00', asset: 'USDC' }],
     },
   });
@@ -224,7 +254,7 @@ test('validation: POST /api/settlements validates merchantId format', async (t) 
 });
 
 test('validation: POST /api/settlements validates items payload structure', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -245,7 +275,7 @@ test('validation: POST /api/settlements validates items payload structure', asyn
 });
 
 test('validation: GET /api/settlements validates query parameter dates', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({
@@ -260,7 +290,7 @@ test('validation: GET /api/settlements validates query parameter dates', async (
 });
 
 test('validation: GET /api/settlements handles date ranges correctly when start date is after end date', async (t) => {
-  const { app } = createTestApp();
+  const { app } = await createTestApp();
   const token = generateTestJwt(app);
 
   const res = await app.inject({

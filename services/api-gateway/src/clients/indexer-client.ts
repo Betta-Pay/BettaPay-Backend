@@ -68,6 +68,19 @@ export interface IndexerClient {
    *          indexer is unavailable so the caller can degrade gracefully.
    */
   getPaymentEvents(merchantId: string, incomingHeaders?: IncomingHeaders): Promise<IndexerEvent[] | null>;
+
+  /**
+   * Triggers a synthetic test event for a webhook subscription via the indexer.
+   *
+   * @param id The webhook subscription ID to test.
+   * @param merchantId The calling merchant's own id (#624) — forwarded so the
+   *        indexer can enforce ownership as a second, independent check even
+   *        though this gateway route already rejects a cross-merchant test
+   *        before ever reaching here (defense in depth, not the only guard).
+   * @param incomingHeaders inbound request headers; tracing headers are propagated.
+   * @returns the test result, or `null` if the indexer is unavailable.
+   */
+  testWebhook(id: string, merchantId: string, incomingHeaders?: IncomingHeaders): Promise<{ success: boolean; statusCode?: number; error?: string } | null>;
 }
 
 export function createIndexerClient(options: IndexerClientOptions): IndexerClient {
@@ -151,5 +164,66 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
     }
   }
 
-  return { getPaymentEvents };
+  async function testWebhook(
+    id: string,
+    merchantId: string,
+    incomingHeaders: IncomingHeaders = {},
+  ): Promise<{ success: boolean; statusCode?: number; error?: string } | null> {
+    const headers = propagateTracingHeaders(incomingHeaders, { ...authHeaders });
+    const url =
+      `${root}/api/webhooks/${encodeURIComponent(id)}/test` +
+      `?merchantId=${encodeURIComponent(merchantId)}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
+
+    try {
+      const res = await fetchImpl(url, { method: 'POST', signal: controller.signal, headers });
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const statusCode = String(res.status);
+
+      metrics.duration.observe({ target_service: TARGET, endpoint: '/api/webhooks/:id/test', status_code: statusCode }, durationSeconds);
+
+      if (!res.ok) {
+        metrics.failures.inc({ target_service: TARGET, endpoint: '/api/webhooks/:id/test', status_code: statusCode });
+        
+        let errorData: any = null;
+        try { errorData = await res.json(); } catch { /* ignore */ }
+        
+        logger?.warn(
+          { status: res.status, id, errorData },
+          'indexer-client: testWebhook non-OK response',
+        );
+        // We could return null or bubble up the error. We return the JSON error if it conforms, else null.
+        if (errorData?.error && typeof errorData.error === 'object' && errorData.error.code === 'NOT_FOUND') {
+            throw new Error('NOT_FOUND');
+        }
+        return null;
+      }
+
+      const body = await res.json();
+      return body as { success: boolean; statusCode?: number; error?: string };
+    } catch (err) {
+      if (err instanceof Error && err.message === 'NOT_FOUND') throw err;
+      const durationSeconds = (Date.now() - startedAt) / 1000;
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      const statusCode = isTimeout ? 'timeout' : 'network_error';
+
+      metrics.failures.inc({ target_service: TARGET, endpoint: '/api/webhooks/:id/test', status_code: statusCode });
+      metrics.duration.observe({ target_service: TARGET, endpoint: '/api/webhooks/:id/test', status_code: statusCode }, durationSeconds);
+
+      logger?.warn(
+        { err, id, timedOut: isTimeout },
+        isTimeout
+          ? 'indexer-client: testWebhook read timeout'
+          : 'indexer-client: testWebhook request failed',
+      );
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return { getPaymentEvents, testWebhook };
 }

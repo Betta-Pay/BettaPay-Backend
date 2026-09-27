@@ -18,6 +18,16 @@ interface SortedSetMember {
 
 class MockRedis {
   store = new Map<string, SortedSetMember[]>();
+  lockAcquired = true;
+
+  async set(key: string, value: string, ...args: any[]): Promise<string | null> {
+    if (!this.lockAcquired) return null;
+    return 'OK';
+  }
+
+  async eval(script: string, numKeys: number, key: string, arg: string): Promise<number> {
+    return 1;
+  }
 
   async zadd(key: string, score: number, member: string): Promise<number> {
     if (!this.store.has(key)) {
@@ -82,16 +92,32 @@ const SNAPSHOT_KEY = 'fx:rate_snapshots';
 // Replicates runRateHistoryCleanup() from index.ts but accepts the retention
 // days as a parameter so each test can configure it independently.
 
+async function acquireCleanupLock(redis: MockRedis): Promise<string | null> {
+  const token = 'mock-token';
+  const result = await redis.set('RATE_CLEANUP_LOCK_KEY', token, 'PX', 30000, 'NX').catch(() => null);
+  return result === 'OK' ? token : null;
+}
+
+async function releaseCleanupLock(redis: MockRedis, token: string): Promise<void> {
+  await redis.eval('mock', 1, 'RATE_CLEANUP_LOCK_KEY', token).catch(() => {});
+}
+
 async function runRateHistoryCleanup(
   redis: MockRedis,
   retentionDays: number,
 ): Promise<number> {
-  const effectiveDays = Number.isFinite(retentionDays) && retentionDays >= 1
-    ? retentionDays
-    : 7;
-  const cutoff = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
-  const purged = await redis.zremrangebyscore(SNAPSHOT_KEY, '-inf', cutoff);
-  return purged;
+  const lockToken = await acquireCleanupLock(redis);
+  if (!lockToken) return 0;
+  try {
+    const effectiveDays = Number.isFinite(retentionDays) && retentionDays >= 1
+      ? retentionDays
+      : 7;
+    const cutoff = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+    const purged = await redis.zremrangebyscore(SNAPSHOT_KEY, '-inf', cutoff);
+    return purged;
+  } finally {
+    await releaseCleanupLock(redis, lockToken);
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -216,6 +242,22 @@ test('Rate history cleanup: invalid retention (≤ 0) defaults to 7 days', async
   const remaining = await redis.zrange(SNAPSHOT_KEY, 0, 0);
   const parsed = JSON.parse(remaining[0]) as { ts: number };
   t.equal(parsed.ts, newSnapshot.ts, 'remaining is the recent snapshot');
+
+  t.end();
+});
+
+test('Rate history cleanup: lock cannot be acquired — returns 0, does not purge', async (t) => {
+  const redis = new MockRedis();
+  redis.lockAcquired = false;
+
+  const oldSnapshot = makeSnapshot(10 * 24, 999);
+  await redis.zadd(SNAPSHOT_KEY, oldSnapshot.ts, oldSnapshot.member);
+
+  const purged = await runRateHistoryCleanup(redis, 7);
+
+  t.equal(purged, 0, 'purged count is 0 when lock fails');
+  const count = await redis.zcard(SNAPSHOT_KEY);
+  t.equal(count, 1, 'key still has snapshot');
 
   t.end();
 });

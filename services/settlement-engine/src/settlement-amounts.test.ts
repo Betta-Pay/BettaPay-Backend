@@ -12,8 +12,9 @@
  */
 
 import test from 'tape';
-import { computeSettlementAmounts, resolveVolumeDiscount } from './settlement-amounts.js';
+import { computeSettlementAmounts, resolveVolumeDiscount, FEE_VERSION } from './settlement-amounts.js';
 import type { DiscountTier } from './settlement-amounts.js';
+import { assertSettlementInvariants } from './settlement-properties.js';
 
 // ─── resolveVolumeDiscount ───────────────────────────────────────────────────
 
@@ -164,6 +165,18 @@ test('invariant: feeAmount >= 0 with any discount', (t) => {
   t.end();
 });
 
+test('runtime invariant: inconsistent settlement math throws', (t) => {
+  t.throws(() => {
+    assertSettlementInvariants({
+      grossAmount: '100.00',
+      feeAmount: '10.01',
+      netAmount: '89.99',
+      feeBps: 100,
+    });
+  }, /feeAmount \+ netAmount === grossAmount/i, 'invalid settlement math is rejected at runtime');
+  t.end();
+});
+
 // ─── Existing snapshot tests still hold ──────────────────────────────────────
 
 test('feeSnapshot: no-discount path still records correct snapshot', (t) => {
@@ -172,6 +185,6 @@ test('feeSnapshot: no-discount path still records correct snapshot', (t) => {
   t.equal(feeSnapshot.maxFeeBpsApplied, 150, 'maxFeeBpsApplied matches input');
   t.equal(feeSnapshot.discountApplied,  0,   'discountApplied is 0');
   t.equal(feeSnapshot.monthlyVolumeAtTime, 0, 'monthlyVolumeAtTime defaults to 0');
-  t.equal(feeSnapshot.feeVersion, '1.0',     'feeVersion is set');
+  t.equal(feeSnapshot.feeVersion, FEE_VERSION, 'feeVersion is set');
   t.end();
 });

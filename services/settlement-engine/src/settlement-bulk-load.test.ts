@@ -1,9 +1,12 @@
 import test from 'tape';
-import { fastify, prisma } from './index.js';
+import { fastify, prisma, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
 
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
@@ -27,6 +30,7 @@ test('bulk-load: processing multiple batches sequentially to verify state memory
     const res = await fastify.inject({
       method: 'POST',
       url: '/api/settlements/bulk',
+      headers: AUTH_HEADER,
       payload: {
         merchantId: MOCK_MERCHANT_STANDARD.id,
         settlements,
@@ -35,9 +39,9 @@ test('bulk-load: processing multiple batches sequentially to verify state memory
 
     t.equal(res.statusCode, 201, `batch ${batchIndex} processes successfully`);
     const body = JSON.parse(res.body);
-    t.equal(body.total, 2);
-    t.equal(body.created, 2);
-    t.equal(body.errors.length, 0);
+    t.equal(body.data.total, 2);
+    t.equal(body.data.created, 2);
+    t.equal(body.data.errors.length, 0);
   }
   t.end();
 });
@@ -53,6 +57,7 @@ test('bulk-load: aggregate daily limit depletion validation with sequence iterat
   const res1 = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: [
@@ -75,6 +80,7 @@ test('bulk-load: aggregate daily limit depletion validation with sequence iterat
   const res2 = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: [
@@ -100,6 +106,7 @@ test('bulk-load: verify invalid asset type rejections inside bulk collection', a
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: [
@@ -115,3 +122,11 @@ test('bulk-load: verify invalid asset type rejections inside bulk collection', a
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

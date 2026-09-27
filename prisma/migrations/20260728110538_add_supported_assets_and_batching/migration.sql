@@ -26,7 +26,7 @@ CREATE TABLE "SettlementBatch" (
 );
 
 -- Seed initial supported assets
-INSERT INTO "SupportedAsset" ("code", "contractId", "decimals", "name", "isActive") VALUES
-('USDC', 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', 7, 'USD Coin', true),
-('EURT', 'GAP5LETOV6YIE62YAM56STDANPRDO7ZFDBGSNHJQIYGGKSMOZAHOOS2S', 7, 'Euro Token', true),
-('XLMS', 'native', 7, 'Stellar Lumens', true);
+INSERT INTO "SupportedAsset" ("code", "contractId", "decimals", "name", "isActive", "updatedAt") VALUES
+('USDC', 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', 7, 'USD Coin', true, NOW()),
+('EURT', 'GAP5LETOV6YIE62YAM56STDANPRDO7ZFDBGSNHJQIYGGKSMOZAHOOS2S', 7, 'Euro Token', true, NOW()),
+('XLMS', 'native', 7, 'Stellar Lumens', true, NOW());

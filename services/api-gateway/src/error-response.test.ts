@@ -17,21 +17,20 @@ test('createErrorResponse includes details when provided', (t) => {
   t.end();
 });
 
-test('a Zod failure on gateway route returns a 400 VALIDATION_ERROR with the issue list in details', async (t) => {
+test('a Zod failure on gateway route returns a 400 VALIDATION_ERROR with reqId in body', async (t) => {
   const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
 
-  // Test Zod error handler on real POST /api/payments route (missing token doesn't bypass validation, or we can use any route without auth, e.g. /api/auth/wallet/verify)
-  // Let's use /api/auth/wallet/verify which requires address, challenge, signature
   const res = await app.inject({
     method: 'POST',
     url: '/api/auth/wallet/verify',
-    payload: { address: 'invalid-address' } // Missing challenge and signature
+    payload: { address: 'invalid-address' }
   });
 
   t.equal(res.statusCode, 400, 'status is preserved at 400');
   const body = JSON.parse(res.body);
   t.equal(body.error.code, 'VALIDATION_ERROR', 'code is VALIDATION_ERROR');
   t.ok(Array.isArray(body.error.details) && body.error.details.length > 0, 'details holds the Zod error list');
+  t.ok(body.error.reqId, 'reqId is present in validation error response for correlation');
 
   await app.close();
   t.end();

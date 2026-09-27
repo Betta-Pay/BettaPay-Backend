@@ -1,9 +1,12 @@
 import test from 'tape';
-import { fastify, prisma, settlementQueue } from './index.js';
+import { fastify, prisma, settlementQueue, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
 process.env.NODE_ENV = 'test';
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
 
 function resetMocks() {
   prisma.merchant.findUnique = async () => null;
@@ -12,6 +15,7 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
 }
 
 test('bulk-e2e: complete successful pipeline simulation', async (t) => {
@@ -25,9 +29,9 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
     createdRecords.push(args.data);
     return args.data;
   };
-  settlementQueue.add = async (name: string, data: any) => {
-    enqueuedJobs.push(data);
-    return { id: 'job_test_123' } as any;
+  settlementQueue.addBulk = async (jobs: any[]) => {
+    for (const job of jobs) enqueuedJobs.push(job.data);
+    return jobs.map(() => ({ id: 'job_test_123' })) as any;
   };
 
   const payload = {
@@ -42,6 +46,7 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
   const postRes = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload,
   });
 
@@ -58,6 +63,7 @@ test('bulk-e2e: complete successful pipeline simulation', async (t) => {
   const statusRes = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${postBody.batchId}/status`,
+    headers: AUTH_HEADER,
   });
 
   t.equal(statusRes.statusCode, 200, 'should return 200 OK');
@@ -87,17 +93,26 @@ test('bulk-e2e: pipeline status changes after partial completions', async (t) =>
   const res = await fastify.inject({
     method: 'GET',
     url: `/api/settlements/batch/${batchId}/status`,
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
-  t.equal(body.batchId, batchId);
-  t.equal(body.total, 3);
-  t.equal(body.completed, 1);
-  t.equal(body.failed, 1);
-  t.equal(body.pending, 1);
-  t.equal(body.status, 'processing', 'batch with mixed states should be marked as processing');
+  t.equal(body.data.batchId, batchId);
+  t.equal(body.data.total, 3);
+  t.equal(body.data.completed, 1);
+  t.equal(body.data.failed, 1);
+  t.equal(body.data.pending, 1);
+  t.equal(body.data.status, 'processing', 'batch with mixed states should be marked as processing');
 
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});
