@@ -3048,25 +3048,14 @@ fastify.get('/api/admin/auth/ip-score', {
         (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
       // #319 — Validate each asset against SupportedAsset table
-      // #743 — Cache the allowlist with a 5-minute TTL to avoid re-reading
-      // the reference table on every settlement-create call.
-      let assetSet: Set<string>;
-      const cachedCodes = await redis
-        .get("supported-asset-codes")
-        .catch(() => null);
-      if (cachedCodes) {
-        assetSet = new Set<string>(JSON.parse(cachedCodes) as string[]);
-      } else {
-        const codes = (
-          await prisma.supportedAsset.findMany({
-            select: { code: true },
-          })
-        ).map((a) => a.code);
-        assetSet = new Set<string>(codes);
-        await redis
-          .set("supported-asset-codes", JSON.stringify([...assetSet]), "EX", 300)
-          .catch(() => {});
-      }
+      // #716 — Collapse per-item lookups into a single findMany for the
+      // distinct batch codes (one query regardless of item count).
+      const codes = [...new Set(items.map((item: any) => item.asset))];
+      const assets = await prisma.supportedAsset.findMany({
+        where: { code: { in: codes } },
+        select: { code: true },
+      });
+      const assetSet = new Set<string>(assets.map((a) => a.code));
 
       for (const item of items) {
         if (!assetSet.has(item.asset)) {
