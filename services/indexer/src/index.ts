@@ -136,11 +136,6 @@ registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
-fastify.register(rateLimit, {
-  max: 500,
-  timeWindow: "1 minute",
-});
-
 // Served on its own port (see startMetricsServer below), not on the
 // application port — keeps the scrape endpoint unauthenticated without
 // exposing it alongside application traffic.
