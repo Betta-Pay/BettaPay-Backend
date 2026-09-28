@@ -451,6 +451,17 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val > 0, {
         message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
       }),
+
+    // API gateway — IP-reputation auth threshold. The gateway keeps its own
+    // inline fallback of "20"; this entry makes a non-numeric value fail boot
+    // instead of coercing silently to NaN via parseInt.
+    AUTH_IP_THRESHOLD: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("20")
+      .refine((val) => Number.isFinite(val), {
+        message: "AUTH_IP_THRESHOLD must be a number",
+      }),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {

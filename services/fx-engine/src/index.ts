@@ -45,6 +45,7 @@ import {
   startMetricsServer,
   RateOverrideBody,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import {
   createHistoryQuerySchema,
@@ -837,6 +838,7 @@ export const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 // #386 — exponential backoff retry strategy
 const redisHealthState: import('@bettapay/validation').RedisHealthState = {
