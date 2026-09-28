@@ -1083,19 +1083,20 @@ fastify.post(
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
+          {
             startLedger,
             endLedger,
             fromLedger,
             toLedger,
             maxRange: MAX_REPLAY_LEDGER_RANGE,
           },
-        },
-      });
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay", { fromLedger, toLedger });
@@ -1129,13 +1130,14 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     // Validate that the contract ID is in the monitored list
     if (!CONTRACT_IDS.includes(contractId)) {
-      return reply.code(422).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Contract ID ${contractId} is not monitored by this indexer`,
-          details: { contractId, monitoredContracts: CONTRACT_IDS },
-        },
-      });
+      return reply.code(422).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Contract ID ${contractId} is not monitored by this indexer`,
+          { contractId, monitoredContracts: CONTRACT_IDS },
+          request.id,
+        ),
+      );
     }
 
     const parsedContractReplay = PerContractReplayBody.parse(request.body);
@@ -1144,19 +1146,20 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
+          {
             startLedger,
             endLedger,
             fromLedger: startLedger,
             toLedger: endLedger,
             maxRange: MAX_REPLAY_LEDGER_RANGE,
           },
-        },
-      });
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay-contract", {
@@ -1194,12 +1197,14 @@ fastify.get<{ Params: { jobId: string } }>(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
       if (!raw) {
-        return reply.code(404).send({
-          error: {
-            code: "NOT_FOUND",
-            message: `Replay job ${jobId} not found`,
-          },
-        });
+        return reply.code(404).send(
+          createErrorResponse(
+            ErrorCodes.NOT_FOUND,
+            `Replay job ${jobId} not found`,
+            undefined,
+            request.id,
+          ),
+        );
       }
       const progress = JSON.parse(raw);
       return { jobId, ...progress };
@@ -1208,12 +1213,14 @@ fastify.get<{ Params: { jobId: string } }>(
         { err, jobId },
         "[Indexer] Failed to read replay progress",
       );
-      return reply.code(500).send({
-        error: {
-          code: "INTERNAL_ERROR",
-          message: "Failed to read replay progress",
-        },
-      });
+      return reply.code(500).send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          "Failed to read replay progress",
+          undefined,
+          request.id,
+        ),
+      );
     }
   },
 );
