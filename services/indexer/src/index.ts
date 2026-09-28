@@ -68,6 +68,8 @@ import {
   isFeatureEnabled,
   logFeatureFlags,
   installCrashHandlers,
+  createErrorResponse,
+  ErrorCodes,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -1288,12 +1290,9 @@ fastify.delete<{ Params: { id: string } }>(
       where: { id },
     });
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+      );
     }
     await prisma.$transaction(async (tx) => {
       await tx.webhookSubscription.delete({ where: { id } });
@@ -1322,12 +1321,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
     });
 
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+      );
     }
 
     // #624: this route sits behind serviceAuth (any trusted internal caller,
@@ -1346,12 +1342,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       callerMerchantId &&
       existing.merchantId !== callerMerchantId
     ) {
-      return reply.code(403).send({
-        error: {
-          code: "FORBIDDEN",
-          message: "Cannot test webhook subscription owned by another merchant",
-        },
-      });
+      return reply.code(403).send(
+        createErrorResponse(ErrorCodes.FORBIDDEN, "Cannot test webhook subscription owned by another merchant"),
+      );
     }
 
     const payload = {
@@ -1470,9 +1463,9 @@ fastify.post<{ Params: { id: string } }>(
     const { id } = request.params;
     const job = await dlqQueue.getJob(id);
     if (!job) {
-      return reply.code(404).send({
-        error: { code: "NOT_FOUND", message: `DLQ job ${id} not found` },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `DLQ job ${id} not found`),
+      );
     }
 
     // Re-enqueue on the main webhook delivery queue. Custom headers

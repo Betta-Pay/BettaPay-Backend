@@ -275,6 +275,14 @@ const settlementDelayCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
+// Reconciliation status labels for metrics
+const RECONCILIATION_STATUS = {
+  UPSTREAM_ERROR: 'upstream_error',
+  CLEAN: 'clean',
+  DISCREPANCIES_FOUND: 'discrepancies_found',
+  ERROR: 'error',
+} as const;
+
 // Reconciliation metrics (#490)
 const reconciliationRunCounter = new promClient.Counter({
   name: 'settlement_reconciliation_runs_total',
@@ -855,7 +863,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
-      reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'upstream_error' });
+      reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: RECONCILIATION_STATUS.UPSTREAM_ERROR });
       return reply.code(504).send(
         createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
       );
@@ -1013,9 +1021,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;
 
     // Emit metrics (#490)
-    reconciliationRunCounter.inc({ 
-      merchant_id: merchantIdLabel, 
-      status: hasDiscrepancies ? 'discrepancies_found' : 'clean' 
+    reconciliationRunCounter.inc({
+      merchant_id: merchantIdLabel,
+      status: hasDiscrepancies ? RECONCILIATION_STATUS.DISCREPANCIES_FOUND : RECONCILIATION_STATUS.CLEAN
     });
 
     // Update discrepancy gauges
@@ -1119,7 +1127,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
-    reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
+    reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: RECONCILIATION_STATUS.ERROR });
     return reply.code(422).send(
       createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Reconciliation diff failed', undefined, request.id),
     );
@@ -1341,12 +1349,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation report error');
-    return reply.code(500).send({ 
-      error: { 
-        code: 'RECONCILIATION_ERROR', 
-        message: 'Failed to generate reconciliation report' 
-      } 
-    });
+    return reply.code(500).send(
+      createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to generate reconciliation report'),
+    );
   }
 });
 
