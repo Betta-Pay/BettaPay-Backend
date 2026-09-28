@@ -53,10 +53,12 @@ import {
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { startSettlementReaper } from './settlement-reaper.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';
+import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
+
+upstream/main
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -87,6 +89,7 @@ import {
   isValidTransition,
   propagateTracingHeaders,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -175,6 +178,7 @@ const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
@@ -432,8 +436,11 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
       await settlementQueue.add('process-settlement', job.data, {
         delay: requeueDelayMs,
-        attempts: job.opts.attempts,
-        backoff: job.opts.backoff,
+        priority: job.opts.priority,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2_000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
       });
       return;
     }
@@ -480,6 +487,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
+        traceId: job.data.traceId,
       });
     }
   } catch (error) {
@@ -497,6 +505,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId,
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
+        traceId: job.data.traceId,
         event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {
@@ -625,9 +634,9 @@ domainWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'Domain events worker error');
 });
 
-fastify.get('/api/health', async (_request, reply) => {
+fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
@@ -820,7 +829,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     });
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -905,8 +914,24 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       failed: 0,
     };
 
-    const merchants = await prisma.merchant.findMany({ select: { id: true } });
-    const existingMerchantIds = new Set(merchants.map(m => m.id));
+    const existingMerchantIds = new Set<string>();
+    let merchantCursor: string | undefined;
+    for (;;) {
+      const merchantPage = await prisma.merchant.findMany({
+        where: merchantCursor ? { id: { gt: merchantCursor } } : {},
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: 1000,
+      });
+      if (merchantPage.length === 0) break;
+
+      for (const merchant of merchantPage) {
+        existingMerchantIds.add(merchant.id);
+      }
+
+      merchantCursor = merchantPage[merchantPage.length - 1].id;
+      if (merchantPage.length < 1000) break;
+    }
 
     // Accumulate gateway totals for the summary
     for (const gr of gatewayRecords) {
@@ -1092,11 +1117,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
-    }
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
     reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
-    return reply.code(400).send({ error: 'Failed to perform reconciliation' });
+    return reply.code(422).send(
+      createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Reconciliation diff failed', undefined, request.id),
+    );
   }
 });
 
@@ -1152,7 +1178,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     }
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -1545,7 +1571,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {
@@ -1943,6 +1969,7 @@ batchWorker.on('failed', (job, err) => {
 // ============================================================================
 
 let isShuttingDown = false;
+let stopSettlementReaper: (() => Promise<void>) | undefined;
 
 async function gracefulShutdown(signal: string): Promise<void> {
   // Prevent multiple shutdown attempts
@@ -1961,6 +1988,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }, 30000);
 
   try {
+    await stopSettlementReaper?.();
+
     // 1. Close Fastify server (stops accepting new connections)
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
@@ -2052,6 +2081,7 @@ const start = async () => {
     startRedisMemoryMonitor(redis, fastify.log);
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    stopSettlementReaper = startSettlementReaper(prisma, settlementQueue, fastify.log);
     fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);

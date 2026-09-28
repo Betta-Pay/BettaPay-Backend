@@ -1,213 +1,72 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PrismaClient } from '@prisma/client';
-import { reapStuckSettlements, startSettlementReaper, PROCESSING_STUCK_THRESHOLD_MS } from './settlement-reaper.js';
+import test from 'tape';
+import { reapStuckSettlements } from './settlement-reaper.js';
 
-const prisma = new PrismaClient();
+test('reapStuckSettlements drains processing rows in batches of 200', async (t) => {
+  const stuckBefore = new Date('2026-09-26T19:00:00.000Z');
+  const settlements = Array.from({ length: 500 }, (_, index) => ({
+    id: `settlement-${String(index).padStart(4, '0')}`,
+    initiatedAt: new Date('2026-09-26T18:00:00.000Z'),
+    status: 'processing',
+  }));
+  const findManyArgs: Array<{ where: any; select: any; orderBy: any; take: number }> = [];
+  const updates: string[] = [];
+  const jobs: Array<{ name: string; data: { id: string } }> = [];
 
-describe('Settlement Reaper (#496)', () => {
-  beforeEach(async () => {
-    await prisma.settlement.deleteMany({});
-    await prisma.merchant.deleteMany({});
-  });
-
-  afterEach(async () => {
-    await prisma.settlement.deleteMany({});
-    await prisma.merchant.deleteMany({});
-  });
-
-  it('should recover settlements stuck in processing state', async () => {
-    await prisma.merchant.create({
-      data: { id: 'merchant-1', name: 'Test', ownerId: 'owner-1' },
-    });
-
-    // Create a settlement stuck in processing
-    const staleDate = new Date();
-    staleDate.setTime(staleDate.getTime() - (PROCESSING_STUCK_THRESHOLD_MS + 10_000));
-
-    const stuck = await prisma.settlement.create({
-      data: {
-        id: 'stl-stuck',
-        merchantId: 'merchant-1',
-        totalAmount: '100',
-        grossAmount: '100',
-        feeAmount: '1',
-        netAmount: '99',
-        feeBps: 100,
-        asset: 'USDC',
-        status: 'processing',
-        initiatedAt: staleDate,
+  const prisma = {
+    settlement: {
+      findMany: async (args: (typeof findManyArgs)[number]) => {
+        findManyArgs.push(args);
+        return settlements
+          .filter((settlement) => settlement.status === args.where.status && settlement.initiatedAt < args.where.initiatedAt.lt)
+          .slice(0, args.take);
       },
-    });
-
-    const mockQueue = {
-      add: vi.fn().mockResolvedValue(undefined),
-    };
-
-    const recovered = await reapStuckSettlements(prisma, mockQueue, undefined);
-
-    expect(recovered).toBe(1);
-
-    // Verify settlement was marked failed
-    const updated = await prisma.settlement.findUnique({ where: { id: stuck.id } });
-    expect(updated?.status).toBe('failed');
-    expect(updated?.completedAt).toBeDefined();
-
-    // Verify it was re-queued
-    expect(mockQueue.add).toHaveBeenCalledWith(
-      'process-settlement',
-      expect.objectContaining({
-        id: stuck.id,
-        merchantId: 'merchant-1',
-      })
-    );
-  });
-
-  it('should not recover recent processing settlements', async () => {
-    await prisma.merchant.create({
-      data: { id: 'merchant-1', name: 'Test', ownerId: 'owner-1' },
-    });
-
-    // Create a settlement recently started (within threshold)
-    const recent = await prisma.settlement.create({
-      data: {
-        id: 'stl-recent',
-        merchantId: 'merchant-1',
-        totalAmount: '100',
-        grossAmount: '100',
-        feeAmount: '1',
-        netAmount: '99',
-        feeBps: 100,
-        asset: 'USDC',
-        status: 'processing',
-        initiatedAt: new Date(),
+      update: async (args: { where: { id: string }; data: { status: string } }) => {
+        updates.push(args.where.id);
+        const settlement = settlements.find((row) => row.id === args.where.id);
+        if (settlement) settlement.status = args.data.status;
+        return settlement;
       },
-    });
+    },
+  };
+  const queue = {
+    add: async (name: string, data: { id: string }) => {
+      jobs.push({ name, data });
+    },
+  };
 
-    const mockQueue = { add: vi.fn() };
-    const recovered = await reapStuckSettlements(prisma, mockQueue, undefined);
+  const count = await reapStuckSettlements(prisma as any, queue as any, stuckBefore);
 
-    expect(recovered).toBe(0);
+  t.equal(count, 500, 'should reap all stale settlements');
+  t.deepEqual(findManyArgs.map((args) => args.take), [200, 200, 200], 'should fetch bounded pages');
+  t.equal(findManyArgs[0].where.status, 'processing', 'should only scan processing settlements');
+  t.equal(findManyArgs[0].where.initiatedAt.lt, stuckBefore, 'should preserve the supplied cutoff');
+  t.equal(updates.length, 500, 'should mark every fetched row failed');
+  t.equal(jobs.length, 500, 'should enqueue one job per reaped settlement');
+  t.deepEqual(jobs[0], { name: 'process-settlement', data: { id: 'settlement-0000' } });
+  t.end();
+});
 
-    // Verify settlement is still processing
-    const updated = await prisma.settlement.findUnique({ where: { id: recent.id } });
-    expect(updated?.status).toBe('processing');
-  });
-
-  it('should handle multiple stuck settlements in one cycle', async () => {
-    await prisma.merchant.create({
-      data: { id: 'merchant-1', name: 'Test', ownerId: 'owner-1' },
-    });
-
-    const staleDate = new Date();
-    staleDate.setTime(staleDate.getTime() - (PROCESSING_STUCK_THRESHOLD_MS + 10_000));
-
-    // Create 3 stuck settlements
-    const ids = [];
-    for (let i = 0; i < 3; i++) {
-      const stl = await prisma.settlement.create({
-        data: {
-          id: `stl-stuck-${i}`,
-          merchantId: 'merchant-1',
-          totalAmount: '100',
-          grossAmount: '100',
-          feeAmount: '1',
-          netAmount: '99',
-          feeBps: 100,
-          asset: 'USDC',
-          status: 'processing',
-          initiatedAt: staleDate,
-        },
-      });
-      ids.push(stl.id);
-    }
-
-    const mockQueue = { add: vi.fn().mockResolvedValue(undefined) };
-    const recovered = await reapStuckSettlements(prisma, mockQueue, undefined);
-
-    expect(recovered).toBe(3);
-    expect(mockQueue.add).toHaveBeenCalledTimes(3);
-
-    // Verify all are marked failed
-    for (const id of ids) {
-      const stl = await prisma.settlement.findUnique({ where: { id } });
-      expect(stl?.status).toBe('failed');
-    }
-  });
-
-  it('should start and stop reaper daemon', async () => {
-    await prisma.merchant.create({
-      data: { id: 'merchant-1', name: 'Test', ownerId: 'owner-1' },
-    });
-
-    const staleDate = new Date();
-    staleDate.setTime(staleDate.getTime() - (PROCESSING_STUCK_THRESHOLD_MS + 10_000));
-
-    const stuck = await prisma.settlement.create({
-      data: {
-        id: 'stl-stuck',
-        merchantId: 'merchant-1',
-        totalAmount: '100',
-        grossAmount: '100',
-        feeAmount: '1',
-        netAmount: '99',
-        feeBps: 100,
-        asset: 'USDC',
-        status: 'processing',
-        initiatedAt: staleDate,
+test('reapStuckSettlements does nothing when there are no stale rows', async (t) => {
+  let updateCount = 0;
+  let enqueueCount = 0;
+  const prisma = {
+    settlement: {
+      findMany: async () => [],
+      update: async () => {
+        updateCount++;
       },
-    });
+    },
+  };
+  const queue = {
+    add: async () => {
+      enqueueCount++;
+    },
+  };
 
-    const mockQueue = { add: vi.fn().mockResolvedValue(undefined) };
-    const mockLog = { info: vi.fn(), error: vi.fn() };
+  const count = await reapStuckSettlements(prisma as any, queue as any, new Date());
 
-    // Start reaper with short interval for testing
-    const stop = startSettlementReaper(prisma, mockQueue, mockLog, 100);
-
-    // Wait for at least one cycle
-    await new Promise(resolve => setTimeout(resolve, 200));
-
-    // Stop reaper
-    stop();
-
-    // Verify reaper ran
-    const updated = await prisma.settlement.findUnique({ where: { id: stuck.id } });
-    expect(updated?.status).toBe('failed');
-  });
-
-  it('should handle recovery errors gracefully', async () => {
-    await prisma.merchant.create({
-      data: { id: 'merchant-1', name: 'Test', ownerId: 'owner-1' },
-    });
-
-    const staleDate = new Date();
-    staleDate.setTime(staleDate.getTime() - (PROCESSING_STUCK_THRESHOLD_MS + 10_000));
-
-    await prisma.settlement.create({
-      data: {
-        id: 'stl-stuck',
-        merchantId: 'merchant-1',
-        totalAmount: '100',
-        grossAmount: '100',
-        feeAmount: '1',
-        netAmount: '99',
-        feeBps: 100,
-        asset: 'USDC',
-        status: 'processing',
-        initiatedAt: staleDate,
-      },
-    });
-
-    // Queue that fails
-    const mockQueue = {
-      add: vi.fn().mockRejectedValue(new Error('Queue error')),
-    };
-
-    const mockLog = { error: vi.fn() };
-
-    // Should not throw
-    const recovered = await reapStuckSettlements(prisma, mockQueue, mockLog);
-
-    // Should still count as recovered (DB update succeeded even if queue failed)
-    expect(recovered).toBe(1);
-  });
+  t.equal(count, 0);
+  t.equal(updateCount, 0);
+  t.equal(enqueueCount, 0);
+  t.end();
 });

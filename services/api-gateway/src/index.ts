@@ -61,6 +61,7 @@ import {
   decryptSensitiveFields,
   createValidationContext,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -116,7 +117,7 @@ import {
 import type { Merchant } from "@prisma/client";
 import type { ApiResponse, PaginatedResponse } from "@bettapay/shared-types";
 import { buildPaginationMeta } from "@bettapay/shared-types";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -144,7 +145,7 @@ import {
 import { Queue } from "bullmq";
 import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
-import { MerchantCache, getCachedMerchant } from "../../shared/validation/merchant-cache.js";
+import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
 declare module "fastify" {
   export interface FastifyInstance {
@@ -1481,7 +1482,9 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     await recordAuthIpFailure(request);
     return reply
       .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .send(
+        createErrorResponse('CHALLENGE_REUSED', 'Wallet challenge already used', undefined, request.id),
+      );
   }
 
   if (Date.now() > stored.expiresAt) {
@@ -1494,8 +1497,10 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   if (stored.address !== d.address) {
     await recordAuthIpFailure(request);
     return reply
-      .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .code(400)
+      .send(
+        createErrorResponse('CHALLENGE_MISMATCH', 'Wallet challenge mismatch', undefined, request.id),
+      );
   }
 
   // If the client echoed a challenge, it must be the one we issued.
@@ -2094,23 +2099,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: cancel initiated payments
         try {
-          const initiatedPayments = await tx.payment.findMany({
+          const cancelled = await tx.payment.updateMany({
             where: { merchantId: id, status: "initiated" },
+            data: { status: "cancelled" },
           });
-          for (const payment of initiatedPayments) {
-            const cancelled = await tx.payment.update({
-              where: { id: payment.id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              payment.id,
-              { before: payment, after: cancelled },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "payments.bulk-cancelled",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: cancelled.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2120,23 +2120,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: fail pending settlements
         try {
-          const pendingSettlements = await tx.settlement.findMany({
+          const failed = await tx.settlement.updateMany({
             where: { merchantId: id, status: "pending" },
+            data: { status: "failed", completedAt: new Date() },
           });
-          for (const settlement of pendingSettlements) {
-            const failed = await tx.settlement.update({
-              where: { id: settlement.id },
-              data: { status: "failed", completedAt: new Date() },
-            });
-            await logAuditEvent(
-              "settlement.status.changed",
-              "settlement",
-              settlement.id,
-              { before: settlement, after: failed },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "settlements.bulk-failed",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: failed.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2202,10 +2197,19 @@ fastify.get('/api/admin/auth/ip-score', {
       status === "suspended"
         ? "Merchant is already suspended"
         : "Merchant is already active";
+    // Retry-safe no-op: the merchant is already in the requested state, so
+    // there is nothing to write and no audit event to emit. Uses a dedicated
+    // code so operators can distinguish it from a malformed request; 409 is
+    // preserved.
     if (merchant.status === status)
       return {
         code: 409 as const,
-        body: createErrorResponse(ErrorCodes.INVALID_REQUEST, conflictMessage),
+        body: createErrorResponse(
+          ErrorCodes.MERCHANT_STATE_CONFLICT,
+          conflictMessage,
+          { current: merchant.status },
+          request.id,
+        ),
       };
 
     await prisma.$transaction(async (tx) => {
@@ -2504,30 +2508,48 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      const payment = await prisma.$transaction(async (tx) => {
-        const created = await tx.payment.create({
-          data: {
-            id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
-            merchantId: d.merchantId,
-            payerId: d.payerId,
-            amount: d.amount,
-            asset: d.asset,
-            reference: d.reference,
-            status: "initiated",
-            idempotencyKey: idempotencyKey ?? undefined,
-            idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-          },
+      let payment;
+      try {
+        payment = await prisma.$transaction(async (tx) => {
+          const created = await tx.payment.create({
+            data: {
+              id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
+              merchantId: d.merchantId,
+              payerId: d.payerId,
+              amount: d.amount,
+              asset: d.asset,
+              reference: d.reference,
+              status: "initiated",
+              idempotencyKey: idempotencyKey ?? undefined,
+              idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+            },
+          });
+          await logAuditEvent(
+            "payment.created",
+            "payment",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "payment.created",
-          "payment",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
+      } catch (err: unknown) {
+        if (
+          idempotencyKey !== null &&
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        ) {
+          const raced = await prisma.payment.findFirst({
+            where: { idempotencyKey, idempotencyKeyExpiresAt: { gt: new Date() } },
+          });
+          if (raced) {
+            request.log.info({ idempotencyKey, paymentId: raced.id }, "Idempotency race lost — returning winner");
+            return reply.code(200).send({ data: raced });
+          }
+        }
+        throw err;
+      }
 
       request.log.info(
         { idempotencyKey, paymentId: payment.id },
@@ -3027,25 +3049,14 @@ fastify.get('/api/admin/auth/ip-score', {
         (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
       // #319 — Validate each asset against SupportedAsset table
-      // #743 — Cache the allowlist with a 5-minute TTL to avoid re-reading
-      // the reference table on every settlement-create call.
-      let assetSet: Set<string>;
-      const cachedCodes = await redis
-        .get("supported-asset-codes")
-        .catch(() => null);
-      if (cachedCodes) {
-        assetSet = new Set<string>(JSON.parse(cachedCodes) as string[]);
-      } else {
-        const codes = (
-          await prisma.supportedAsset.findMany({
-            select: { code: true },
-          })
-        ).map((a) => a.code);
-        assetSet = new Set<string>(codes);
-        await redis
-          .set("supported-asset-codes", JSON.stringify([...assetSet]), "EX", 300)
-          .catch(() => {});
-      }
+      // #716 — Collapse per-item lookups into a single findMany for the
+      // distinct batch codes (one query regardless of item count).
+      const codes = [...new Set(items.map((item: any) => item.asset))];
+      const assets = await prisma.supportedAsset.findMany({
+        where: { code: { in: codes } },
+        select: { code: true },
+      });
+      const assetSet = new Set<string>(assets.map((a) => a.code));
 
       for (const item of items) {
         if (!assetSet.has(item.asset)) {
@@ -3686,6 +3697,7 @@ const isDirectRun = Boolean(
 );
 if (isDirectRun) {
   mainApp = buildApp();
+  installCrashHandlers(mainApp.log);
 
   // Served on its own port (see startMetricsServer), not the application
   // port — keeps the scrape endpoint unauthenticated without exposing it

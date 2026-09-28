@@ -7,7 +7,7 @@
 // Worker job timeout — maximum duration a settlement job can run before
 // being forcefully terminated. Must be at least 5s (minimum realistic processing time)
 // and at most 5m (to prevent hung jobs from blocking the queue indefinitely).
-export const SETTLEMENT_JOB_TIMEOUT_MS = 30_000; // 30 seconds, within [5_000, 300_000]
+export const SETTLEMENT_JOB_TIMEOUT_MS = Number(process.env.SETTLEMENT_JOB_TIMEOUT_MS ?? 30_000); // 30s default, within [5_000, 300_000]
 
 // Processing state timeout — maximum duration a settlement can remain in
 // 'processing' state before the reaper considers it stuck. Configured with a

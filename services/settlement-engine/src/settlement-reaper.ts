@@ -1,116 +1,72 @@
+import type { FastifyLoggerInstance } from 'fastify';
+import type { Queue } from 'bullmq';
 import type { PrismaClient } from '@prisma/client';
 
-/**
- * Issue #496: Worker crash mid-process leaves settlement in ambiguous state
- *
- * The reaper periodically scans for settlements stuck in 'processing' state
- * and either finalizes them or fails with retry. This handles the scenario where
- * a worker crashes after transitioning to 'processing' but before completion.
- *
- * Recovery strategy:
- * - If a settlement has been processing > PROCESSING_TIMEOUT_MS, consider it stuck
- * - On recovery, either mark it completed (if possible) or failed (with retry queuing)
- */
-
-export const PROCESSING_STUCK_THRESHOLD_MS = 2 * 30_000; // 60 seconds
+const REAP_BATCH = 200;
+const REAPER_INTERVAL_MS = 5 * 60 * 1000;
+const STUCK_AFTER_MS = 30 * 60 * 1000;
 
 export async function reapStuckSettlements(
   prisma: PrismaClient,
-  queue: any,
-  log: any,
-  thresholdMs: number = PROCESSING_STUCK_THRESHOLD_MS,
+  queue: Queue,
+  stuckBefore = new Date(Date.now() - STUCK_AFTER_MS),
 ): Promise<number> {
-  const now = new Date();
-  const thresholdDate = new Date(now.getTime() - thresholdMs);
+  let reapedCount = 0;
 
-  // Find settlements stuck in processing
-  const stuck = await prisma.settlement.findMany({
-    where: {
-      status: 'processing',
-      initiatedAt: { lte: thresholdDate },
-    },
-    select: { id: true, merchantId: true, grossAmount: true, asset: true },
-  });
+  for (;;) {
+    const stuck = await prisma.settlement.findMany({
+      where: { status: 'processing', initiatedAt: { lt: stuckBefore } },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: REAP_BATCH,
+    });
+    if (stuck.length === 0) break;
 
-  if (stuck.length === 0) {
-    return 0;
-  }
-
-  let recovered = 0;
-
-  for (const settlement of stuck) {
-    try {
-      // Try to recover by marking as failed and re-queuing
-      const updated = await prisma.settlement.update({
-        where: { id: settlement.id },
-        data: { status: 'failed', completedAt: new Date() },
+    for (const row of stuck) {
+      await prisma.settlement.update({
+        where: { id: row.id },
+        data: { status: 'failed' },
       });
-
-      // Re-queue for retry
-      if (queue) {
-        await queue.add('process-settlement', {
-          id: settlement.id,
-          merchantId: settlement.merchantId,
-          grossAmount: settlement.grossAmount,
-          asset: settlement.asset,
-        });
-      }
-
-      recovered++;
-
-      if (log) {
-        log.warn({
-          settlementId: settlement.id,
-          merchantId: settlement.merchantId,
-          thresholdMs,
-        }, 'Recovered stuck settlement: marked failed and re-queued');
-      }
-    } catch (err) {
-      if (log) {
-        log.error({
-          err,
-          settlementId: settlement.id,
-          merchantId: settlement.merchantId,
-        }, 'Failed to recover stuck settlement');
-      }
+      await queue.add('process-settlement', { id: row.id });
+      reapedCount++;
     }
+
+    if (stuck.length < REAP_BATCH) break;
   }
 
-  return recovered;
+  return reapedCount;
 }
 
-/**
- * Start the reaper daemon that periodically scans for stuck settlements.
- * Returns a function to stop the reaper.
- */
 export function startSettlementReaper(
   prisma: PrismaClient,
-  queue: any,
-  log: any,
-  intervalMs: number = 10_000,
-): () => void {
-  let timer: NodeJS.Timeout | undefined;
+  queue: Queue,
+  logger: FastifyLoggerInstance,
+): () => Promise<void> {
+  let inFlight: Promise<void> | undefined;
 
-  const run = async () => {
-    try {
-      const recovered = await reapStuckSettlements(prisma, queue, log);
-      if (recovered > 0 && log) {
-        log.info({ recovered }, 'Settlement reaper cycle completed');
-      }
-    } catch (err) {
-      if (log) {
-        log.error({ err }, 'Settlement reaper cycle failed');
-      }
+  const interval = setInterval(() => {
+    if (inFlight) {
+      logger.warn({ intervalMs: REAPER_INTERVAL_MS }, 'Skipping settlement reaper tick while a prior run is still active');
+      return;
     }
-  };
 
-  // Run once immediately
-  run().catch(() => {});
+    const stuckBefore = new Date(Date.now() - STUCK_AFTER_MS);
+    inFlight = reapStuckSettlements(prisma, queue, stuckBefore)
+      .then((reapedCount) => {
+        if (reapedCount > 0) {
+          logger.info({ reapedCount, stuckBefore: stuckBefore.toISOString() }, 'Reaped stuck settlements');
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, 'Settlement reaper failed');
+      })
+      .finally(() => {
+        inFlight = undefined;
+      });
+  }, REAPER_INTERVAL_MS);
 
-  // Then run periodically
-  timer = setInterval(run, intervalMs);
-
-  return () => {
-    if (timer) clearInterval(timer);
+  return async () => {
+    clearInterval(interval);
+    await inFlight;
   };
 }

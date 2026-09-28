@@ -67,13 +67,14 @@ import {
   anchorSettledEvent,
   isFeatureEnabled,
   logFeatureFlags,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
 import * as promClient from "prom-client";
 
 export const env = validateEnvOrExit(process.env);
-const PORT = Number(process.env.PORT ?? "3000");
+const PORT = Number(process.env.PORT ?? "3003");
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
@@ -82,8 +83,13 @@ import rateLimit from "@fastify/rate-limit";
 
 const fastifyInstance = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
+  // Explicit 1MB cap. Fastify's default is 1MB but the implicit value is not
+  // visible at the call site; stated explicitly so the limit is auditable and
+  // matches the other services.
+  bodyLimit: 1_048_576,
 });
 export const fastify = fastifyInstance;
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(
@@ -920,11 +926,12 @@ async function flushIndexedEvents(
 // definitions below so Fastify's onRoute hook sees all of them.
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", async (_request, reply) => {
-  const health = await buildIndexerHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
+  const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
     redisHealthState,
+
+    
     getQueueJobCounts: () => webhookQueue.getJobCounts(),
     getQueueIsPaused: () => webhookQueue.isPaused(),
     getLatestLedger: () => server.getLatestLedger(),
@@ -1378,7 +1385,12 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       connection: sharedRedis,
     });
     try {
-      await job.waitUntilFinished(queueEvents);
+      const finished = await Promise.race([
+        job.waitUntilFinished(queueEvents),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
+        ),
+      ]);
 
       const testedAt = new Date();
       await prisma.webhookSubscription.update({
