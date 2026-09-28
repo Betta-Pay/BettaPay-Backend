@@ -48,25 +48,25 @@ test('GET /api/health/live always returns 200 (liveness probe)', async () => {
 
 test('GET /api/health returns 503 when critical dependents fail (readiness probe)', async () => {
   const prisma = createMockPrisma() as any;
-
-  const fetchImpl = async (url: string | URL | Request) => {
-    throw new Error('upstream unreachable');
+  prisma.$queryRaw = async () => {
+    throw new Error('database connection failed');
   };
 
   const app = buildApp({
     prisma,
     logger: false,
-    fetchImpl: fetchImpl as any
   });
 
-  const res = await app.inject({ method: 'GET', url: '/api/health' });
-  assert.equal(res.statusCode, 503);
+  try {
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    assert.equal(res.statusCode, 503);
 
-  const body = JSON.parse(res.body);
-  assert.equal(body.status, 'unhealthy');
-  assert.equal(body.service, 'api-gateway');
-
-  await app.close();
+    const body = JSON.parse(res.body);
+    assert.equal(body.status, 'unhealthy');
+    assert.equal(body.service, 'api-gateway');
+  } finally {
+    await app.close();
+  }
 });
 
 test('GET /api/health/all aggregates downstream health with graceful degradation', async () => {

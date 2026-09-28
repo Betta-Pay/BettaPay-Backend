@@ -295,6 +295,8 @@ export const DependencyHealth = z.object({
   name: z.string(),
   status: DependencyConnectionStatus,
   latencyMs: z.number().optional(),
+  healthy: z.boolean().optional(),
+  serverVersion: z.string().nullable().optional(),
   details: z.record(z.unknown()).optional(),
 });
 export type DependencyHealth = z.infer<typeof DependencyHealth>;
@@ -307,6 +309,12 @@ export const HealthResponse = z.object({
   lastDependencyCheck: z.string(),
   dependencies: z.array(DependencyHealth),
   upstream: z.array(DependencyHealth).optional(),
+  business: z
+    .object({
+      abandonedPayments: z.number().int().nonnegative(),
+    })
+    .optional()
+    .describe("Non-critical telemetry; absent in test env"),
 });
 export type HealthResponse = z.infer<typeof HealthResponse>;
 
@@ -413,8 +421,10 @@ export const CreatePaymentBody = z
     amount: AmountString,
     asset: CurrencyCode,
     convertTo: CurrencyCode.optional(),
-    payerId: z.string().optional(),
-    reference: z.string().optional(),
+    // #763 — free-form optionals previously relied on the global trim with no
+    // length caps, so oversized strings hit DB limits as 500s instead of 400s.
+    payerId: z.string().max(128, "payerId must not exceed 128 characters").optional(),
+    reference: z.string().max(255, "reference must not exceed 255 characters").optional(),
     idempotencyKey: IdempotencyKeySchema.optional(),
   })
   .superRefine((data, ctx) => addAmountPrecisionIssue(data.amount, data.asset, ctx));

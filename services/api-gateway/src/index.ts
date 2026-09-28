@@ -60,6 +60,8 @@ import {
   encryptSensitiveFields,
   decryptSensitiveFields,
   createValidationContext,
+  auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -115,11 +117,16 @@ import {
 import type { Merchant } from "@prisma/client";
 import type { ApiResponse, PaginatedResponse } from "@bettapay/shared-types";
 import { buildPaginationMeta } from "@bettapay/shared-types";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { fetchUpstream, UpstreamTimeoutError, SsrfRejectedError, validateUpstreamUrl } from "./upstream-fetch.js";
+import {
+  CONNECTION_TIMEOUT_MS,
+  GATEWAY_TIMEOUT_CONFIG,
+  REQUEST_TIMEOUT_MS,
+} from "./timeout-config.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
@@ -136,7 +143,9 @@ import {
   type WebhookJobData,
 } from "@bettapay/webhook-delivery";
 import { Queue } from "bullmq";
+import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
+import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
 declare module "fastify" {
   export interface FastifyInstance {
@@ -146,6 +155,13 @@ declare module "fastify" {
     ) => Promise<void>;
   }
 }
+
+// Set by the auth rejection paths so the onResponse audit hook (#665) can
+// persist a queryable row for every authentication failure. Modelled as an
+// intersection rather than a FastifyRequest augmentation: Fastify's request
+// interface is generic, and merging a non-generic declaration into it is an
+// error.
+type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -232,9 +248,6 @@ const SERVICE_VERSION = readServiceVersion(import.meta.url);
 // IMPORTANT: keep both values BELOW any upstream load balancer / reverse proxy
 // idle timeout (commonly 60s) so this gateway returns a clean 408 rather than
 // the load balancer cutting the connection first.
-const REQUEST_TIMEOUT_MS = 30_000;
-const CONNECTION_TIMEOUT_MS = 31_000;
-
 // --- App Factory & Configuration Options ------------------------------------
 export interface AppOptions {
   prisma?: PrismaClient;
@@ -242,6 +255,7 @@ export interface AppOptions {
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
   redis?: ReturnType<typeof createRedisClient>;
+  domainEventsQueue?: Queue | { add: (...args: any[]) => Promise<any> };
   logger?: any;
   fetchImpl?: typeof fetch;
   interServiceSecret?: string | string[];
@@ -280,6 +294,10 @@ export function getDefaultPrisma(): PrismaClient {
   }
   return defaultPrisma;
 }
+
+// Merchant cache: avoids repeated DB reads for the same merchant during
+// a single payment creation request (#740).
+const merchantCache = new MerchantCache();
 
 // Set by buildApp() when it creates the app's Redis client — shutdown()/start()
 // (defined after buildApp, at module scope) need it but don't have their own
@@ -512,6 +530,10 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   fastify.addHook("onSend", async (_request, reply, _payload) => {
+    reply.header(
+      GATEWAY_TIMEOUT_CONFIG.responseHeader,
+      String(GATEWAY_TIMEOUT_CONFIG.requestTimeoutMs),
+    );
     if (!reply.getHeader("permissions-policy")) {
       reply.header(
         "Permissions-Policy",
@@ -519,6 +541,12 @@ export function buildApp(opts: AppOptions = {}) {
       );
     }
   });
+
+  if (env.ALLOWED_ORIGINS.includes('*')) {
+    throw new Error(
+      'CORS misconfiguration: ALLOWED_ORIGINS cannot contain "*" when credentials are enabled.',
+    );
+  }
 
   fastify.register(cors, {
     origin: env.ALLOWED_ORIGINS,
@@ -531,6 +559,21 @@ export function buildApp(opts: AppOptions = {}) {
       expiresIn: env.JWT_EXPIRES_IN,
     },
   });
+
+  fastify.register(swagger, {
+    openapi: {
+      info: { title: "BettaPay API", version: SERVICE_VERSION },
+      servers: [{ url: "http://localhost:3000" }],
+    },
+  });
+
+  fastify.get(
+    "/api/docs/json",
+    {
+      config: { rateLimit: false },
+    },
+    async (_req, reply) => reply.send(fastify.swagger()),
+  );
 
   // Rate limiting: global default and route overrides.
   // Issue #559 — the primary bucket is keyed per authenticated merchant
@@ -872,6 +915,13 @@ export function buildApp(opts: AppOptions = {}) {
     }
   }
 
+  // Flags a request as an authentication rejection so the onResponse audit
+  // hook (#665) can persist a queryable row. Only the fact of the rejection is
+  // recorded downstream — never the credential that caused it.
+  function markAuthRejected(request: FastifyRequest): void {
+    (request as AuthFailureMarkedRequest).authFailed = true;
+  }
+
   // Authentication hook — verifies the JWT, rejects revoked tokens (jti
   // blocklist), and keeps the per-merchant session index fresh.
   fastify.decorate(
@@ -881,12 +931,14 @@ export function buildApp(opts: AppOptions = {}) {
         await request.jwtVerify();
         const payload = request.user as MerchantJwtPayload;
         if (payload.jti && (await isJtiRevoked(payload.jti))) {
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
         }
       } catch (err) {
         request.log.error(err);
+        markAuthRejected(request);
         return reply
           .code(401)
           .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -905,6 +957,7 @@ export function buildApp(opts: AppOptions = {}) {
             { jti, merchantId },
             "[Auth] JWT session missing or revoked",
           );
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -992,6 +1045,35 @@ export function buildApp(opts: AppOptions = {}) {
   // Zod validation runs inside route handlers after this global preHandler, so
   // schemas receive trimmed, control-character-free, NFC-normalized strings.
 
+  auditRouteAuthPolicy(fastify);
+
+  // Persist authentication rejections to the audit log (#665). Auth probing was
+  // log-only, so security review had no queryable rejection history; this adds
+  // one without ever changing what the caller sees.
+  //
+  // Best-effort end to end: `logAuditEvent` already swallows DB errors, and the
+  // explicit catch guarantees an audit-layer problem can never surface on the
+  // response path. No tokens, headers, cookies or query strings are recorded —
+  // only the route, the caller's IP reputation score and the timestamp (ip and
+  // createdAt are filled in by the audit logger itself).
+  fastify.addHook("onResponse", async (request, reply) => {
+    const rejected = (request as AuthFailureMarkedRequest).authFailed === true;
+    if (!rejected && reply.statusCode !== 401) return;
+
+    // Route pattern (e.g. "/api/auth/refresh") rather than the raw URL, so
+    // rejections group by endpoint and no query-string credential is stored.
+    const path = request.routeOptions?.url ?? request.url.split("?")[0];
+    const ipReputationScore = await getAuthIpScore(request.ip);
+
+    await logAuditEvent(
+      "auth.rejected",
+      "request",
+      request.id,
+      { path, method: request.method, ipReputationScore, rejectedAt: new Date().toISOString() },
+      request,
+    ).catch(() => null);
+  });
+
   // Routes
   registerGatewayHealthRoutes({
     fastify,
@@ -1008,12 +1090,31 @@ export function buildApp(opts: AppOptions = {}) {
 
   // --- Wallet Auth Challenge Store ----------------------------------------------
   // #386 — exponential backoff retry strategy
-  const redis = createRedisClient(env.REDIS_URL, fastify.log);
+  const redis = opts.redis ?? createRedisClient(env.REDIS_URL, fastify.log);
   sharedRedis = redis;
+
+  const domainEvents =
+    opts.domainEventsQueue ??
+    new Queue("domain-events", { connection: redis });
+
+  if (typeof (domainEvents as any)?.on === "function") {
+    (domainEvents as any).on("error", (err: unknown) => {
+      fastify.log.warn({ err }, "domain-events queue error (non-fatal)");
+    });
+  }
+  if ((domainEvents as any)?.connection) {
+    (domainEvents as any).connection.on("error", () => {});
+  }
 
   // Release the Redis connection when the app closes so tests (and workers)
   // don't leak sockets and hang the process.
   fastify.addHook("onClose", async () => {
+    if (typeof (domainEvents as any)?.close === "function") {
+      await (domainEvents as any).close().catch(() => {});
+      if ((domainEvents as any)?.connection) {
+        (domainEvents as any).connection.on("error", () => {});
+      }
+    }
     await redis.quit().catch(() => {});
     redis.disconnect();
   });
@@ -1307,23 +1408,27 @@ export function buildApp(opts: AppOptions = {}) {
   } catch (err) {
     request.log.error(err);
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const payload = request.user as MerchantJwtPayload;
   if (!payload.merchantId || !payload.ownerId || !payload.jti || !payload.exp) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   if (await isJtiRevoked(payload.jti)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const remainingLifetime = payload.exp - Math.floor(Date.now() / 1000);
   if (remainingLifetime <= 0) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
@@ -1363,21 +1468,39 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     stored = await consumeWalletChallenge(redis, d.address);
   } catch (err) {
     request.log.error({ err }, 'Failed to read wallet challenge from Redis');
-    return reply.code(503).send({ error: 'Authentication service unavailable' });
+    return reply
+      .code(503)
+      .send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          'Authentication service unavailable',
+        ),
+      );
   }
 
   if (!stored) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .send(
+        createErrorResponse('CHALLENGE_REUSED', 'Wallet challenge already used', undefined, request.id),
+      );
   }
 
-  if (stored.address !== d.address || Date.now() > stored.expiresAt) {
+  if (Date.now() > stored.expiresAt) {
     await recordAuthIpFailure(request);
     return reply
-      .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .code(400)
+      .send(createErrorResponse("CHALLENGE_EXPIRED", 'Challenge expired'));
+  }
+
+  if (stored.address !== d.address) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(400)
+      .send(
+        createErrorResponse('CHALLENGE_MISMATCH', 'Wallet challenge mismatch', undefined, request.id),
+      );
   }
 
   // If the client echoed a challenge, it must be the one we issued.
@@ -1391,6 +1514,7 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   // Verify against the *stored* challenge string, never the client-supplied one.
   if (!verifyWalletSignature(d.address, stored.challenge, d.signature)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
 
@@ -1975,23 +2099,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: cancel initiated payments
         try {
-          const initiatedPayments = await tx.payment.findMany({
+          const cancelled = await tx.payment.updateMany({
             where: { merchantId: id, status: "initiated" },
+            data: { status: "cancelled" },
           });
-          for (const payment of initiatedPayments) {
-            const cancelled = await tx.payment.update({
-              where: { id: payment.id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              payment.id,
-              { before: payment, after: cancelled },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "payments.bulk-cancelled",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: cancelled.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2001,23 +2120,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: fail pending settlements
         try {
-          const pendingSettlements = await tx.settlement.findMany({
+          const failed = await tx.settlement.updateMany({
             where: { merchantId: id, status: "pending" },
+            data: { status: "failed", completedAt: new Date() },
           });
-          for (const settlement of pendingSettlements) {
-            const failed = await tx.settlement.update({
-              where: { id: settlement.id },
-              data: { status: "failed", completedAt: new Date() },
-            });
-            await logAuditEvent(
-              "settlement.status.changed",
-              "settlement",
-              settlement.id,
-              { before: settlement, after: failed },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "settlements.bulk-failed",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: failed.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2083,10 +2197,19 @@ fastify.get('/api/admin/auth/ip-score', {
       status === "suspended"
         ? "Merchant is already suspended"
         : "Merchant is already active";
+    // Retry-safe no-op: the merchant is already in the requested state, so
+    // there is nothing to write and no audit event to emit. Uses a dedicated
+    // code so operators can distinguish it from a malformed request; 409 is
+    // preserved.
     if (merchant.status === status)
       return {
         code: 409 as const,
-        body: createErrorResponse(ErrorCodes.INVALID_REQUEST, conflictMessage),
+        body: createErrorResponse(
+          ErrorCodes.MERCHANT_STATE_CONFLICT,
+          conflictMessage,
+          { current: merchant.status },
+          request.id,
+        ),
       };
 
     await prisma.$transaction(async (tx) => {
@@ -2102,6 +2225,13 @@ fastify.get('/api/admin/auth/ip-score', {
         request,
         tx as unknown as Parameters<typeof logAuditEvent>[5],
       );
+    });
+    merchantCache.invalidate(id);
+
+    // #744 — Invalidate cached merchant data so the suspended/unsuspended
+    // status is visible to read paths immediately.
+    await redis.del(`merchant:${id}`).catch((err: unknown) => {
+      request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
     });
 
     const updated = await prisma.merchant.findUnique({ where: { id } });
@@ -2195,6 +2325,13 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         return merchantUpdate;
       });
+      merchantCache.invalidate(id);
+
+      // #744 — Invalidate cached merchant data so updated settings are
+      // visible to read paths immediately.
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
+      });
 
       return reply.code(200).send({ data: { merchant: updated } });
     },
@@ -2282,9 +2419,11 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
-      const merchant = await prisma.merchant.findFirst({
-        where: { id: d.merchantId, deletedAt: null },
-      });
+      const merchant = await getCachedMerchant(
+        d.merchantId,
+        merchantCache,
+        (id) => prisma.merchant.findFirst({ where: { id, deletedAt: null } }),
+      );
       if (!merchant) {
         return reply
           .code(404)
@@ -2369,30 +2508,48 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      const payment = await prisma.$transaction(async (tx) => {
-        const created = await tx.payment.create({
-          data: {
-            id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
-            merchantId: d.merchantId,
-            payerId: d.payerId,
-            amount: d.amount,
-            asset: d.asset,
-            reference: d.reference,
-            status: "initiated",
-            idempotencyKey: idempotencyKey ?? undefined,
-            idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-          },
+      let payment;
+      try {
+        payment = await prisma.$transaction(async (tx) => {
+          const created = await tx.payment.create({
+            data: {
+              id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
+              merchantId: d.merchantId,
+              payerId: d.payerId,
+              amount: d.amount,
+              asset: d.asset,
+              reference: d.reference,
+              status: "initiated",
+              idempotencyKey: idempotencyKey ?? undefined,
+              idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+            },
+          });
+          await logAuditEvent(
+            "payment.created",
+            "payment",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "payment.created",
-          "payment",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
+      } catch (err: unknown) {
+        if (
+          idempotencyKey !== null &&
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        ) {
+          const raced = await prisma.payment.findFirst({
+            where: { idempotencyKey, idempotencyKeyExpiresAt: { gt: new Date() } },
+          });
+          if (raced) {
+            request.log.info({ idempotencyKey, paymentId: raced.id }, "Idempotency race lost — returning winner");
+            return reply.code(200).send({ data: raced });
+          }
+        }
+        throw err;
+      }
 
       request.log.info(
         { idempotencyKey, paymentId: payment.id },
@@ -2400,6 +2557,28 @@ fastify.get('/api/admin/auth/ip-score', {
           ? "Idempotency miss — payment created"
           : "Payment created (no idempotency key)",
       );
+
+      /* after successful payment commit: */
+      await domainEvents
+        .add(
+          "payment.created",
+          {
+            type: "payment.created",
+            id: payment.id,
+            merchantId: payment.merchantId,
+            amount: payment.amount,
+            asset: payment.asset,
+            traceId: (request as unknown as { traceId?: string }).traceId,
+            occurredAt: new Date().toISOString(),
+          },
+          { removeOnComplete: 10_000 },
+        )
+        .catch((err: unknown) => {
+          request.log.warn(
+            { err, paymentId: payment.id },
+            "Domain event emit failed (non-fatal)",
+          );
+        });
 
       if (d.convertTo) {
         return reply.code(201).send({ data: { ...payment, fxQuote } });
@@ -2676,15 +2855,21 @@ fastify.get('/api/admin/auth/ip-score', {
       try {
         d = UpdateSettlementStatusBody.parse(request.body);
       } catch (error) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
-              "Invalid request body",
-              error,
-            ),
-          );
+        if (error instanceof z.ZodError) {
+          return reply
+            .code(400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.VALIDATION_ERROR,
+                "Invalid request body",
+                error.issues.map((issue) => ({
+                  path: issue.path,
+                  message: issue.message,
+                })),
+              ),
+            );
+        }
+        throw error;
       }
 
       const { id } = request.params;
@@ -2864,12 +3049,17 @@ fastify.get('/api/admin/auth/ip-score', {
         (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
       // #319 — Validate each asset against SupportedAsset table
-      for (const item of items) {
-        const supportedAsset = await prisma.supportedAsset.findUnique({
-          where: { code: item.asset },
-        });
+      // #716 — Collapse per-item lookups into a single findMany for the
+      // distinct batch codes (one query regardless of item count).
+      const codes = [...new Set(items.map((item: any) => item.asset))];
+      const assets = await prisma.supportedAsset.findMany({
+        where: { code: { in: codes } },
+        select: { code: true },
+      });
+      const assetSet = new Set<string>(assets.map((a) => a.code));
 
-        if (!supportedAsset || !supportedAsset.isActive) {
+      for (const item of items) {
+        if (!assetSet.has(item.asset)) {
           return reply
             .code(422)
             .send(
@@ -2958,7 +3148,7 @@ fastify.get('/api/admin/auth/ip-score', {
         if (newDailyTotal > dailyLimit) {
           return reply.code(422).send(
             createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
+              "QUOTA_EXCEEDED",
               `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
@@ -3048,6 +3238,16 @@ fastify.get('/api/admin/auth/ip-score', {
   );
 
   fastify.get("/api/deployments", async (request, reply) => {
+    // #761 — explorer links must follow the configured network, not assume
+    // testnet, or a mainnet receipt points a member at the wrong ledger
+    // viewer during an incident.
+    const isMainnet = env.STELLAR_NETWORK_PASSPHRASE.toLowerCase().includes(
+      "public global",
+    );
+    const explorerContractBase = isMainnet
+      ? "https://stellar.expert/explorer/public/contract"
+      : "https://lab.stellar.org/r/testnet/contract";
+
     return {
       data: {
         network: env.STELLAR_NETWORK_PASSPHRASE,
@@ -3055,12 +3255,12 @@ fastify.get('/api/admin/auth/ip-score', {
           {
             name: "Settlement contract",
             contractId: env.SETTLEMENT_CONTRACT_ID,
-            explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.SETTLEMENT_CONTRACT_ID}`,
+            explorerUrl: `${explorerContractBase}/${env.SETTLEMENT_CONTRACT_ID}`,
           },
           {
             name: "Governance contract",
             contractId: env.GOVERNANCE_CONTRACT_ID,
-            explorerUrl: `https://lab.stellar.org/r/testnet/contract/${env.GOVERNANCE_CONTRACT_ID}`,
+            explorerUrl: `${explorerContractBase}/${env.GOVERNANCE_CONTRACT_ID}`,
           },
         ],
         updatedAt: new Date().toISOString(),
@@ -3135,6 +3335,14 @@ fastify.get('/api/admin/auth/ip-score', {
   // GET /api/assets — list all supported assets
   fastify.get("/api/assets", async (request, reply) => {
     try {
+      // #742 — Cache the asset list in Redis with a 5-minute TTL to avoid
+      // re-querying a tiny reference table on every call. Falls back to the
+      // database on cache miss or Redis failure.
+      const cached = await redis.get("supported-assets").catch(() => null);
+      if (cached) {
+        return { data: JSON.parse(cached) };
+      }
+
       const assets = await prisma.supportedAsset.findMany({
         where: { isActive: true },
         select: {
@@ -3145,6 +3353,10 @@ fastify.get('/api/admin/auth/ip-score', {
           isActive: true,
         },
       });
+
+      await redis
+        .set("supported-assets", JSON.stringify(assets), "EX", 300)
+        .catch(() => {});
 
       return { data: assets };
     } catch (error) {
@@ -3181,6 +3393,12 @@ fastify.get('/api/admin/auth/ip-score', {
           { before: null, after: asset },
           request,
         );
+
+        // Invalidate asset caches so the new asset is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
 
         return reply.code(201).send({ data: asset });
       } catch (error: any) {
@@ -3235,6 +3453,12 @@ fastify.get('/api/admin/auth/ip-score', {
           request,
         );
 
+        // Invalidate asset caches so the update is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
+
         return { data: asset };
       } catch (error: any) {
         if (error.code === "P2025") {
@@ -3276,6 +3500,12 @@ fastify.get('/api/admin/auth/ip-score', {
           { before, after: null },
           request,
         );
+
+        // Invalidate asset caches so the deletion is visible immediately.
+        await Promise.all([
+          redis.del("supported-assets").catch(() => {}),
+          redis.del("supported-asset-codes").catch(() => {}),
+        ]);
 
         return reply.code(204).send();
       } catch (error: any) {
@@ -3371,6 +3601,7 @@ async function warmupDownstreamServices(
 // Graceful shutdown
 let mainApp: ReturnType<typeof Fastify> | null = null;
 let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
+let mainWebhookQueue: ReturnType<typeof createWebhookQueue> | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string) {
@@ -3381,6 +3612,17 @@ async function shutdown(signal: string) {
   app.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
+    // Stop crons first so no new jobs are enqueued
+    stopAbandonedPaymentsCron();
+    stopIdempotencyKeyCleanupCron();
+
+    // Close the webhook queue after crons stop, before Prisma disconnect
+    if (mainWebhookQueue) {
+      await mainWebhookQueue.close().catch((err: unknown) => {
+        app.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
+      });
+    }
+
     await app.close();
     if (metricsServer) {
       await new Promise<void>((resolve) =>
@@ -3388,8 +3630,6 @@ async function shutdown(signal: string) {
       );
     }
     await getDefaultPrisma().$disconnect();
-    stopAbandonedPaymentsCron();
-    stopIdempotencyKeyCleanupCron();
     process.exit(0);
   } catch (err) {
     app.log.error(err, "Error during shutdown");
@@ -3434,6 +3674,7 @@ const start = async () => {
       const webhookQueue = createWebhookQueue("gateway-expired-webhooks", {
         url: env.REDIS_URL,
       });
+      mainWebhookQueue = webhookQueue;
       startAbandonedPaymentsCron(
         prisma,
         app.log,
@@ -3444,8 +3685,7 @@ const start = async () => {
     }
     await app.listen({ port: PORT, host: "0.0.0.0" });
   } catch (err) {
-    if (mainApp) mainApp.log.error(err);
-    else console.error(err);
+    mainApp?.log.error({ err }, "Gateway startup warning");
     process.exit(1);
   }
 };
@@ -3457,6 +3697,7 @@ const isDirectRun = Boolean(
 );
 if (isDirectRun) {
   mainApp = buildApp();
+  installCrashHandlers(mainApp.log);
 
   // Served on its own port (see startMetricsServer), not the application
   // port — keeps the scrape endpoint unauthenticated without exposing it

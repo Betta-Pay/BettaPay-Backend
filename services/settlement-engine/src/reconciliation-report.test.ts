@@ -41,6 +41,11 @@ interface ReconciliationReport {
       net: string;
     };
   };
+  lineItemDiscrepancies: Array<{
+    id: string;
+    type: 'missing' | 'extra' | 'mismatched';
+    fields: Array<{ field: string; local: unknown; gateway: unknown }>;
+  }>;
   alerts: string[];
 }
 
@@ -62,16 +67,35 @@ function generateReconciliationReport(
   
   const localMap = new Map(localRecords.map(r => [r.id, r]));
   const gatewayMap = new Map(gatewayRecords.map(r => [r.id, r]));
+  const lineItemDiscrepancies: ReconciliationReport['lineItemDiscrepancies'] = [];
+
+  for (const record of missing) {
+    lineItemDiscrepancies.push({
+      id: record.id,
+      type: 'missing',
+      fields: [],
+    });
+  }
+  for (const record of extra) {
+    lineItemDiscrepancies.push({
+      id: record.id,
+      type: 'extra',
+      fields: [],
+    });
+  }
 
   let mismatchedCount = 0;
   for (const id of matchedIds) {
     const localRec = localMap.get(id)!;
     const gatewayRec = gatewayMap.get(id);
-    
-    if (localRec.grossAmount !== gatewayRec.grossAmount || 
-        localRec.feeAmount !== gatewayRec.feeAmount ||
-        localRec.netAmount !== gatewayRec.netAmount) {
+
+    const fields = ['grossAmount', 'feeAmount', 'netAmount']
+      .filter(field => localRec[field] !== gatewayRec[field])
+      .map(field => ({ field, local: localRec[field], gateway: gatewayRec[field] }));
+
+    if (fields.length > 0) {
       mismatchedCount++;
+      lineItemDiscrepancies.push({ id, type: 'mismatched', fields });
     }
   }
 
@@ -134,6 +158,7 @@ function generateReconciliationReport(
         net: netDiff,
       },
     },
+    lineItemDiscrepancies,
     alerts,
   };
 }
@@ -220,6 +245,31 @@ test('reconciliation report: detects mismatched settlement amounts', (t) => {
   t.equal(report.summary.mismatched, 1, 'should have 1 mismatched record');
   t.equal(report.summary.matched, 0, 'should have 0 perfectly matched records');
   t.ok(report.alerts.some(a => a.includes('1 settlement(s) with field mismatches')), 'should alert about mismatch');
+
+  t.end();
+});
+
+test('reconciliation report: flags offsetting line-item discrepancies', (t) => {
+  const localSettlements = [
+    { id: '1', merchantId: 'M1', grossAmount: '100.00', feeAmount: '1.00', netAmount: '99.00' },
+    { id: '2', merchantId: 'M1', grossAmount: '200.00', feeAmount: '2.00', netAmount: '198.00' },
+  ];
+  const gatewaySettlements = [
+    { id: '1', merchantId: 'M1', grossAmount: '101.00', feeAmount: '1.00', netAmount: '100.00' },
+    { id: '2', merchantId: 'M1', grossAmount: '199.00', feeAmount: '2.00', netAmount: '197.00' },
+  ];
+
+  const report = generateReconciliationReport(localSettlements, gatewaySettlements);
+
+  t.equal(report.amounts.differences.gross, '0.00', 'aggregate gross totals should cancel');
+  t.equal(report.amounts.differences.net, '0.00', 'aggregate net totals should cancel');
+  t.equal(report.summary.mismatched, 2, 'both offsetting records should be mismatched');
+  t.deepEqual(
+    report.lineItemDiscrepancies.map(discrepancy => discrepancy.id),
+    ['1', '2'],
+    'both discrepant line items should be reported',
+  );
+  t.equal(report.lineItemDiscrepancies[0].fields[0].field, 'grossAmount', 'gross field discrepancy should be reported');
 
   t.end();
 });

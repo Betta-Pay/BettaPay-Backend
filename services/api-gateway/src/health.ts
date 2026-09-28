@@ -37,7 +37,7 @@ export async function buildGatewayHealthResponse(
   } = options;
 
   const [postgresql, fxEngine, settlementEngine, indexer] = await Promise.all([
-    checkPostgresql(() => prisma.$queryRaw`SELECT 1`),
+    checkPostgresql(() => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`),
     checkUpstreamServiceHealth(env.FX_ENGINE_URL, 'fx-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.SETTLEMENT_ENGINE_URL, 'settlement-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
@@ -49,9 +49,11 @@ export async function buildGatewayHealthResponse(
     startTime,
     dependencies: [postgresql],
     upstream: [fxEngine, settlementEngine, indexer],
-    // Readiness contract: the gateway cannot serve payments/quotes without its
-    // database AND its downstream engines, so all of them gate the 503.
-    criticalDependencyNames: ['postgresql', 'fx-engine', 'settlement-engine', 'indexer'],
+    // Only postgresql is truly critical — a dead downstream should degrade
+    // the gateway (200 + degraded) rather than 503 the entire payment path.
+    // Upstream services are probed and reported in the `upstream` block but
+    // gate `degraded` status instead of `unhealthy`/503.
+    criticalDependencyNames: ['postgresql'],
   });
 
   // Include abandoned payments count in non-test environments

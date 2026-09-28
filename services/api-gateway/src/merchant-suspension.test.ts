@@ -61,8 +61,14 @@ test('POST /api/merchants/:id/suspend returns 409 when already suspended', async
     });
     t.equal(res.statusCode, 409, 'returns 409 Conflict');
     const body = JSON.parse(res.body);
-    t.equal(body.error.code, ErrorCodes.INVALID_REQUEST, 'uses INVALID_REQUEST code');
+    t.equal(
+      body.error.code,
+      ErrorCodes.MERCHANT_STATE_CONFLICT,
+      'uses MERCHANT_STATE_CONFLICT code',
+    );
     t.match(body.error.message, /already suspended/i, 'explains the merchant is already suspended');
+    t.equal(body.error.details.current, 'suspended', 'reports the current merchant state');
+    t.ok(body.error.reqId, 'includes the request id');
   } catch (err: any) {
     t.fail(err);
   } finally {

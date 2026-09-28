@@ -28,7 +28,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import * as promClient from 'prom-client';
 import * as crypto from 'crypto';
-import { Queue, Worker, type Job } from 'bullmq';
+import { Queue, Worker, type BulkJobOptions, type Job } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -43,20 +43,29 @@ import {
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor,
+  type MirrorDelegate,
+} from './domain-events-consumer.js';
+import {
   acquireSemaphore,
   releaseSemaphore,
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { startSettlementReaper } from './settlement-reaper.js';
+import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
+
+upstream/main
 import {
   validateEnvOrExit,
   CreateSettlementBody,
   BulkSettlementBody,
   registerErrorHandler,
   registerRequestId,
+  registerServiceAuth,
   createErrorResponse,
   ErrorCodes,
   FeeRule,
@@ -78,6 +87,9 @@ import {
   WebhookHeadersSchema,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
+  propagateTracingHeaders,
+  auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -146,6 +158,10 @@ const prisma = prismaBase.$extends({
   },
 }) as unknown as typeof prismaBase;
 
+// Merchant cache: avoids repeated DB reads for the same merchant during
+// a single settlement creation request (#741).
+const merchantCache = new MerchantCache();
+
 type SettlementJobData = {
   id: string;
   merchantId: string;
@@ -162,6 +178,7 @@ const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
@@ -212,6 +229,9 @@ fastify.register(rateLimit, {
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
+// Inter-service auth: internal endpoints require a valid x-service-token (#117).
+registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
+auditRouteAuthPolicy(fastify);
 
 // ── Settlement processing queue ────────────────────────────────────────────────
 
@@ -416,8 +436,11 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
       await settlementQueue.add('process-settlement', job.data, {
         delay: requeueDelayMs,
-        attempts: job.opts.attempts,
-        backoff: job.opts.backoff,
+        priority: job.opts.priority,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2_000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
       });
       return;
     }
@@ -457,11 +480,14 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
     log.info({ settlementId }, 'Settlement completed in database');
 
     if (updatedSettlement.webhookUrl) {
+      const eventId = `settlement:${updatedSettlement.id}:completed`;
       await webhookQueue.add('deliver', {
+        eventId,
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
+        traceId: job.data.traceId,
       });
     }
   } catch (error) {
@@ -474,9 +500,12 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
     if (updatedSettlement?.webhookUrl) {
       // Best-effort enqueue — don't let a queue error mask the original failure.
+      const eventId = `settlement:${updatedSettlement.id}:failed`;
       await webhookQueue.add('deliver', {
+        eventId,
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
+        traceId: job.data.traceId,
         event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {
@@ -503,6 +532,60 @@ const worker = new Worker(
     concurrency: 5,
   },
 );
+
+// Domain events consumer (#770): mirrors payment.created events emitted by
+// the gateway. Runs in parallel with the reconcile endpoint; an empty queue
+// is an idle poll and a missing mirror table is a guarded no-op.
+const domainWorker = new Worker(
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor(
+    () => (prisma as unknown as { paymentMirror?: MirrorDelegate }).paymentMirror,
+    fastify.log,
+  ),
+  { connection: redis, concurrency: 10 },
+);
+
+const MAX_SETTLEMENT_RETRY_COUNT = 3;
+
+export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT_RETRY_COUNT): void {
+  if (retryCount >= maxRetries) {
+    throw new Error(`Maximum retry limit (${maxRetries}) exceeded`);
+  }
+}
+
+async function getSettlementRetryCount(settlementId: string): Promise<number> {
+  const visited = new Set<string>();
+  let currentId = settlementId;
+  let ancestorCount = 0;
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const current = await prisma.settlement.findUnique({
+      where: { id: currentId },
+      select: { supersededById: true },
+    });
+
+    if (!current?.supersededById) break;
+    currentId = current.supersededById;
+    ancestorCount += 1;
+  }
+
+  let descendantCount = 0;
+  let activeIds = [settlementId];
+
+  while (activeIds.length > 0) {
+    const children = await prisma.settlement.findMany({
+      where: { supersededById: { in: activeIds } },
+      select: { id: true },
+    });
+
+    if (children.length === 0) break;
+    descendantCount += children.length;
+    activeIds = children.map((child) => child.id);
+  }
+
+  return ancestorCount + descendantCount;
+}
 
 const getActiveSettlementJob = trackActiveJob(worker);
 
@@ -547,10 +630,13 @@ webhookQueue.on('error', (err) => {
 webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
 });
+domainWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'Domain events worker error');
+});
 
-fastify.get('/api/health', async (_request, reply) => {
+fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
@@ -616,42 +702,14 @@ fastify.post<{ Params: { id: string } }>(
       ));
     }
 
-    // Count the retry chain to enforce max 3 retries
-    const retryChain = await prisma.settlement.findMany({
-      where: {
-        OR: [
-          { supersededById: id },
-          { id: original.supersededById ?? '' },
-        ],
-      },
-    });
+    const totalRetries = await getSettlementRetryCount(id);
 
-    // Find the root of the chain
-    let current = original;
-    let chainLength = 0;
-    const visited = new Set<string>();
-
-    while (current.supersededById && !visited.has(current.id)) {
-      visited.add(current.id);
-      chainLength++;
-      const parent = await prisma.settlement.findUnique({
-        where: { id: current.supersededById },
-      });
-      if (!parent) break;
-      current = parent;
-    }
-
-    // Count forward retries from original
-    const forwardRetries = await prisma.settlement.count({
-      where: { supersededById: id },
-    });
-
-    const totalRetries = chainLength + forwardRetries;
-
-    if (totalRetries >= 3) {
-      return reply.code(422).send(createErrorResponse(
+    try {
+      assertRetryLimit(totalRetries, MAX_SETTLEMENT_RETRY_COUNT);
+    } catch (error) {
+      return reply.code(409).send(createErrorResponse(
         ErrorCodes.VALIDATION_ERROR,
-        'Maximum retry limit (3) exceeded',
+        (error as Error).message,
         { retryCount: totalRetries }
       ));
     }
@@ -771,7 +829,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     });
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -782,10 +840,11 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     let gatewayRecords: any[] = [];
     try {
       const response = await fetch(url.toString(), {
-        headers: {
+        headers: propagateTracingHeaders(request.headers as Record<string, string>, {
           'x-service-token': token,
           'Content-Type': 'application/json',
-        },
+        }),
+        signal: AbortSignal.timeout(env.WRITE_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -797,9 +856,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
       reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'upstream_error' });
-      return reply.code(502).send({
-        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway', details: error instanceof Error ? error.message : String(error) }
-      });
+      return reply.code(504).send(
+        createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
+      );
     }
 
     // 3. Diff the two sets by settlement ID and compare records
@@ -855,8 +914,24 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       failed: 0,
     };
 
-    const merchants = await prisma.merchant.findMany({ select: { id: true } });
-    const existingMerchantIds = new Set(merchants.map(m => m.id));
+    const existingMerchantIds = new Set<string>();
+    let merchantCursor: string | undefined;
+    for (;;) {
+      const merchantPage = await prisma.merchant.findMany({
+        where: merchantCursor ? { id: { gt: merchantCursor } } : {},
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: 1000,
+      });
+      if (merchantPage.length === 0) break;
+
+      for (const merchant of merchantPage) {
+        existingMerchantIds.add(merchant.id);
+      }
+
+      merchantCursor = merchantPage[merchantPage.length - 1].id;
+      if (merchantPage.length < 1000) break;
+    }
 
     // Accumulate gateway totals for the summary
     for (const gr of gatewayRecords) {
@@ -1042,11 +1117,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
-    }
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
     reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
-    return reply.code(400).send({ error: 'Failed to perform reconciliation' });
+    return reply.code(422).send(
+      createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Reconciliation diff failed', undefined, request.id),
+    );
   }
 });
 
@@ -1073,24 +1149,36 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       }
     }
 
-    // 1. Query local settlements
-    const localRecords = await prisma.settlement.findMany({
-      where: localWhere,
-      select: {
-        id: true,
-        merchantId: true,
-        grossAmount: true,
-        totalAmount: true,
-        feeAmount: true,
-        netAmount: true,
-        feeBps: true,
-        asset: true,
-        status: true,
-      },
-    });
+    // 1. Query local settlements, paged by id so memory stays bounded (#711).
+    //    The merchant and date-range filters apply unchanged to every page, and
+    //    the aggregation below sees exactly the same rows as before.
+    const localRecords: SettlementRecord[] = [];
+    let sCursor: string | undefined;
+    for (;;) {
+      const page = await prisma.settlement.findMany({
+        where: { ...localWhere, ...(sCursor ? { id: { gt: sCursor } } : {}) },
+        orderBy: { id: 'asc' },
+        take: 500,
+        select: {
+          id: true,
+          merchantId: true,
+          grossAmount: true,
+          totalAmount: true,
+          feeAmount: true,
+          netAmount: true,
+          feeBps: true,
+          asset: true,
+          status: true,
+        },
+      });
+      if (page.length === 0) break;
+      localRecords.push(...(page as unknown as SettlementRecord[]));
+      sCursor = page[page.length - 1].id;
+      if (page.length < 500) break;
+    }
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -1106,10 +1194,11 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     let gatewayRecords: any[] = [];
     try {
       const response = await fetch(url.toString(), {
-        headers: {
+        headers: propagateTracingHeaders(request.headers as Record<string, string>, {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-        },
+        }),
+        signal: AbortSignal.timeout(env.WRITE_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -1120,9 +1209,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway for report');
-      return reply.code(502).send({
-        error: { code: 'UPSTREAM_ERROR', message: 'Failed to fetch settlement records from api-gateway' }
-      });
+      return reply.code(504).send(
+        createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
+      );
     }
 
     // 3. Compute summary statistics
@@ -1131,6 +1220,19 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
 
     const missingCount = gatewayRecords.filter(r => !localIds.has(r.id)).length;
     const extraCount = localRecords.filter(r => !gatewayIds.has(r.id)).length;
+
+    const lineItemDiscrepancies: Array<{
+      id: string;
+      type: 'missing' | 'extra' | 'mismatched';
+      fields: Array<{ field: string; local: unknown; gateway: unknown }>;
+    }> = [
+      ...gatewayRecords
+        .filter(r => !localIds.has(r.id))
+        .map(r => ({ id: r.id, type: 'missing' as const, fields: [] })),
+      ...localRecords
+        .filter(r => !gatewayIds.has(r.id))
+        .map(r => ({ id: r.id, type: 'extra' as const, fields: [] })),
+    ];
 
     let mismatchedCount = 0;
     const matchedIds = [...localIds].filter(id => gatewayIds.has(id));
@@ -1143,14 +1245,19 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       const gatewayRec = gatewayMap.get(id);
       
       const fieldsToCompare = ['merchantId', 'totalAmount', 'grossAmount', 'feeAmount', 'netAmount', 'feeBps', 'asset', 'status'];
-      const hasDifference = fieldsToCompare.some(field => {
+      const fields = fieldsToCompare.filter(field => {
         const localVal = String((localRec as any)[field] ?? '');
         const gatewayVal = String(gatewayRec[field] ?? '');
         return localVal !== gatewayVal;
-      });
+      }).map(field => ({
+        field,
+        local: (localRec as any)[field] ?? null,
+        gateway: gatewayRec[field] ?? null,
+      }));
 
-      if (hasDifference) {
+      if (fields.length > 0) {
         mismatchedCount++;
+        lineItemDiscrepancies.push({ id, type: 'mismatched', fields });
       }
     }
 
@@ -1222,6 +1329,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
           net: netDiff.toString(),
         },
       },
+      lineItemDiscrepancies,
       alerts: hasDiscrepancies || hasAmountDifferences ? [
         ...(missingCount > 0 ? [`${missingCount} settlement(s) in gateway but missing in local database`] : []),
         ...(extraCount > 0 ? [`${extraCount} settlement(s) in local database but missing in gateway`] : []),
@@ -1265,7 +1373,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'amount must be > 0'));
     }
 
-    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    const merchant = await getCachedMerchant(
+      d.merchantId,
+      merchantCache,
+      (id) => prisma.merchant.findUnique({ where: { id } }),
+    );
 
     // ── Pre-validation ──────────────────────────────────────────────────────
     if (!merchant) {
@@ -1275,7 +1387,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const parsedFeeRule = FeeRule.passthrough().safeParse(merchant.settings);
@@ -1403,6 +1515,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   '/api/settlements/bulk',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 30,
@@ -1423,7 +1536,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         if (claimed === null) {
           const existingHash = await redis.get(`idempotency:bulk:${idempotencyKey}`);
           if (existingHash && existingHash !== payloadHash) {
-            return reply.code(409).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Idempotency key already used with a different payload'));
+            return reply.code(409).send(createErrorResponse('IDEMPOTENCY_PAYLOAD_MISMATCH', 'Idempotency key already used with a different payload'));
           }
 
           const existingResponse = await redis.get(`idempotency:bulk_res:${idempotencyKey}`);
@@ -1446,7 +1559,11 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }
 
-    const merchant = await prisma.merchant.findUnique({ where: { id: d.merchantId } });
+    const merchant = await getCachedMerchant(
+      d.merchantId,
+      merchantCache,
+      (id) => prisma.merchant.findUnique({ where: { id } }),
+    );
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
@@ -1454,7 +1571,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {
@@ -1585,18 +1702,27 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
       });
 
-      // Enqueue job for each successfully created settlement record
-      for (const item of validItems) {
-        const jobData: SettlementJobData = {
-          id: item.id,
-          merchantId: d.merchantId,
-          grossAmount: item.grossAmount,
-          asset: item.asset,
-        };
-        await settlementQueue.add('process-settlement', jobData).catch((err) => {
-          request.log.error({ err, settlementId: item.id }, 'Failed to enqueue bulk settlement job');
-        });
-      }
+      // Enqueue one job per created settlement in a single round trip (#714).
+      // `addBulk` is all-or-nothing for the call itself, which matches the
+      // surrounding transaction's semantics: either every job is accepted by
+      // the queue or the failure is logged once and the request still returns.
+      const jobs: { name: string; data: SettlementJobData; opts: BulkJobOptions }[] =
+        validItems.map((item) => ({
+          name: 'process-settlement',
+          data: {
+            id: item.id,
+            merchantId: d.merchantId,
+            grossAmount: item.grossAmount,
+            asset: item.asset,
+          },
+          opts: {} as BulkJobOptions,
+        }));
+      await settlementQueue.addBulk(jobs).catch((err) => {
+        request.log.error(
+          { err, count: jobs.length, batchId },
+          'Failed to enqueue bulk settlement jobs',
+        );
+      });
     }
 
     const responsePayload = {
@@ -1621,6 +1747,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 fastify.get<{ Params: { batchId: string } }>(
   '/api/settlements/batch/:batchId/status',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -1842,6 +1969,7 @@ batchWorker.on('failed', (job, err) => {
 // ============================================================================
 
 let isShuttingDown = false;
+let stopSettlementReaper: (() => Promise<void>) | undefined;
 
 async function gracefulShutdown(signal: string): Promise<void> {
   // Prevent multiple shutdown attempts
@@ -1860,6 +1988,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }, 30000);
 
   try {
+    await stopSettlementReaper?.();
+
     // 1. Close Fastify server (stops accepting new connections)
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
@@ -1872,6 +2002,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
     await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
+    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
     fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues
@@ -1950,6 +2081,7 @@ const start = async () => {
     startRedisMemoryMonitor(redis, fastify.log);
 
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    stopSettlementReaper = startSettlementReaper(prisma, settlementQueue, fastify.log);
     fastify.log.info({ port: PORT }, 'Settlement Engine started successfully');
   } catch (err) {
     fastify.log.error(err);
@@ -1984,6 +2116,7 @@ export async function closeTestResources(): Promise<void> {
   await step('worker', () => worker.close());
   await step('batchWorker', () => batchWorker.close());
   await step('webhookWorker', () => webhookWorker.close());
+  await step('domainWorker', () => domainWorker.close());
   await step('settlementQueue', () => settlementQueue.close());
   await step('settlementDLQ', () => settlementDLQ.close());
   await step('batchQueue', () => batchQueue.close());

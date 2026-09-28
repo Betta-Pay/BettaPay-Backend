@@ -73,13 +73,15 @@ test('Generic error returns 500 and does not leak stack trace with reqId', async
 
   assert.strictEqual(response.statusCode, 500);
   const body = JSON.parse(response.body);
-  // Generic fallback shape (with referenceId for error tracking), not the
-  // standard error envelope — no internal details are exposed.
-  assert.strictEqual(body.error, 'Internal Server Error');
-  assert.strictEqual(body.statusCode, 500);
-  assert.ok(body.referenceId, 'referenceId is present for traceability');
-  assert.ok(body.reqId, 'reqId is present in generic error response');
-  assert.strictEqual(body.details, undefined);
+  // #666: the generic 500 now uses the same envelope as every other error, so
+  // clients can branch on `error.code` during an incident. The referenceId
+  // travels inside error.details for traceability and no internal detail leaks.
+  assert.strictEqual(body.error.code, 'INTERNAL_ERROR');
+  assert.strictEqual(body.error.message, 'Internal Server Error');
+  assert.ok(body.error.details?.referenceId, 'referenceId is present for traceability');
+  assert.ok(body.error.reqId, 'reqId is present in generic error response');
+  assert.strictEqual(body.statusCode, undefined);
+  assert.strictEqual(body.referenceId, undefined);
   assert.strictEqual(response.body.includes('Database connection failed'), false);
   assert.strictEqual(logged, true, 'Logger should be called when error occurs');
 });

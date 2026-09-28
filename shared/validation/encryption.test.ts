@@ -258,6 +258,15 @@ testNode('encryptField: produces unique ciphertext for identical plaintext calls
   assert.equal(decryptField(cipher2, TEST_KEY), plaintext);
 });
 
+testNode('decryptField rejects tampered payload and wrong key', () => {
+  const plaintext = 'merchant-secret-value';
+  const ciphertext = encryptField(plaintext, TEST_KEY);
+
+  const tampered = ciphertext.replace(/.$/, ciphertext.at(-1) === '0' ? '1' : '0');
+  assert.throws(() => decryptField(tampered, TEST_KEY), /authentication tag mismatch|corrupted ciphertext|Malformed encrypted payload structure|Invalid initialization vector or auth tag length/);
+  assert.throws(() => decryptField(ciphertext, 'wrong-secret-32-character-encryption-key!'), /authentication tag mismatch|corrupted ciphertext|Failed to decrypt field/);
+});
+
 testNode('encryptField & decryptField: throws when FIELD_ENCRYPTION_KEY is missing or too short', () => {
   const originalEnv = process.env.FIELD_ENCRYPTION_KEY;
   delete process.env.FIELD_ENCRYPTION_KEY;

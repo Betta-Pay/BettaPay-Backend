@@ -71,11 +71,18 @@ export function shouldEnablePrismaQueryLogging(): boolean {
   return process.env.LOG_LEVEL === 'debug' || process.env.NODE_ENV === 'development';
 }
 
-export function getPrismaLogLevels(): PrismaLogLevel[] {
+// #760 — this announcement previously went straight to console.log,
+// bypassing the structured-logger level control every other Prisma log line
+// in this module goes through. `log` is optional (defaults to a noop) so
+// existing no-arg callers keep compiling and stay quiet under production
+// levels exactly as before.
+export function getPrismaLogLevels(
+  log: { debug: (obj: object, msg?: string) => void } = { debug: () => {} },
+): PrismaLogLevel[] {
   const override = parsePrismaLogLevelsOverride(process.env.PRISMA_LOG_LEVELS);
   const levels = override ?? defaultPrismaLogLevelsForEnv(process.env.NODE_ENV);
   const source = override ? 'PRISMA_LOG_LEVELS override' : `NODE_ENV=${process.env.NODE_ENV ?? 'development'} default`;
-  console.log(`[Prisma] log levels: ${levels.join(', ')} (${source})`);
+  log.debug({ levels, source }, '[Prisma] log levels');
   return levels;
 }
 
@@ -142,11 +149,20 @@ export async function connectWithRetry(
  * @param poolSize - Max connections in the Prisma pool (default: 10).
  * @param timeout  - Max seconds to wait for a connection from the pool (default: 10).
  */
+function validatePrismaPoolSetting(name: string, value: number, min: number, max: number): void {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+}
+
 export function buildPrismaConnectionUrl(
   rawUrl: string,
   poolSize: number = 10,
   timeout: number = 10,
 ): string {
+  validatePrismaPoolSetting('DATABASE_POOL_SIZE', poolSize, 1, 10000);
+  validatePrismaPoolSetting('DATABASE_POOL_TIMEOUT', timeout, 1, 3600);
+
   const sep = rawUrl.includes('?') ? '&' : '?';
   return `${rawUrl}${sep}connection_limit=${poolSize}&pool_timeout=${timeout}`;
 }

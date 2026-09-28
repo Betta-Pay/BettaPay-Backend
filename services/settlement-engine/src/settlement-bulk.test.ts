@@ -22,9 +22,48 @@ function resetMocks() {
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);
+  settlementQueue.addBulk = async () => [] as any;
   redis.set = async () => 'OK' as any;
   redis.get = async () => null as any;
 }
+
+const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
+const AUTH_HEADER = { 'x-service-token': AUTH_TOKEN };
+
+test('POST /api/settlements/bulk: rejects anonymous callers with 401 before idempotency logic', async (t) => {
+  resetMocks();
+
+  const res = await fastify.inject({
+    method: 'POST',
+    url: '/api/settlements/bulk',
+    headers: {
+      'idempotency-key': 'idem-anon-123',
+    },
+    payload: {
+      merchantId: 'merch_1',
+      settlements: [{ amount: '10.00', asset: 'USDC' }],
+    },
+  });
+
+  t.equal(res.statusCode, 401, 'should return 401 Unauthorized for anonymous caller');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'UNAUTHORIZED');
+  t.end();
+});
+
+test('GET /api/settlements/batch/:batchId/status: rejects anonymous callers with 401', async (t) => {
+  resetMocks();
+
+  const res = await fastify.inject({
+    method: 'GET',
+    url: '/api/settlements/batch/batch_test123/status',
+  });
+
+  t.equal(res.statusCode, 401, 'should return 401 Unauthorized for anonymous caller');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'UNAUTHORIZED');
+  t.end();
+});
 
 test('POST /api/settlements/bulk: rejects batch size > 100', async (t) => {
   resetMocks();
@@ -37,6 +76,7 @@ test('POST /api/settlements/bulk: rejects batch size > 100', async (t) => {
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: 'merch_1',
       settlements,
@@ -56,6 +96,7 @@ test('POST /api/settlements/bulk: returns 404 if merchant not found', async (t) 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: 'merch_non_existent',
       settlements: BATCH_VALID_STANDARD,
@@ -79,14 +120,15 @@ test('POST /api/settlements/bulk: processes valid batch successfully', async (t)
     createdRecords.push(args.data);
     return args.data;
   };
-  settlementQueue.add = async (name: string, data: any) => {
-    enqueuedJobs.push(data);
-    return {} as any;
+  settlementQueue.addBulk = async (jobs: any[]) => {
+    for (const job of jobs) enqueuedJobs.push(job.data);
+    return jobs.map(() => ({ id: 'job_test_123' })) as any;
   };
 
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_VALID_STANDARD,
@@ -120,6 +162,7 @@ test('POST /api/settlements/bulk: handles partial failures (min amount violation
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_WITH_MIN_LIMIT_VIOLATION,
@@ -151,6 +194,7 @@ test('POST /api/settlements/bulk: handles partial failures (max amount violation
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_WITH_MAX_LIMIT_VIOLATION,
@@ -178,6 +222,7 @@ test('POST /api/settlements/bulk: handles daily limits aggregation check', async
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_WITH_DAILY_LIMIT_VIOLATION,
@@ -207,6 +252,7 @@ test('POST /api/settlements/bulk: filters out invalid amount formats', async (t)
   const res = await fastify.inject({
     method: 'POST',
     url: '/api/settlements/bulk',
+    headers: AUTH_HEADER,
     payload: {
       merchantId: MOCK_MERCHANT_STANDARD.id,
       settlements: BATCH_WITH_INVALID_AMOUNTS,
@@ -240,6 +286,7 @@ test('GET /api/settlements/batch/:batchId/status: tracks progress of existing ba
   const res = await fastify.inject({
     method: 'GET',
     url: '/api/settlements/batch/batch_test123/status',
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 200, 'returns 200 OK');
@@ -262,6 +309,7 @@ test('GET /api/settlements/batch/:batchId/status: returns 404 for unknown batch'
   const res = await fastify.inject({
     method: 'GET',
     url: '/api/settlements/batch/batch_unknown/status',
+    headers: AUTH_HEADER,
   });
 
   t.equal(res.statusCode, 404, 'returns 404 Not Found');
@@ -298,6 +346,7 @@ test('POST /api/settlements/bulk: idempotency successfully returns cached respon
     method: 'POST',
     url: '/api/settlements/bulk',
     headers: {
+      ...AUTH_HEADER,
       'idempotency-key': 'idem-key-123'
     },
     payload,
@@ -328,6 +377,7 @@ test('POST /api/settlements/bulk: rejects same idempotency key with different pa
     method: 'POST',
     url: '/api/settlements/bulk',
     headers: {
+      ...AUTH_HEADER,
       'idempotency-key': 'idem-key-456'
     },
     payload,
@@ -335,7 +385,7 @@ test('POST /api/settlements/bulk: rejects same idempotency key with different pa
 
   t.equal(res.statusCode, 409, 'returns 409 Conflict');
   const body = JSON.parse(res.body);
-  t.equal(body.error.code, 'VALIDATION_ERROR');
+  t.equal(body.error.code, 'IDEMPOTENCY_PAYLOAD_MISMATCH');
   t.ok(body.error.message.includes('different payload'), 'error message indicates payload mismatch');
   t.end();
 });

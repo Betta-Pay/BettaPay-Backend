@@ -44,6 +44,8 @@ import {
   startRedisMemoryMonitor,
   startMetricsServer,
   RateOverrideBody,
+  auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import {
   createHistoryQuerySchema,
@@ -831,8 +833,12 @@ interface StoredQuote {
 
 export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
+  // Explicit 1MB cap — matches api-gateway and settlement-engine so the limit
+  // is auditable rather than relying on Fastify's implicit default.
+  bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 // #386 — exponential backoff retry strategy
 const redisHealthState: import('@bettapay/validation').RedisHealthState = {
@@ -932,6 +938,8 @@ async function runRateHistoryCleanup(): Promise<number> {
 const cleanupQueue = new Queue("rate-history-cleanup", {
   connection: bullMqConnection,
   defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: "exponential", delay: 60_000 },
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 50 },
   },
@@ -1030,7 +1038,12 @@ function logRateStalenessIfStale(
   }
 }
 
-fastify.get("/api/health", async (_request, reply) => {
+auditRouteAuthPolicy(fastify);
+
+// Upstream health probes (gateway aggregation, Render) share the global
+// 200/min bucket. Exempt so a traffic spike on another route cannot 429 the
+// liveness probe and get the service killed.
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
     redisHealthState,
@@ -1137,9 +1150,12 @@ fastify.get("/api/health", async (_request, reply) => {
 
 fastify.get("/api/rates", async (_request, _reply) => {
   logRateStalenessIfStale(fastify.log);
+  const stale = Date.now() - cache.cachedAt > env.MAX_STALE_SECONDS * 1000;
   return {
     rates: cache.rates,
     updatedAt: new Date(cache.cachedAt).toISOString(),
+    stale,
+    source: fallbackStartTime !== null ? "seed" : stale ? "cache" : "live",
   };
 });
 
@@ -1635,6 +1651,7 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       valid,
       stale: !valid,
       quoteId: stored.quoteId,
+      fallbackAccepted: fallbackStartTime !== null,
       from: stored.from,
       to: stored.to,
       rate: stored.rate,
@@ -1657,18 +1674,39 @@ async function shutdown(signal: string) {
 
   fastify.log.info(`Received ${signal}, shutting down gracefully...`);
 
+  // #752 — force-exit timeout: if the close sequence hangs for >30s,
+  // exit hard so the container/orchestrator can reclaim resources.
+  const FORCE_EXIT_MS = 30_000;
+  const forceExit = setTimeout(() => {
+    fastify.log.error("FX shutdown timed out — forcing exit");
+    process.exit(1);
+  }, FORCE_EXIT_MS);
+  forceExit.unref?.();
+
   try {
     if (refreshIntervalHandle !== null) {
       clearTimeout(refreshIntervalHandle);
       refreshIntervalHandle = null;
     }
-    await cleanupWorker.close();
+    if (fallbackWarningIntervalHandle !== null) {
+      clearInterval(fallbackWarningIntervalHandle);
+      fallbackWarningIntervalHandle = null;
+    }
+    // #753 — bound worker.close() with a 10s timeout race so a wedged
+    // connection cannot block the entire shutdown sequence.
+    await Promise.race([
+      cleanupWorker.close(),
+      new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+    ]);
     await cleanupQueue.close();
     await fastify.close();
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
+
+    clearTimeout(forceExit);
     process.exit(0);
   } catch (err) {
     fastify.log.error(err, "Error during shutdown");
+    clearTimeout(forceExit);
     process.exit(1);
   }
 }

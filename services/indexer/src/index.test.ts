@@ -123,6 +123,44 @@ test('DELETE /api/webhooks/:id - rejects requests without service token', async 
   }
 });
 
+test('POST /api/events/replay - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: '/api/events/replay',
+      payload: { fromLedger: 100, toLedger: 200 },
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
+test('POST /api/events/replay/contract/:contractId - rejects requests without service token', async (t) => {
+  await fastify.ready();
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: '/api/events/replay/contract/CA_TEST',
+      payload: { startLedger: 100, endLedger: 200 },
+    });
+    t.equal(res.statusCode, 401, 'should return 401 without x-service-token');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'UNAUTHORIZED', 'error code should be UNAUTHORIZED');
+  } catch (err: any) {
+    t.fail(err);
+  } finally {
+    t.end();
+  }
+});
+
 test('GET /api/events/stats - rejects requests without service token', async (t) => {
   await fastify.ready();
 

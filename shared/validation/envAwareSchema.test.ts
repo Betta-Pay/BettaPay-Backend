@@ -145,10 +145,10 @@ test('CORS Origins Schema - Production mode - accepts HTTPS origins', () => {
   assert.strictEqual(result.success, true);
 });
 
-test('CORS Origins Schema - Development mode - accepts wildcard origin (*)', () => {
+test('CORS Origins Schema - rejects wildcard origin (*) in all environments', () => {
   const schema = createCorsOriginsSchema('development');
   const result = schema.safeParse(['*']);
-  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.success, false);
 });
 
 test('CORS Origins Schema - Development mode - accepts HTTP origins', () => {

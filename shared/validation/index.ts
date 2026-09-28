@@ -22,6 +22,8 @@ export * from './metrics-server.js';
 export * from './feature-flags.js';
 export * from './startup-checks.js';
 export * from './encryption.js';
+export * from './route-audit.js';
+export * from './crash-handlers.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -51,6 +53,11 @@ export const ErrorCodes = {
   // #317 — returned when a suspended merchant attempts to create a payment
   // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
   MERCHANT_SUSPENDED: "MERCHANT_SUSPENDED",
+  // Returned when a state-transition request is a no-op because the entity is
+  // already in the requested state (e.g. suspending a suspended merchant).
+  // Distinct from INVALID_REQUEST so operators can tell a retry-safe no-op
+  // apart from a genuinely malformed request.
+  MERCHANT_STATE_CONFLICT: "MERCHANT_STATE_CONFLICT",
   QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
   QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
 } as const;
@@ -235,10 +242,12 @@ export const EnvSchema = z
     DATABASE_POOL_SIZE: z
       .string()
       .transform((s) => parseInt(s, 10))
+      .pipe(z.number().int().min(1).max(10000))
       .default("10"),
     DATABASE_POOL_TIMEOUT: z
       .string()
       .transform((s) => parseInt(s, 10))
+      .pipe(z.number().int().min(1).max(3600))
       .default("10"),
 
     // Redis — optional, falls back to localhost
@@ -283,6 +292,7 @@ export const EnvSchema = z
     CONTRACT_NAMES: z.string().optional(),
 
     // Service URLs (used by gateway to proxy requests)
+    API_GATEWAY_URL: z.string().url().default("http://localhost:3000"),
     FX_ENGINE_URL: z.string().url().default("http://localhost:3002"),
     SETTLEMENT_ENGINE_URL: z.string().url().default("http://localhost:3001"),
     INDEXER_URL: z.string().url().default("http://localhost:3003"),
@@ -442,6 +452,33 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val > 0, {
         message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
       }),
+
+    // Abandoned-payments cron — a payment with no activity past this many
+    // minutes is considered abandoned. Also the correlation mechanism for
+    // the webhook reliability metric. Default matches the gateway health
+    // check's current inline fallback (api-gateway/src/health.ts).
+    ABANDONMENT_THRESHOLD_MINUTES: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1440"),
+    // How often the abandoned-payments cron runs (ms). Default matches the
+    // cron's current inline `setInterval` value (api-gateway/src/abandoned-payments-cron.ts).
+    ABANDONED_PAYMENTS_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+    // How often the idempotency-key cleanup cron runs (ms). Default matches
+    // the cron's current inline fallback (api-gateway/src/idempotency-key-cleanup-cron.ts).
+    IDEMPOTENCY_KEY_CLEANUP_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+
+    // Rate-limit kill-switch. Validated here so a typo like "False" (capital
+    // F) fails fast at boot instead of silently being treated as enabled —
+    // the gateway's own disable check (api-gateway/src/index.ts) only matches
+    // exactly 'false' or '0' and is left untouched.
+    RATE_LIMIT_ENABLED: z.enum(["true", "false", "1", "0"]).default("true"),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
@@ -602,17 +639,42 @@ export function validateEnv(env: Record<string, unknown>): Env {
   }
 }
 
+// #759 — routes the config-validation failure message through a structured
+// logger instead of a bare console write, so it's subject to the same level
+// control and shape as the rest of a service's logs. `log` is optional (no
+// new required parameter for existing `validateEnvOrExit` callers); when
+// omitted, falls back to `console.error` so the message is never silently
+// dropped for callers that haven't wired a logger through yet.
+export function reportValidationConfigIssue(
+  message: string,
+  log?: { error(obj: unknown, msg: string): void },
+): void {
+  if (log) {
+    log.error({}, message);
+  } else {
+    console.error(message);
+  }
+}
+
 // Wraps validateEnv() for use at service startup: logs a single clean,
 // human-readable message (no stack trace) and exits with code 1 on failure,
 // so misconfiguration is caught fast instead of surfacing later at runtime.
-export function validateEnvOrExit(env: Record<string, unknown>): Env {
+export function validateEnvOrExit(
+  env: Record<string, unknown>,
+  log?: { error(obj: unknown, msg: string): void },
+): Env {
   try {
     return validateEnv(env);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    reportValidationConfigIssue(
+      error instanceof Error ? error.message : String(error),
+      log,
+    );
     return process.exit(1);
   }
 }
 
-export * from "./prisma-pool-metrics.js";
-export * from "./encryption.js";
+export * from './prisma-pool-metrics.js';
+export * from './encryption.js';
+export * from './batch-scan.js';
+export * from './idempotency.js';
