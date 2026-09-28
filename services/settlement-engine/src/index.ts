@@ -84,6 +84,7 @@ import {
   isValidTransition,
   propagateTracingHeaders,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -172,6 +173,7 @@ const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
@@ -802,7 +804,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     });
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);

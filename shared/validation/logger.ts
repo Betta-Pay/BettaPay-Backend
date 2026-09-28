@@ -10,6 +10,7 @@
  */
 
 import { createRequire } from 'module';
+import type { FastifyBaseLogger } from 'fastify';
 
 /** Fields that must never appear in logs, matched at top level and one level deep. */
 const REDACT_PATHS = [
@@ -75,4 +76,23 @@ export function createLoggerOptions(options: LoggerConfigOptions = {}) {
     },
     transport: pretty ? prettyTransport() : undefined,
   };
+}
+
+/**
+ * Last-resort process guards so a missed await or stray throw produces a
+ * structured fatal log instead of silently killing the container. Nothing is
+ * registered until this is called.
+ */
+export function installCrashHandlers(log: FastifyBaseLogger): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    log.fatal(
+      { err: reason instanceof Error ? reason : new Error(String(reason)), errorClass: 'fatal' as const },
+      'Unhandled promise rejection — exiting for supervisor restart',
+    );
+    process.exitCode = 1;
+  });
+  process.on('uncaughtException', (err: Error) => {
+    log.fatal({ err, errorClass: 'fatal' as const }, 'Uncaught exception — exiting');
+    process.exit(1);
+  });
 }
