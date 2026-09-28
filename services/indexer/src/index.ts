@@ -68,6 +68,8 @@ import {
   isFeatureEnabled,
   logFeatureFlags,
   installCrashHandlers,
+  createErrorResponse,
+  ErrorCodes,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -1081,19 +1083,24 @@ fastify.post(
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
-            startLedger,
-            endLedger,
-            fromLedger,
-            toLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
-          },
-        },
-      });
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger,
+        toLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
     }
 
     const job = await replayQueue.add("replay", { fromLedger, toLedger });
@@ -1142,19 +1149,24 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
-            startLedger,
-            endLedger,
-            fromLedger: startLedger,
-            toLedger: endLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
-          },
-        },
-      });
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
     }
 
     const job = await replayQueue.add("replay-contract", {

@@ -1008,6 +1008,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         });
         continue;
       }
+    }
 
     const matchedCount = matchedIds.size - mismatched.length;
     const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;

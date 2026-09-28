@@ -7,6 +7,7 @@ const MAX_STALE_SECONDS = 300;
 let lastSuccessfulFetch: number | null = null;
 let cacheCachedAt: number;
 let currentTime: number;
+let cache: any;
 
 function reset(
   opts: {
@@ -18,6 +19,7 @@ function reset(
 ): void {
   currentTime = opts.now ?? 1_000_000_000_000;
   lastSuccessfulFetch = opts.lastSuccessfulFetch ?? null;
+  cacheCachedAt = currentTime - (opts.cacheAgeMs ?? 0);
   (global as any).cache = {
     cachedAt: cacheCachedAt,
     rateCachedAt: opts.rateCachedAt ?? {
@@ -28,9 +30,8 @@ function reset(
     rates: {},
     batchIds: {},
   };
+  cache = (global as any).cache;
 }
-
-const cache = (global as any).cache;
 
 function getRateSource(): "live" | "seed" {
   return lastSuccessfulFetch !== null ? "live" : "seed";
