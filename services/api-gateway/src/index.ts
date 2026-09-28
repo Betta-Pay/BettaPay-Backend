@@ -61,6 +61,7 @@ import {
   decryptSensitiveFields,
   createValidationContext,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -3696,6 +3697,7 @@ const isDirectRun = Boolean(
 );
 if (isDirectRun) {
   mainApp = buildApp();
+  installCrashHandlers(mainApp.log);
 
   // Served on its own port (see startMetricsServer), not the application
   // port — keeps the scrape endpoint unauthenticated without exposing it
