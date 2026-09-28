@@ -477,6 +477,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
+        traceId: job.data.traceId,
       });
     }
   } catch (error) {
@@ -494,6 +495,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId,
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
+        traceId: job.data.traceId,
         event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {

@@ -23,6 +23,7 @@ export * from './feature-flags.js';
 export * from './startup-checks.js';
 export * from './encryption.js';
 export * from './route-audit.js';
+export * from './crash-handlers.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {

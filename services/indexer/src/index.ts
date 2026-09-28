@@ -67,6 +67,7 @@ import {
   anchorSettledEvent,
   isFeatureEnabled,
   logFeatureFlags,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -88,6 +89,7 @@ const fastifyInstance = Fastify({
   bodyLimit: 1_048_576,
 });
 export const fastify = fastifyInstance;
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(
