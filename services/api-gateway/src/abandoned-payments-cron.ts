@@ -62,27 +62,43 @@ export async function autoExpireAbandonedPayments(
       });
       expiredCount += result.count;
 
-      // Dispatch webhook for each cancelled payment if merchant has a webhook URL
+      // Dispatch webhooks for cancelled payments with a merchant webhook URL.
+      // Single Redis round trip per batch via addBulk; delivery payloads are
+      // identical to the previous per-payment adds. Best-effort: one bad
+      // payload never blocks the rest, and an enqueue failure never blocks
+      // expiry.
       if (webhookQueue) {
+        const webhookJobs: Array<{ name: string; data: WebhookJobData }> = [];
         for (const payment of stalePayments) {
-          const settings = payment.merchant?.settings as { webhookUrl?: string } | null | undefined;
-          const webhookUrl = settings?.webhookUrl;
-          if (!webhookUrl) continue;
-
           try {
-            await webhookQueue.add('deliver', {
-              url: webhookUrl,
-              event: {
-                type: 'payment.expired',
-                paymentId: payment.id,
-                merchantId: payment.merchantId,
-                amount: payment.amount.toString(),
-                asset: payment.asset,
-                reason: 'expired',
+            const settings = payment.merchant?.settings as { webhookUrl?: string } | null | undefined;
+            const webhookUrl = settings?.webhookUrl;
+            if (!webhookUrl) continue;
+
+            webhookJobs.push({
+              name: 'deliver',
+              data: {
+                url: webhookUrl,
+                event: {
+                  type: 'payment.expired',
+                  paymentId: payment.id,
+                  merchantId: payment.merchantId,
+                  amount: payment.amount.toString(),
+                  asset: payment.asset,
+                  reason: 'expired',
+                },
               },
             });
           } catch (err) {
-            logger.warn({ err, paymentId: payment.id }, 'Failed to enqueue webhook for expired payment');
+            logger.warn({ err, paymentId: payment.id }, 'Failed to build webhook job for expired payment');
+          }
+        }
+
+        if (webhookJobs.length > 0) {
+          try {
+            await webhookQueue.addBulk(webhookJobs);
+          } catch (err) {
+            logger.warn({ err, count: webhookJobs.length }, 'Failed to enqueue webhooks for expired payments');
           }
         }
       }
