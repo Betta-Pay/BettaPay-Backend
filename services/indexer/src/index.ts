@@ -1225,7 +1225,24 @@ fastify.post(
     preValidation: [fastify.serviceAuth],
   },
   async (request, reply) => {
-    const { dryRun } = CleanupQuery.parse(request.query ?? {});
+    let dryRun = false;
+    try {
+      ({ dryRun } = CleanupQuery.parse(request.query ?? {}));
+    } catch (err) {
+      fastify.log.warn(
+        { err, reqId: request.id },
+        "[Indexer] Invalid cleanup query",
+      );
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.INVALID_REQUEST,
+          err instanceof Error ? err.message : "Invalid cleanup query",
+          undefined,
+          request.id,
+        ),
+      );
+    }
+
     if (dryRun) {
       const dryResult = await cleanupOldEvents(true);
       return reply.code(200).send(dryResult);
