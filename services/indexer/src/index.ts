@@ -1394,7 +1394,12 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
 
     if (!existing) {
       return reply.code(404).send(
-        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
       );
     }
 
