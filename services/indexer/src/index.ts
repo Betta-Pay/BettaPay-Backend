@@ -1098,6 +1098,27 @@ fastify.post(
       });
     }
 
+    // Duplicate-replay conflict: an identical replay is already in flight.
+    // Event-level dedupe (P2002 skip) still applies, so this only prevents
+    // queueing a second pass over the same range while the first is running.
+    const activeReplay = getActiveReplayJob();
+    const activeReplayData = activeReplay?.data as
+      | { fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeReplayData?.fromLedger === fromLedger &&
+      activeReplayData?.toLedger === toLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for ledger range ${fromLedger}-${toLedger} is already in progress`,
+          { jobId: activeReplay?.id, fromLedger, toLedger },
+          request.id,
+        ),
+      );
+    }
+
     const job = await replayQueue.add("replay", { fromLedger, toLedger });
 
     return reply.code(202).send({
@@ -1157,6 +1178,33 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
           },
         },
       });
+    }
+
+    // Duplicate-replay conflict: an identical per-contract replay is already in
+    // flight. Matched on contract + range, so a different contract or range
+    // still queues normally.
+    const activeContractReplay = getActiveReplayJob();
+    const activeContractReplayData = activeContractReplay?.data as
+      | { contractId?: string; fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeContractReplayData?.contractId === contractId &&
+      activeContractReplayData?.fromLedger === startLedger &&
+      activeContractReplayData?.toLedger === endLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for contract ${contractId} over ledger range ${startLedger}-${endLedger} is already in progress`,
+          {
+            jobId: activeContractReplay?.id,
+            contractId,
+            fromLedger: startLedger,
+            toLedger: endLedger,
+          },
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay-contract", {
