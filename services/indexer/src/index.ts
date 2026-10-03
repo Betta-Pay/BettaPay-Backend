@@ -1103,6 +1103,24 @@ fastify.post(
         );
     }
 
+    const activeReplay = getActiveReplayJob();
+    const activeReplayData = activeReplay?.data as
+      | { fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeReplayData?.fromLedger === fromLedger &&
+      activeReplayData?.toLedger === toLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for ledger range ${fromLedger}-${toLedger} is already in progress`,
+          { jobId: activeReplay?.id, fromLedger, toLedger },
+          request.id,
+        ),
+      );
+    }
+
     const job = await replayQueue.add("replay", { fromLedger, toLedger });
 
     return reply.code(202).send({
@@ -1134,13 +1152,14 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     // Validate that the contract ID is in the monitored list
     if (!CONTRACT_IDS.includes(contractId)) {
-      return reply.code(422).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Contract ID ${contractId} is not monitored by this indexer`,
-          details: { contractId, monitoredContracts: CONTRACT_IDS },
-        },
-      });
+      return reply.code(422).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Contract ID ${contractId} is not monitored by this indexer`,
+          { contractId, monitoredContracts: CONTRACT_IDS },
+          request.id,
+        ),
+      );
     }
 
     const parsedContractReplay = PerContractReplayBody.parse(request.body);
@@ -1167,6 +1186,30 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
             request.id,
           ),
         );
+    }
+
+    const activeContractReplay = getActiveReplayJob();
+    const activeContractReplayData = activeContractReplay?.data as
+      | { contractId?: string; fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeContractReplayData?.contractId === contractId &&
+      activeContractReplayData?.fromLedger === startLedger &&
+      activeContractReplayData?.toLedger === endLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for contract ${contractId} over ledger range ${startLedger}-${endLedger} is already in progress`,
+          {
+            jobId: activeContractReplay?.id,
+            contractId,
+            fromLedger: startLedger,
+            toLedger: endLedger,
+          },
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay-contract", {
@@ -1204,12 +1247,14 @@ fastify.get<{ Params: { jobId: string } }>(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
       if (!raw) {
-        return reply.code(404).send({
-          error: {
-            code: "NOT_FOUND",
-            message: `Replay job ${jobId} not found`,
-          },
-        });
+        return reply.code(404).send(
+          createErrorResponse(
+            ErrorCodes.NOT_FOUND,
+            `Replay job ${jobId} not found`,
+            undefined,
+            request.id,
+          ),
+        );
       }
       const progress = JSON.parse(raw);
       return { jobId, ...progress };
@@ -1218,12 +1263,14 @@ fastify.get<{ Params: { jobId: string } }>(
         { err, jobId },
         "[Indexer] Failed to read replay progress",
       );
-      return reply.code(500).send({
-        error: {
-          code: "INTERNAL_ERROR",
-          message: "Failed to read replay progress",
-        },
-      });
+      return reply.code(500).send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          "Failed to read replay progress",
+          undefined,
+          request.id,
+        ),
+      );
     }
   },
 );
@@ -1235,7 +1282,24 @@ fastify.post(
     preValidation: [fastify.serviceAuth],
   },
   async (request, reply) => {
-    const { dryRun } = CleanupQuery.parse(request.query ?? {});
+    let dryRun = false;
+    try {
+      ({ dryRun } = CleanupQuery.parse(request.query ?? {}));
+    } catch (err) {
+      fastify.log.warn(
+        { err, reqId: request.id },
+        "[Indexer] Invalid cleanup query",
+      );
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.INVALID_REQUEST,
+          err instanceof Error ? err.message : "Invalid cleanup query",
+          undefined,
+          request.id,
+        ),
+      );
+    }
+
     if (dryRun) {
       const dryResult = await cleanupOldEvents(true);
       return reply.code(200).send(dryResult);
@@ -1300,12 +1364,9 @@ fastify.delete<{ Params: { id: string } }>(
       where: { id },
     });
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+      );
     }
     await prisma.$transaction(async (tx) => {
       await tx.webhookSubscription.delete({ where: { id } });
@@ -1334,12 +1395,14 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
     });
 
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
+      );
     }
 
     // #624: this route sits behind serviceAuth (any trusted internal caller,
@@ -1358,12 +1421,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       callerMerchantId &&
       existing.merchantId !== callerMerchantId
     ) {
-      return reply.code(403).send({
-        error: {
-          code: "FORBIDDEN",
-          message: "Cannot test webhook subscription owned by another merchant",
-        },
-      });
+      return reply.code(403).send(
+        createErrorResponse(ErrorCodes.FORBIDDEN, "Cannot test webhook subscription owned by another merchant"),
+      );
     }
 
     const payload = {
@@ -1482,9 +1542,9 @@ fastify.post<{ Params: { id: string } }>(
     const { id } = request.params;
     const job = await dlqQueue.getJob(id);
     if (!job) {
-      return reply.code(404).send({
-        error: { code: "NOT_FOUND", message: `DLQ job ${id} not found` },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `DLQ job ${id} not found`),
+      );
     }
 
     // Re-enqueue on the main webhook delivery queue. Custom headers
