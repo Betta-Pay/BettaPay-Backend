@@ -6,9 +6,8 @@ import {
   buildIndexerHealthResponse,
   buildSettlementEngineHealthResponse,
   checkBullMQ,
-
-checkPostgresql,
-  checkRedisPing,ain
+  checkPostgresql,
+  checkRedisPing,
   computeOverallStatus,
 } from './health.js';
 
@@ -243,7 +242,7 @@ test('checkPostgresql returns healthy with latency and optional serverVersion', 
   assert.equal(dependency.status, 'connected');
   assert.equal(dependency.healthy, true);
   assert.equal(typeof dependency.latencyMs, 'number');
-  assert.ok(dependency.latencyMs < 1000);
+  assert.ok(dependency.latencyMs! < 1000);
   assert.equal(typeof dependency.serverVersion, 'string');
 });
 
@@ -274,7 +273,7 @@ test('checkPostgresql measures slow latency as degraded in buildHealthResponse',
 
   assert.equal(dependency.status, 'connected');
   assert.equal(dependency.healthy, true);
-  assert.ok(dependency.latencyMs > 1000);
+  assert.ok(dependency.latencyMs! > 1000);
 
   const response = buildHealthResponse({
     service: 'db-service',

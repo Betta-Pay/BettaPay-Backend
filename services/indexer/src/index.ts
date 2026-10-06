@@ -1083,25 +1083,26 @@ fastify.post(
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send(
-        createErrorResponse(
-          ErrorCodes.VALIDATION_ERROR,
-          `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          {
-            startLedger,
-            endLedger,
-            fromLedger,
-            toLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
-          },
-          request.id,
-        ),
-      );
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger,
+        toLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
     }
 
-    // Duplicate-replay conflict: an identical replay is already in flight.
-    // Event-level dedupe (P2002 skip) still applies, so this only prevents
-    // queueing a second pass over the same range while the first is running.
     const activeReplay = getActiveReplayJob();
     const activeReplayData = activeReplay?.data as
       | { fromLedger?: number; toLedger?: number }
@@ -1167,25 +1168,26 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send(
-        createErrorResponse(
-          ErrorCodes.VALIDATION_ERROR,
-          `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          {
-            startLedger,
-            endLedger,
-            fromLedger: startLedger,
-            toLedger: endLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
-          },
-          request.id,
-        ),
-      );
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
     }
 
-    // Duplicate-replay conflict: an identical per-contract replay is already in
-    // flight. Matched on contract + range, so a different contract or range
-    // still queues normally.
     const activeContractReplay = getActiveReplayJob();
     const activeContractReplayData = activeContractReplay?.data as
       | { contractId?: string; fromLedger?: number; toLedger?: number }
