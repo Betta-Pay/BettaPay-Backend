@@ -18,9 +18,10 @@
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments             — list payments, merchant-scoped (protected, #553)
  *   GET    /api/payments/:id         — fetch payment session
+ *   GET    /api/payments/:id/events  — ordered on-chain events for one payment (owner/admin)
  *   PATCH  /api/payments/:id/status  — transition payment status (protected)
  *   POST   /api/settlements          — trigger settlement (protected)
- *   GET    /api/deployments          — Soroban contract addresses (testnet)
+ *   GET    /api/deployments          — Soroban contract addresses (testnet, ETag-aware)
  *   GET    /api/rates                — proxy to FX engine (timeout-aware)
  *   GET    /api/currencies           — proxy to FX engine (timeout-aware)
  *   GET    /api/quote                — proxy to FX engine (timeout-aware)
@@ -165,6 +166,10 @@ type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
 
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const IDEMPOTENCY_TTL_SECONDS = IDEMPOTENCY_TTL_MS / 1000;
+// Bulk-cancel summaries share the existing Redis idempotency store. The key is
+// deliberately namespaced so it cannot collide with payment/settlement keys.
+const BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX = "idempotency:bulk-cancel:";
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -223,6 +228,210 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
   const key = Array.isArray(raw) ? raw[0] : raw;
   return (key as string).trim() || null;
 }
+
+// ── Conditional requests (#918) ──────────────────────────────────────────────
+// Deployment metadata is derived from process environment variables, so it
+// cannot change while the process is running. Hashing the exact serialized
+// response lets clients revalidate it with If-None-Match instead of
+// re-downloading the whole payload on every dashboard load.
+export function computeDeploymentsEtag(serializedPayload: string): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(serializedPayload)
+    .digest("base64url");
+  return `W/"${digest}"`;
+}
+
+/** Weak comparison for If-None-Match, accepting a comma-separated tag list. */
+export function isEtagMatch(
+  ifNoneMatch: string | string[] | undefined,
+  etag: string,
+): boolean {
+  if (!ifNoneMatch) return false;
+  const header = Array.isArray(ifNoneMatch)
+    ? ifNoneMatch.join(",")
+    : ifNoneMatch;
+  const normalized = etag.replace(/^W\//, "");
+  return header
+    .split(",")
+    .map((candidate) => candidate.trim())
+    .some(
+      (candidate) =>
+        candidate === "*" || candidate.replace(/^W\//, "") === normalized,
+    );
+}
+
+export interface DeploymentsResponsePayload {
+  data: {
+    network: string;
+    contracts: { name: string; contractId: string; explorerUrl: string }[];
+    updatedAt: string;
+  };
+}
+
+/**
+ * Builds the public deployment-descriptor response. `updatedAt` is supplied by
+ * the caller so a process can snapshot the descriptor once and serve a stable
+ * representation (and ETag) for its whole lifetime.
+ */
+export function buildDeploymentsResponse(input: {
+  networkPassphrase: string;
+  settlementContractId: string;
+  governanceContractId: string;
+  updatedAt?: string;
+}): DeploymentsResponsePayload {
+  // #761 — explorer links must follow the configured network, not assume
+  // testnet, or a mainnet receipt points a member at the wrong ledger viewer
+  // during an incident.
+  const isMainnet = input.networkPassphrase
+    .toLowerCase()
+    .includes("public global");
+  const explorerContractBase = isMainnet
+    ? "https://stellar.expert/explorer/public/contract"
+    : "https://lab.stellar.org/r/testnet/contract";
+
+  return {
+    data: {
+      network: input.networkPassphrase,
+      contracts: [
+        {
+          name: "Settlement contract",
+          contractId: input.settlementContractId,
+          explorerUrl: `${explorerContractBase}/${input.settlementContractId}`,
+        },
+        {
+          name: "Governance contract",
+          contractId: input.governanceContractId,
+          explorerUrl: `${explorerContractBase}/${input.governanceContractId}`,
+        },
+      ],
+      updatedAt: input.updatedAt ?? new Date().toISOString(),
+    },
+  };
+}
+
+// ── Payment event helpers (#916) ─────────────────────────────────────────────
+// Indexer payloads have varied slightly across event versions, so accept the
+// documented envelope (`payload.payment.id`) as well as the flatter shapes
+// emitted by older deployments. Topics are also checked because some events
+// carry the payment id there rather than in the decoded body.
+export interface PaymentEventLike {
+  id?: string;
+  ledger: number;
+  indexedAt: string;
+  topics?: string[];
+  decodedPayload?: unknown;
+}
+
+export function eventBelongsToPayment(
+  event: PaymentEventLike,
+  paymentId: string,
+): boolean {
+  const payload = event.decodedPayload as any;
+  const candidates = [
+    payload?.payload?.payment?.id,
+    payload?.payload?.paymentId,
+    payload?.payment?.id,
+    payload?.paymentId,
+    payload?.payment_id,
+  ];
+  if (
+    candidates.some(
+      (candidate) => typeof candidate === "string" && candidate === paymentId,
+    )
+  ) {
+    return true;
+  }
+  return Boolean(event.topics?.includes(paymentId));
+}
+
+/** Deterministic order: ledger ascending, then indexed timestamp, then id. */
+export function comparePaymentEvents(
+  a: PaymentEventLike,
+  b: PaymentEventLike,
+): number {
+  if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+  const at = Date.parse(a.indexedAt);
+  const bt = Date.parse(b.indexedAt);
+  if (at !== bt) return at - bt;
+  return String(a.id ?? "").localeCompare(String(b.id ?? ""));
+}
+
+// ── Route contracts ──────────────────────────────────────────────────────────
+// Exported so the tests can assert the published contract even though Fastify's
+// swagger plugin is registered without an await in this synchronous app factory
+// (a pre-existing limitation that leaves /api/docs/json empty).
+const ETAG_HEADER_DOC = {
+  description:
+    "Weak entity tag derived from the serialized deployments payload. Send " +
+    "this value as If-None-Match to receive 304 Not Modified when the " +
+    "deployment metadata has not changed.",
+  schema: { type: "string" },
+};
+
+export const deploymentsRouteSchema = {
+  description:
+    "Soroban contract addresses for the configured network. Supports " +
+    "conditional requests: the ETag header identifies the current " +
+    "deployments payload and a matching If-None-Match returns 304 with " +
+    "an empty body.",
+  response: {
+    200: {
+      description: "Current deployment metadata.",
+      headers: {
+        ETag: ETAG_HEADER_DOC,
+      },
+    },
+    304: {
+      description:
+        "The caller's If-None-Match matched the current ETag; the body " +
+        "is empty.",
+      headers: {
+        ETag: ETAG_HEADER_DOC,
+      },
+    },
+  },
+};
+
+export const paymentsListRouteSchema = {
+  description:
+    "List payments, merchant-scoped and paginated. The optional `from` " +
+    "and `to` bounds filter on `createdAt`; both boundaries are " +
+    "inclusive (createdAt >= from and createdAt <= to) and interpreted " +
+    "as UTC instants. `from` must not be after `to`.",
+  querystring: {
+    type: "object",
+    additionalProperties: true,
+    properties: {
+      from: {
+        type: "string",
+        description:
+          "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
+      },
+      to: {
+        type: "string",
+        description:
+          "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
+      },
+    },
+  },
+};
+
+export const paymentEventsRouteSchema = {
+  description:
+    "Return the indexed on-chain events for a single payment, ordered " +
+    "deterministically by ledger sequence, then indexed timestamp, then " +
+    "event id. Only the owning merchant or an admin may read them; other " +
+    "callers receive 404 so the endpoint does not reveal whether a " +
+    "payment id exists.",
+  params: {
+    type: "object",
+    required: ["id"],
+    properties: {
+      id: { type: "string", description: "Payment id." },
+    },
+  },
+};
 
 // Derive isProduction via the shared createValidationContext utility so
 // env-based branching is consistent with the rest of the validation layer
@@ -2614,6 +2823,7 @@ fastify.get('/api/admin/auth/ip-score', {
         await fastify.authenticate(request, reply);
       },
       config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+      schema: paymentsListRouteSchema,
     },
     async (request, reply) => {
       const query = PaymentListQuery.parse(request.query);
@@ -2710,6 +2920,64 @@ fastify.get('/api/admin/auth/ip-score', {
     return { data: payment };
   });
 
+  // GET /api/payments/:id/events — ordered on-chain event trail for one payment.
+  //
+  // Ownership: only the payment's merchant (or the configured admin) may read
+  // the events. Non-owning callers receive the same 404 as an unknown id so the
+  // endpoint cannot be used to probe which payment ids exist.
+  fastify.get<{ Params: { id: string } }>(
+    "/api/payments/:id/events",
+    {
+      preValidation: [fastify.authenticate],
+      config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+      schema: paymentEventsRouteSchema,
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const payment = await prisma.payment.findUnique({ where: { id } });
+      if (!payment) {
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Payment not found"));
+      }
+
+      const requesterMerchantId = (request.user as { merchantId?: string })
+        ?.merchantId;
+      const ownsPayment = requesterMerchantId === payment.merchantId;
+      const isAdmin = requesterMerchantId === env.ADMIN_ADDRESS;
+      if (!ownsPayment && !isAdmin) {
+        // Deliberately 404 rather than 403: a 403 would confirm that the
+        // payment id belongs to another merchant.
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Payment not found"));
+      }
+
+      const events = await indexerClient.getPaymentEvents(
+        payment.merchantId,
+        request.headers,
+      );
+      if (events === null) {
+        // Do not return [] — that would claim the payment has no event trail
+        // when the indexer is simply unreachable.
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.GATEWAY_TIMEOUT,
+              "Event index unavailable, please retry",
+            ),
+          );
+      }
+
+      const paymentEvents = events
+        .filter((event) => eventBelongsToPayment(event, id))
+        .sort(comparePaymentEvents);
+
+      return reply.send({ data: paymentEvents });
+    },
+  );
+
   // Enforce valid status transitions. The DB enum and Prisma allow any status, so
   // this route is the single place that guards the payment state machine.
   fastify.patch<{
@@ -2769,6 +3037,13 @@ fastify.get('/api/admin/auth/ip-score', {
   );
 
   // Bulk-cancel initiated payments belonging to the authenticated merchant.
+  //
+  // Replay safety (#917): when the caller supplies an Idempotency-Key, the
+  // summary is stored in the existing Redis idempotency namespace for the same
+  // 24h TTL as payment/settlement keys. A retry with the same key returns the
+  // stored summary verbatim instead of recomputing over already-cancelled rows,
+  // so operators see the same per-item statuses and totals. Redis expiry is the
+  // cleanup mechanism for these summaries (no new table).
   fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>(
     "/api/payments/bulk-cancel",
     {
@@ -2779,8 +3054,59 @@ fastify.get('/api/admin/auth/ip-score', {
     async (request, reply) => {
       const d = BulkCancelPaymentsBody.parse(request.body);
       const merchantId = (request.user as any).merchantId as string;
+      const idempotencyKey = readIdempotencyKey(request);
 
-      // Deduplicate IDs
+      if (
+        idempotencyKey !== null &&
+        idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LEN
+      ) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              "Idempotency-Key must not exceed 255 characters",
+            ),
+          );
+      }
+
+      const summaryKey =
+        idempotencyKey !== null
+          ? `${BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX}${idempotencyKey}`
+          : null;
+
+      if (summaryKey) {
+        try {
+          const cached = await redis.get(summaryKey);
+          if (cached) {
+            try {
+              const replayed = JSON.parse(cached);
+              if (replayed && typeof replayed === "object") {
+                request.log.info(
+                  { idempotencyKey },
+                  "Bulk-cancel idempotency hit — replaying stored summary",
+                );
+                return reply.code(200).send(replayed);
+              }
+            } catch (err) {
+              request.log.warn(
+                { err, idempotencyKey },
+                "Ignoring unparseable bulk-cancel idempotency summary",
+              );
+            }
+          }
+        } catch (err) {
+          // Redis-down: fall through and perform the cancel. The summary will
+          // not be replayable, but the operation must not be blocked.
+          request.log.warn(
+            { err, idempotencyKey },
+            "Bulk-cancel idempotency lookup failed — proceeding without replay",
+          );
+        }
+      }
+
+      // Deduplicate IDs. The per-item result list mirrors this deduplicated,
+      // input-ordered set so summary shape is stable across replays.
       const uniqueIds = [...new Set(d.paymentIds)];
 
       const payments = await prisma.payment.findMany({
@@ -2791,28 +3117,50 @@ fastify.get('/api/admin/auth/ip-score', {
 
       const cancelledIds: string[] = [];
       const skippedIds: string[] = [];
-      const errors: { id: string; reason: string }[] = [];
+      const errorIds: string[] = [];
+      const toCancelIds: string[] = [];
+      const items: {
+        id: string;
+        status: "cancelled" | "skipped" | "error";
+        reason?: string;
+      }[] = [];
 
       for (const id of uniqueIds) {
         const payment = paymentMap.get(id);
         if (!payment) {
           skippedIds.push(id);
+          items.push({ id, status: "skipped", reason: "not_found" });
           continue;
         }
         if (payment.merchantId !== merchantId) {
           skippedIds.push(id);
+          items.push({ id, status: "skipped", reason: "not_owned" });
+          continue;
+        }
+        if (payment.status === "cancelled") {
+          // A retry (or a fresh-key replay) must report an already-cancelled
+          // payment as cancelled, not as an error/skip.
+          cancelledIds.push(id);
+          items.push({ id, status: "cancelled" });
           continue;
         }
         if (payment.status !== "initiated") {
           skippedIds.push(id);
+          items.push({
+            id,
+            status: "skipped",
+            reason: `status:${payment.status}`,
+          });
           continue;
         }
         cancelledIds.push(id);
+        toCancelIds.push(id);
+        items.push({ id, status: "cancelled" });
       }
 
-      if (cancelledIds.length > 0) {
+      if (toCancelIds.length > 0) {
         await prisma.$transaction(async (tx) => {
-          for (const id of cancelledIds) {
+          for (const id of toCancelIds) {
             const before = paymentMap.get(id)!;
             const updated = await tx.payment.update({
               where: { id },
@@ -2830,13 +3178,33 @@ fastify.get('/api/admin/auth/ip-score', {
         });
       }
 
-      return reply.code(200).send({
+      const summary = {
         cancelled: cancelledIds.length,
         skipped: skippedIds.length,
-        errors: errors.length,
+        errors: errorIds.length,
         cancelledIds,
         skippedIds,
-      });
+        errorIds,
+        items,
+      };
+
+      if (summaryKey) {
+        try {
+          await redis.set(
+            summaryKey,
+            JSON.stringify(summary),
+            "EX",
+            IDEMPOTENCY_TTL_SECONDS,
+          );
+        } catch (err) {
+          request.log.warn(
+            { err, idempotencyKey },
+            "Failed to persist bulk-cancel idempotency summary",
+          );
+        }
+      }
+
+      return reply.code(200).send(summary);
     },
   );
 
@@ -3237,36 +3605,36 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
-  fastify.get("/api/deployments", async (request, reply) => {
-    // #761 — explorer links must follow the configured network, not assume
-    // testnet, or a mainnet receipt points a member at the wrong ledger
-    // viewer during an incident.
-    const isMainnet = env.STELLAR_NETWORK_PASSPHRASE.toLowerCase().includes(
-      "public global",
-    );
-    const explorerContractBase = isMainnet
-      ? "https://stellar.expert/explorer/public/contract"
-      : "https://lab.stellar.org/r/testnet/contract";
-
-    return {
-      data: {
-        network: env.STELLAR_NETWORK_PASSPHRASE,
-        contracts: [
-          {
-            name: "Settlement contract",
-            contractId: env.SETTLEMENT_CONTRACT_ID,
-            explorerUrl: `${explorerContractBase}/${env.SETTLEMENT_CONTRACT_ID}`,
-          },
-          {
-            name: "Governance contract",
-            contractId: env.GOVERNANCE_CONTRACT_ID,
-            explorerUrl: `${explorerContractBase}/${env.GOVERNANCE_CONTRACT_ID}`,
-          },
-        ],
-        updatedAt: new Date().toISOString(),
-      },
-    };
+  // Deployment metadata is fixed for the lifetime of the process (it comes
+  // from env), so snapshot the representation once. This keeps the ETag stable
+  // instead of changing on every request because of a fresh `updatedAt`.
+  const deploymentsPayload = buildDeploymentsResponse({
+    networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE,
+    settlementContractId: env.SETTLEMENT_CONTRACT_ID,
+    governanceContractId: env.GOVERNANCE_CONTRACT_ID,
   });
+  const deploymentsBody = JSON.stringify(deploymentsPayload);
+  const deploymentsEtag = computeDeploymentsEtag(deploymentsBody);
+
+  fastify.get(
+    "/api/deployments",
+    {
+      schema: deploymentsRouteSchema,
+    },
+    async (request, reply) => {
+      if (isEtagMatch(request.headers["if-none-match"], deploymentsEtag)) {
+        return reply
+          .code(304)
+          .header("ETag", deploymentsEtag)
+          .send();
+      }
+
+      return reply
+        .header("ETag", deploymentsEtag)
+        .type("application/json")
+        .send(deploymentsBody);
+    },
+  );
 
   async function proxyFxUpstream(
     request: FastifyRequest,

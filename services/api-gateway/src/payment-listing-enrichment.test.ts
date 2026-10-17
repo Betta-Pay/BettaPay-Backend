@@ -219,3 +219,68 @@ test('Payment listing bulk enrichment: indexer unavailability degrades every pay
   await app.close();
   t.end();
 });
+
+test('Payment listing: from/to filter createdAt with inclusive UTC boundaries (#915)', async (t) => {
+  const createdAt = (iso: string): Date => new Date(iso);
+  const payments = [
+    { id: 'pay_before', merchantId: 'merchant-a', status: 'completed', amount: '1.00', asset: 'USDC', createdAt: createdAt('2026-09-30T23:59:59.999Z') },
+    { id: 'pay_from', merchantId: 'merchant-a', status: 'completed', amount: '2.00', asset: 'USDC', createdAt: createdAt('2026-10-01T00:00:00.000Z') },
+    { id: 'pay_middle', merchantId: 'merchant-a', status: 'completed', amount: '3.00', asset: 'USDC', createdAt: createdAt('2026-10-02T12:00:00.000Z') },
+    { id: 'pay_to', merchantId: 'merchant-a', status: 'completed', amount: '4.00', asset: 'USDC', createdAt: createdAt('2026-10-03T00:00:00.000Z') },
+    { id: 'pay_after', merchantId: 'merchant-a', status: 'completed', amount: '5.00', asset: 'USDC', createdAt: createdAt('2026-10-03T00:00:00.001Z') },
+  ];
+  const app = buildApp({ prisma: createMockPrisma({ payments }) as any, logger: false });
+  await app.ready();
+  const token = generateTestJwt(app, { merchantId: 'merchant-a', ownerId: 'owner-a' });
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/payments?from=2026-10-01T00:00:00.000Z&to=2026-10-03T00:00:00.000Z&limit=100',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200');
+  const body = JSON.parse(res.body);
+  t.deepEqual(
+    body.data.map((p: any) => p.id).sort(),
+    ['pay_from', 'pay_middle', 'pay_to'],
+    'both exact boundaries are included and rows outside the window are excluded',
+  );
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: malformed or inverted from/to ranges are rejected (#915)', async (t) => {
+  const app = buildApp({ prisma: createMockPrisma({ payments: makePayments('merchant-a', 1) }) as any, logger: false });
+  await app.ready();
+  const token = generateTestJwt(app, { merchantId: 'merchant-a', ownerId: 'owner-a' });
+
+  const malformed = await app.inject({
+    method: 'GET',
+    url: '/api/payments?from=not-a-date',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(malformed.statusCode, 400, 'malformed date is a validation error');
+
+  const inverted = await app.inject({
+    method: 'GET',
+    url: '/api/payments?from=2026-10-03T00:00:00.000Z&to=2026-10-01T00:00:00.000Z',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(inverted.statusCode, 400, 'from after to is a validation error');
+
+  const offsetRange = await app.inject({
+    method: 'GET',
+    url: '/api/payments?from=2026-10-01T10:00:00%2B02:00&to=2026-10-01T09:00:00.000Z',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(
+    offsetRange.statusCode,
+    200,
+    'bounds are compared as instants, not lexicographic strings with offsets',
+  );
+
+  await app.close();
+  t.end();
+});
