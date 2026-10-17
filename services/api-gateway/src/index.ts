@@ -33,7 +33,6 @@ import Fastify, {
 } from "fastify";
 import cors from "@fastify/cors";
 import fastifyJwt from "@fastify/jwt";
-import rateLimit from "@fastify/rate-limit";
 import crypto from "crypto";
 import zlib from "zlib";
 import { Transform } from "stream";
@@ -48,6 +47,7 @@ import {
   registerRequestId,
   createLoggerOptions,
   registerTracing,
+  registerRequestContext,
   createRedisClient,
   waitForRedis,
   runStartupChecks,
@@ -109,6 +109,7 @@ import {
   isValidTransition,
   createErrorResponse,
   ErrorCodes,
+  registerSharedRateLimit,
   registerErrorHandler,
   registerServiceAuth,
   createAuditLogger,
@@ -447,6 +448,7 @@ export function buildApp(opts: AppOptions = {}) {
   registerRequestId(fastify);
   registerErrorHandler(fastify);
   registerTracing(fastify);
+  registerRequestContext(fastify);
   registerServiceAuth(fastify, opts.interServiceSecret ?? env.INTER_SERVICE_SECRET);
 
   // Centralized query and path parameter sanitization preHandler hook:
@@ -597,7 +599,7 @@ export function buildApp(opts: AppOptions = {}) {
   // buildApp is synchronous and defines routes before the (unawaited) plugin
   // executes, so the plugin's own hooks never attach to any route. Primary
   // enforcement therefore happens explicitly in the hook below.
-  fastify.register(rateLimit, {
+  registerSharedRateLimit(fastify, {
     max: GLOBAL_RATE_LIMIT_MAX,
     timeWindow: "1 minute",
     skip: () => isRateLimitDisabled(),

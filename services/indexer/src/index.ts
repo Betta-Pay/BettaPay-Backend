@@ -22,7 +22,7 @@ import {
   createWebhookWorker,
   WEBHOOK_DEFAULTS,
 } from "@bettapay/webhook-delivery";
-import { closeWorkerWithTimeout, trackActiveJob } from "./worker-shutdown.js";
+import { closeWorkerWithTimeout, trackActiveJob } from "@bettapay/worker-shutdown";
 import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
@@ -37,7 +37,6 @@ import {
   registerServiceAuth,
   auditRouteAuthPolicy,
   PaginationQuery,
-  EventListQuery,
   DateRangeQuery,
   EVENT_TYPES,
   WebhookUrlSchema,
@@ -48,8 +47,8 @@ import {
   getPrismaLogLevels,
   setupPrismaQueryLogging,
   registerTracing,
+  registerRequestContext,
   genReqId,
-  buildIndexerHealthResponse,
   readServiceVersion,
   createAuditLogger,
   createRedisClient,
@@ -70,8 +69,10 @@ import {
   installCrashHandlers,
   createErrorResponse,
   ErrorCodes,
+  registerSharedRateLimit,
 } from "@bettapay/validation";
-import { buildPaginationMeta } from "@bettapay/shared-types";
+import { registerIndexerHealthRoute } from './routes/health.js';
+import { registerIndexerEventsRoutes } from './routes/events.js';
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
 import * as promClient from "prom-client";
 
@@ -81,7 +82,6 @@ const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
 
 const fastifyInstance = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
@@ -122,7 +122,7 @@ const logAuditEvent = createAuditLogger(
 
 fastify.register(cors, { origin: env.ALLOWED_ORIGINS });
 fastify.register(helmet, { contentSecurityPolicy: false });
-fastify.register(rateLimit, {
+registerSharedRateLimit(fastify, {
   max: 500,
   timeWindow: "1 minute",
   addHeaders: {
@@ -135,6 +135,7 @@ fastify.register(rateLimit, {
 registerErrorHandler(fastify);
 // Distributed tracing: log + propagate x-request-id / x-trace-id (#118).
 registerTracing(fastify);
+registerRequestContext(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
 
@@ -923,8 +924,7 @@ async function flushIndexedEvents(
 // definitions below so Fastify's onRoute hook sees all of them.
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
-  const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
+registerIndexerHealthRoute(fastify, {queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
     redisHealthState,
 
@@ -939,47 +939,12 @@ fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, re
     service: "indexer",
     version: SERVICE_VERSION,
   });
-  const statusCode = health.status === "unhealthy" ? 503 : 200;
-  return reply.code(statusCode).send(health);
+
+registerIndexerEventsRoutes(fastify, {
+  prisma,
+  serviceAuth: fastify.serviceAuth,
+  getLatestLedgerCursor: () => latestLedgerCursor,
 });
-
-// Issue #67 — paginated events endpoint using the shared PaginatedResponse envelope
-// Internal endpoint — requires a valid x-service-token (#117).
-fastify.get(
-  "/api/events",
-  { preValidation: [fastify.serviceAuth] },
-  async (request) => {
-    const { limit, page, type, topic, contractId, fromLedger, toLedger } =
-      EventListQuery.parse(request.query ?? {});
-
-    const where: Record<string, unknown> = {};
-    if (type) where.type = type;
-    if (topic) where.topics = { has: topic };
-    if (contractId) where.contractId = contractId;
-    if (fromLedger !== undefined || toLedger !== undefined) {
-      const ledgerFilter: Record<string, number> = {};
-      if (fromLedger !== undefined) ledgerFilter.gte = fromLedger;
-      if (toLedger !== undefined) ledgerFilter.lte = toLedger;
-      where.ledger = ledgerFilter;
-    }
-
-    const [dbEvents, total] = await Promise.all([
-      prisma.indexedEvent.findMany({
-        where,
-        take: limit,
-        skip: (page - 1) * limit,
-        orderBy: { indexedAt: "desc" },
-      }),
-      prisma.indexedEvent.count({ where }),
-    ]);
-
-    return {
-      data: dbEvents,
-      pagination: buildPaginationMeta(page, limit, total),
-      latestLedgerCursor,
-    };
-  },
-);
 
 // Issue #68 — replay historical events for a ledger range (all contracts)
 // Issue #76 — extended to iterate over all configured contract IDs

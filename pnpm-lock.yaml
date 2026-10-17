@@ -25,7 +25,7 @@ importers:
         version: 7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3)
       '@stellar/stellar-sdk':
         specifier: ^15.1.0
-        version: 15.1.0
+        version: 15.1.0(debug@4.4.3)
       bullmq:
         specifier: ^5.78.0
         version: 5.80.10
@@ -98,7 +98,7 @@ importers:
         version: 7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3)
       '@stellar/stellar-sdk':
         specifier: ^16.0.1
-        version: 16.0.1
+        version: 16.0.1(debug@4.4.3)
       bullmq:
         specifier: ^5.79.1
         version: 5.80.10
@@ -191,6 +191,9 @@ importers:
       '@bettapay/webhook-delivery':
         specifier: workspace:*
         version: link:../../shared/webhook-delivery
+      '@bettapay/worker-shutdown':
+        specifier: workspace:*
+        version: link:../../shared/worker-shutdown
       '@fastify/cors':
         specifier: '*'
         version: 11.3.0
@@ -208,7 +211,7 @@ importers:
         version: 7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3)
       '@stellar/stellar-sdk':
         specifier: '*'
-        version: 16.0.1
+        version: 16.0.1(debug@4.4.3)
       bullmq:
         specifier: '*'
         version: 5.80.10
@@ -258,6 +261,9 @@ importers:
       '@bettapay/webhook-delivery':
         specifier: workspace:*
         version: link:../../shared/webhook-delivery
+      '@bettapay/worker-shutdown':
+        specifier: workspace:*
+        version: link:../../shared/worker-shutdown
       '@fastify/cors':
         specifier: ^11.2.0
         version: 11.3.0
@@ -330,6 +336,9 @@ importers:
       '@bettapay/stellar-utils':
         specifier: workspace:^
         version: link:../stellar-utils
+      '@fastify/rate-limit':
+        specifier: ^11.1.0
+        version: 11.1.0
       '@prisma/extension-read-replicas':
         specifier: ^0.5.0
         version: 0.5.0(@prisma/client@7.9.0(prisma@7.9.0(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3))(typescript@5.9.3))
@@ -368,6 +377,19 @@ importers:
       ts-node:
         specifier: ^10.9.2
         version: 10.9.2(@types/node@20.19.43)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.3.3
+        version: 5.9.3
+
+  shared/worker-shutdown:
+    dependencies:
+      bullmq:
+        specifier: '*'
+        version: 5.80.10
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.19.43
       typescript:
         specifier: ^5.3.3
         version: 5.9.3
@@ -2514,10 +2536,10 @@ snapshots:
       buffer: 6.0.3
       sha.js: 2.4.12
 
-  '@stellar/stellar-sdk@15.1.0':
+  '@stellar/stellar-sdk@15.1.0(debug@4.4.3)':
     dependencies:
       '@stellar/stellar-base': 15.0.0
-      axios: 1.15.0
+      axios: 1.15.0(debug@4.4.3)
       bignumber.js: 9.3.1
       commander: 14.0.3
       eventsource: 2.0.2
@@ -2528,12 +2550,12 @@ snapshots:
     transitivePeerDependencies:
       - debug
 
-  '@stellar/stellar-sdk@16.0.1':
+  '@stellar/stellar-sdk@16.0.1(debug@4.4.3)':
     dependencies:
       '@noble/ed25519': 3.1.0
       '@noble/hashes': 2.2.0
       '@stellar/js-xdr': 4.0.0
-      axios: 1.16.1
+      axios: 1.16.1(debug@4.4.3)
       base32.js: 0.1.0
       bignumber.js: 11.1.5
       buffer: 6.0.3
@@ -2774,17 +2796,17 @@ snapshots:
 
   aws-ssl-profiles@1.1.2: {}
 
-  axios@1.15.0:
+  axios@1.15.0(debug@4.4.3):
     dependencies:
-      follow-redirects: 1.16.0
+      follow-redirects: 1.16.0(debug@4.4.3)
       form-data: 4.0.6
       proxy-from-env: 2.1.0
     transitivePeerDependencies:
       - debug
 
-  axios@1.16.1:
+  axios@1.16.1(debug@4.4.3):
     dependencies:
-      follow-redirects: 1.16.0
+      follow-redirects: 1.16.0(debug@4.4.3)
       form-data: 4.0.6
       https-proxy-agent: 5.0.1
       proxy-from-env: 2.1.0
@@ -3270,7 +3292,9 @@ snapshots:
       fast-querystring: 1.1.2
       safe-regex2: 5.1.1
 
-  follow-redirects@1.16.0: {}
+  follow-redirects@1.16.0(debug@4.4.3):
+    optionalDependencies:
+      debug: 4.4.3
 
   for-each@0.3.5:
     dependencies:
