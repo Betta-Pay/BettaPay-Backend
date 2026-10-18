@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateEnv, validateEnvOrExit } from './index.js';
 
+// Valid Stellar C-strkeys (C + 55 chars from A-Z,2-7 = 56 total)
+const VALID_CONTRACT_ID = 'C' + 'A'.repeat(55);
+const VALID_CONTRACT_ID_2 = 'C' + 'B'.repeat(55);
+
 function validEnv(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: 'test',
@@ -9,8 +13,8 @@ function validEnv(overrides: Record<string, string> = {}): Record<string, string
     GOOGLE_CLIENT_ID: 'test-client-id',
     INTER_SERVICE_SECRET: 'a'.repeat(16),
     DATABASE_URL: 'postgres://user:pass@localhost:5432/db',
-    SETTLEMENT_CONTRACT_ID: 'CONTRACT123',
-    GOVERNANCE_CONTRACT_ID: 'CONTRACT456',
+    SETTLEMENT_CONTRACT_ID: VALID_CONTRACT_ID,
+    GOVERNANCE_CONTRACT_ID: VALID_CONTRACT_ID_2,
     ADMIN_ADDRESS: 'GADMIN',
     ADMIN_SECRET: 'SADMIN',
     FIELD_ENCRYPTION_KEY: 'b'.repeat(32),
@@ -21,7 +25,7 @@ function validEnv(overrides: Record<string, string> = {}): Record<string, string
 test('validateEnv returns parsed config when all required variables are valid', () => {
   const env = validateEnv(validEnv());
   assert.equal(env.JWT_SECRET, 'a'.repeat(32));
-  assert.deepEqual(env.CONTRACT_IDS, ['CONTRACT123']);
+  assert.deepEqual(env.CONTRACT_IDS, [VALID_CONTRACT_ID]);
 });
 
 test('validateEnv throws with a human-readable message for a too-short secret', () => {

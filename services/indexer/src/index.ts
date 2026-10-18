@@ -22,7 +22,7 @@ import {
   createWebhookWorker,
   WEBHOOK_DEFAULTS,
 } from "@bettapay/webhook-delivery";
-import { closeWorkerWithTimeout, trackActiveJob } from "./worker-shutdown.js";
+import { closeWorkerWithTimeout, trackActiveJob } from "@bettapay/worker-shutdown";
 import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import pg from "pg";
@@ -67,6 +67,9 @@ import {
   anchorSettledEvent,
   isFeatureEnabled,
   logFeatureFlags,
+  installCrashHandlers,
+  createErrorResponse,
+  ErrorCodes,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -82,8 +85,13 @@ import rateLimit from "@fastify/rate-limit";
 
 const fastifyInstance = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
+  // Explicit 1MB cap. Fastify's default is 1MB but the implicit value is not
+  // visible at the call site; stated explicitly so the limit is auditable and
+  // matches the other services.
+  bodyLimit: 1_048_576,
 });
 export const fastify = fastifyInstance;
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 const pool = new pg.Pool({
   connectionString: buildPrismaConnectionUrl(
@@ -129,11 +137,6 @@ registerErrorHandler(fastify);
 registerTracing(fastify);
 // Inter-service auth: internal endpoints require a valid x-service-token (#117).
 registerServiceAuth(fastify, env.INTER_SERVICE_SECRET);
-
-fastify.register(rateLimit, {
-  max: 500,
-  timeWindow: "1 minute",
-});
 
 // Served on its own port (see startMetricsServer below), not on the
 // application port — keeps the scrape endpoint unauthenticated without
@@ -222,6 +225,13 @@ const indexerLedgerTimeoutsCounter = new promClient.Counter({
 const indexerLedgerSkipsCounter = new promClient.Counter({
   name: "indexer_ledger_skips_total",
   help: "Total number of ledger retries/skips due to stuck ledgers",
+});
+
+// Issue #892 — dedup-ratio counter: tracks how many events were dropped as
+// duplicates so operators can derive the ratio against eventsFetchedCounter.
+const indexerDedupEventsTotal = new promClient.Counter({
+  name: "indexer_dedup_events_total",
+  help: "Total number of on-chain events dropped as duplicates (Prisma P2002 / skipDuplicates)",
 });
 
 function parseRetryAfterMs(err: unknown): number | null {
@@ -488,7 +498,8 @@ const replayWorker = new Worker(
               ? evt.topic.map(String)
               : [String(evt.topic)];
             const rawValue = evt.value.toXDR("base64");
-            const decodedPayload = decodeScVal(evt.value, topics[0]);
+            const decodedPayload =
+              decodeScVal(evt.value, topics[0]) ?? null;
             const resolvedContractId = evt.contractId
               ? evt.contractId.toString()
               : targetContractId;
@@ -654,22 +665,27 @@ function serializeNative(value: unknown): unknown {
   return value;
 }
 
-function decodeScVal(evtValue: xdr.ScVal, topicHint: string): unknown {
+/** @internal exported for testing only */
+export function decodeScVal(
+  evtValue: xdr.ScVal,
+  topicHint: string,
+): unknown {
   try {
     const native = scValToNative(evtValue);
     return serializeNative(native);
   } catch (err) {
     fastify.log.warn(
       { topicHint, err: String(err) },
-      "[Indexer] Failed to decode XDR — raw value preserved",
+      "[Indexer] Failed to decode XDR — event skipped",
     );
-    return null;
+    return undefined;
   }
 }
 
 // ── Event payload validation ──────────────────────────────────────────────────
 
-const EVENT_SCHEMA_MAP: Record<string, z.ZodTypeAny> = {
+/** @internal exported for testing only */
+export const EVENT_SCHEMA_MAP: Record<string, z.ZodTypeAny> = {
   PaymentInitiated: paymentInitiatedEvent,
   PaymentCompleted: paymentCompletedEvent,
   SettlementTriggered: settlementTriggeredEvent,
@@ -678,7 +694,8 @@ const EVENT_SCHEMA_MAP: Record<string, z.ZodTypeAny> = {
   AnchorSettled: anchorSettledEvent,
 };
 
-function validatePayload(type: string, payload: unknown): string | null {
+/** @internal exported for testing only */
+export function validatePayload(type: string, payload: unknown): string | null {
   const schema = EVENT_SCHEMA_MAP[type];
   if (!schema) return null;
   const result = schema.safeParse(payload);
@@ -784,6 +801,7 @@ export async function persistEvent(
         { stellarId, contractId, ledger, type },
         "[Indexer] Duplicate event — skipping (composite constraint)",
       );
+      indexerDedupEventsTotal.inc();
       return null;
     }
     throw err;
@@ -903,6 +921,11 @@ async function flushIndexedEvents(
     }
   }
 
+  const deduped = data.length - records.length;
+  if (deduped > 0) {
+    indexerDedupEventsTotal.inc(deduped);
+  }
+
   const maxInsertedLedger = records.reduce<number | null>((max, record) => {
     const ledger = typeof record.ledger === "number" ? record.ledger : null;
     if (ledger === null) return max;
@@ -920,7 +943,7 @@ async function flushIndexedEvents(
 // definitions below so Fastify's onRoute hook sees all of them.
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", async (_request, reply) => {
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildIndexerHealthResponse({queryDatabase: () => prisma.$queryRaw`SELECT 1`,
     pingRedis: () => sharedRedis.ping(),
     redisHealthState,
@@ -1080,19 +1103,42 @@ fastify.post(
 
     const range = toLedger - fromLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
-            startLedger,
-            endLedger,
-            fromLedger,
-            toLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
-          },
-        },
-      });
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger,
+        toLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
+    }
+
+    const activeReplay = getActiveReplayJob();
+    const activeReplayData = activeReplay?.data as
+      | { fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeReplayData?.fromLedger === fromLedger &&
+      activeReplayData?.toLedger === toLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for ledger range ${fromLedger}-${toLedger} is already in progress`,
+          { jobId: activeReplay?.id, fromLedger, toLedger },
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay", { fromLedger, toLedger });
@@ -1126,13 +1172,14 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     // Validate that the contract ID is in the monitored list
     if (!CONTRACT_IDS.includes(contractId)) {
-      return reply.code(422).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Contract ID ${contractId} is not monitored by this indexer`,
-          details: { contractId, monitoredContracts: CONTRACT_IDS },
-        },
-      });
+      return reply.code(422).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          `Contract ID ${contractId} is not monitored by this indexer`,
+          { contractId, monitoredContracts: CONTRACT_IDS },
+          request.id,
+        ),
+      );
     }
 
     const parsedContractReplay = PerContractReplayBody.parse(request.body);
@@ -1141,19 +1188,48 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
 
     const range = endLedger - startLedger;
     if (range > MAX_REPLAY_LEDGER_RANGE) {
-      return reply.code(400).send({
-        error: {
-          code: "VALIDATION_ERROR",
-          message: `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`,
-          details: {
-            startLedger,
-            endLedger,
+      const message = `Ledger range exceeds maximum of ${MAX_REPLAY_LEDGER_RANGE} (requested ${range})`;
+      const details = {
+        startLedger,
+        endLedger,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        maxRange: MAX_REPLAY_LEDGER_RANGE,
+      };
+      return reply
+        .code(400)
+        .send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            message,
+            details,
+            request.id,
+          ),
+        );
+    }
+
+    const activeContractReplay = getActiveReplayJob();
+    const activeContractReplayData = activeContractReplay?.data as
+      | { contractId?: string; fromLedger?: number; toLedger?: number }
+      | undefined;
+    if (
+      activeContractReplayData?.contractId === contractId &&
+      activeContractReplayData?.fromLedger === startLedger &&
+      activeContractReplayData?.toLedger === endLedger
+    ) {
+      return reply.code(409).send(
+        createErrorResponse(
+          "CONFLICT",
+          `A replay for contract ${contractId} over ledger range ${startLedger}-${endLedger} is already in progress`,
+          {
+            jobId: activeContractReplay?.id,
+            contractId,
             fromLedger: startLedger,
             toLedger: endLedger,
-            maxRange: MAX_REPLAY_LEDGER_RANGE,
           },
-        },
-      });
+          request.id,
+        ),
+      );
     }
 
     const job = await replayQueue.add("replay-contract", {
@@ -1191,12 +1267,14 @@ fastify.get<{ Params: { jobId: string } }>(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
       if (!raw) {
-        return reply.code(404).send({
-          error: {
-            code: "NOT_FOUND",
-            message: `Replay job ${jobId} not found`,
-          },
-        });
+        return reply.code(404).send(
+          createErrorResponse(
+            ErrorCodes.NOT_FOUND,
+            `Replay job ${jobId} not found`,
+            undefined,
+            request.id,
+          ),
+        );
       }
       const progress = JSON.parse(raw);
       return { jobId, ...progress };
@@ -1205,12 +1283,14 @@ fastify.get<{ Params: { jobId: string } }>(
         { err, jobId },
         "[Indexer] Failed to read replay progress",
       );
-      return reply.code(500).send({
-        error: {
-          code: "INTERNAL_ERROR",
-          message: "Failed to read replay progress",
-        },
-      });
+      return reply.code(500).send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          "Failed to read replay progress",
+          undefined,
+          request.id,
+        ),
+      );
     }
   },
 );
@@ -1222,13 +1302,36 @@ fastify.post(
     preValidation: [fastify.serviceAuth],
   },
   async (request, reply) => {
-    const { dryRun } = CleanupQuery.parse(request.query ?? {});
-    if (dryRun) {
-      const dryResult = await cleanupOldEvents(true);
-      return reply.code(200).send(dryResult);
+    let dryRun = false;
+    try {
+      ({ dryRun } = CleanupQuery.parse(request.query ?? {}));
+    } catch (err) {
+      fastify.log.warn(
+        { err, reqId: request.id },
+        "[Indexer] Invalid cleanup query",
+      );
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.INVALID_REQUEST,
+          err instanceof Error ? err.message : "Invalid cleanup query",
+          undefined,
+          request.id,
+        ),
+      );
     }
-    const deletedCount = await cleanupOldEvents();
-    return reply.code(200).send({ status: "completed", deletedCount });
+
+    // Both modes return the same fields; only `status` (and whether rows were
+    // deleted) differs. A real run reports the preview of what it removed.
+    const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
+    if (dryRun) {
+      return reply
+        .code(200)
+        .send({ status: "dry-run", ...preview, deletedCount: 0 });
+    }
+    const deletedCount = (await cleanupOldEvents()) as number;
+    return reply
+      .code(200)
+      .send({ status: "completed", ...preview, deletedCount });
   },
 );
 
@@ -1287,12 +1390,9 @@ fastify.delete<{ Params: { id: string } }>(
       where: { id },
     });
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+      );
     }
     await prisma.$transaction(async (tx) => {
       await tx.webhookSubscription.delete({ where: { id } });
@@ -1321,12 +1421,14 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
     });
 
     if (!existing) {
-      return reply.code(404).send({
-        error: {
-          code: "NOT_FOUND",
-          message: `Webhook subscription ${id} not found`,
-        },
-      });
+      return reply.code(404).send(
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
+      );
     }
 
     // #624: this route sits behind serviceAuth (any trusted internal caller,
@@ -1345,12 +1447,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       callerMerchantId &&
       existing.merchantId !== callerMerchantId
     ) {
-      return reply.code(403).send({
-        error: {
-          code: "FORBIDDEN",
-          message: "Cannot test webhook subscription owned by another merchant",
-        },
-      });
+      return reply.code(403).send(
+        createErrorResponse(ErrorCodes.FORBIDDEN, "Cannot test webhook subscription owned by another merchant"),
+      );
     }
 
     const payload = {
@@ -1379,7 +1478,12 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       connection: sharedRedis,
     });
     try {
-      await job.waitUntilFinished(queueEvents);
+      const finished = await Promise.race([
+        job.waitUntilFinished(queueEvents),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
+        ),
+      ]);
 
       const testedAt = new Date();
       await prisma.webhookSubscription.update({
@@ -1464,9 +1568,9 @@ fastify.post<{ Params: { id: string } }>(
     const { id } = request.params;
     const job = await dlqQueue.getJob(id);
     if (!job) {
-      return reply.code(404).send({
-        error: { code: "NOT_FOUND", message: `DLQ job ${id} not found` },
-      });
+      return reply.code(404).send(
+        createErrorResponse(ErrorCodes.NOT_FOUND, `DLQ job ${id} not found`),
+      );
     }
 
     // Re-enqueue on the main webhook delivery queue. Custom headers
@@ -1574,6 +1678,7 @@ async function pollEvents() {
       // event). Decode/validate are unchanged; every event still becomes its
       // own row, including events carrying a validationError.
       const pendingEvents: Prisma.IndexedEventCreateManyInput[] = [];
+      let skippedEventCount = 0;
 
       for (const evt of response.events) {
         if (aborted) break;
@@ -1598,7 +1703,18 @@ async function pollEvents() {
         const contractName = getContractName(resolvedContractId);
         const stellarId = typeof evt.id === "string" ? evt.id : null;
 
+        // A malformed payload is logged by decodeScVal and skipped so one bad
+        // event cannot stall the cycle; later events are still processed.
+        if (decodedPayload === undefined) {
+          skippedEventCount++;
+          continue;
+        }
+
         const validationError = validatePayload(topics[0], decodedPayload);
+        if (validationError !== null) {
+          skippedEventCount++;
+          continue;
+        }
 
         pendingEvents.push({
           id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
@@ -1616,6 +1732,13 @@ async function pollEvents() {
         });
 
         eventsFetchedCounter.inc({ contractId: resolvedContractId });
+      }
+
+      if (skippedEventCount > 0) {
+        fastify.log.warn(
+          { skipped: skippedEventCount, processed: pendingEvents.length },
+          "[Indexer] Skipped events that failed decode or validation",
+        );
       }
 
       if (pendingEvents.length > 0) {

@@ -49,10 +49,11 @@ export type PaginatedResponse<T> = {
 // Single source of truth for computing pagination metadata so every list
 // endpoint (settlements, events, audit log, ...) reports identical semantics.
 export function buildPaginationMeta(page: number, limit: number, total: number): PaginationMeta {
-  const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
+  const totalPages = total === 0 ? 0 : Math.ceil(total / normalizedLimit);
   return {
     page,
-    limit,
+    limit: normalizedLimit,
     total,
     totalPages,
     hasNext: total > 0 && page < totalPages,

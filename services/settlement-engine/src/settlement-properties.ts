@@ -107,3 +107,34 @@ export function assertSettlementInvariants({
     throw new Error('Settlement invariant violated: feeBps must be within [0, 10000]');
   }
 }
+
+/**
+ * Prisma Query Timeout Configuration (#923)
+ *
+ * Configurable statement timeout for settlement Prisma queries to prevent
+ * slow database calls from holding connection-pool slots indefinitely.
+ *
+ * Timeout is applied via SET LOCAL statement_timeout in PostgreSQL.
+ * Queries exceeding this timeout will be aborted and surface as QueryTimeoutError.
+ *
+ * Default: 5000ms (5 seconds)
+ * Min: 1000ms (1 second)
+ * Max: 60000ms (60 seconds)
+ */
+export const SETTLEMENT_QUERY_TIMEOUT_MS = Number(
+  process.env.SETTLEMENT_QUERY_TIMEOUT_MS ?? 5000
+);
+
+export function validateQueryTimeout(): void {
+  const MIN_TIMEOUT = 1000;
+  const MAX_TIMEOUT = 60000;
+
+  if (
+    SETTLEMENT_QUERY_TIMEOUT_MS < MIN_TIMEOUT ||
+    SETTLEMENT_QUERY_TIMEOUT_MS > MAX_TIMEOUT
+  ) {
+    throw new Error(
+      `SETTLEMENT_QUERY_TIMEOUT_MS (${SETTLEMENT_QUERY_TIMEOUT_MS}ms) must be within [${MIN_TIMEOUT}, ${MAX_TIMEOUT}]`
+    );
+  }
+}

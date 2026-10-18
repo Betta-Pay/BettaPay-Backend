@@ -7,7 +7,77 @@
   "components": {
     "schemas": {}
   },
-  "paths": {},
+  "paths": {
+    "/api/payments": {
+      "get": {
+        "summary": "List payments",
+        "description": "Lists payments with a bounded page size. By default soft-deleted (deleted-merchant) payments are excluded. Service-auth admin callers may pass includeDeleted=true to include them; merchant JWT callers may not.",
+        "parameters": [
+          {
+            "name": "merchantId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Filter to one merchant. Honoured only for service-auth admin callers; JWT callers are always scoped to their own merchant."
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "default": 1 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+            "description": "Page size. Maximum 100; default 50."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["initiated", "completed", "failed", "cancelled"]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "format": "date-time" }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "format": "date-time" }
+          },
+          {
+            "name": "includeEvents",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "boolean", "default": false },
+            "description": "Batch on-chain event enrichment for the page."
+          },
+          {
+            "name": "includeDeleted",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "boolean", "default": false },
+            "description": "Admin-only (service-auth) flag. When true, payments belonging to soft-deleted merchants are included. A merchant JWT caller is rejected with 403."
+          }
+        ],
+        "responses": {
+          "200": { "description": "Paginated payments" },
+          "400": { "description": "Invalid query parameters" },
+          "401": { "description": "Authentication required" },
+          "403": { "description": "includeDeleted requested by a non-admin caller" }
+        }
+      }
+    }
+  },
   "servers": [
     {
       "url": "http://localhost:3000"

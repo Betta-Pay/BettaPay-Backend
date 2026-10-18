@@ -22,3 +22,27 @@ test('GET /api/docs/json returns valid OpenAPI 3 document', async (t) => {
   await app.close();
   t.end();
 });
+
+test('OpenAPI documents the payments listing bounds and includeDeleted flags', async (t) => {
+  const { app } = await createTestApp();
+
+  const res = await app.inject({ method: 'GET', url: '/api/docs/json' });
+  t.equal(res.statusCode, 200, 'returns 200');
+  const body = JSON.parse(res.body);
+  const params = body.paths?.['/api/payments']?.get?.parameters ?? [];
+  const byName = Object.fromEntries(params.map((p: any) => [p.name, p]));
+
+  t.ok(byName.limit, 'limit parameter is documented');
+  t.equal(byName.limit.schema.default, 50, 'default page size is documented');
+  t.equal(byName.limit.schema.maximum, 100, 'maximum page size is documented');
+  t.ok(byName.includeDeleted, 'includeDeleted is documented');
+  t.equal(byName.includeDeleted.schema.default, false, 'includeDeleted defaults to false');
+  t.match(
+    byName.includeDeleted.description,
+    /admin|service-auth/i,
+    'includeDeleted documents the admin authorization',
+  );
+
+  await app.close();
+  t.end();
+});

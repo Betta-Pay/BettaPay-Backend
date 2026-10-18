@@ -136,8 +136,19 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
         return null;
       }
 
-      const body = (await res.json()) as { events?: unknown };
-      const events = Array.isArray(body?.events) ? (body.events as IndexerEvent[]) : [];
+      const body = (await res.json()) as {
+        events?: unknown;
+        data?: unknown;
+      };
+      // /api/events currently returns the shared PaginatedResponse envelope
+      // (`{ data: [...] }`); older indexers returned `{ events: [...] }`.
+      // Accept both so payment event trails work against either deployment.
+      const rawEvents = Array.isArray(body?.events)
+        ? body.events
+        : Array.isArray(body?.data)
+          ? body.data
+          : [];
+      const events = rawEvents as IndexerEvent[];
 
       return events.filter((e) => e?.type === PAYMENT_COMPLETED_TYPE);
     } catch (err) {

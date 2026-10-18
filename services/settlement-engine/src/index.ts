@@ -43,14 +43,43 @@ import {
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor,
+  type MirrorDelegate,
+} from './domain-events-consumer.js';
+import {
   acquireSemaphore,
   releaseSemaphore,
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { closeWorkerWithTimeout, trackActiveJob } from '@bettapay/worker-shutdown';
 import { validateTimeoutConstants } from './timeout-constants.js';
+
+/**
+ * Mask PII fields before writing to reconcile log lines (#905).
+ * Replaces merchant identifiers and raw amounts with redacted placeholders so
+ * log aggregators never store payment-level PII.
+ */
+function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
+  const out = { ...obj } as Record<string, unknown>;
+  for (const key of Object.keys(out)) {
+    const lk = key.toLowerCase();
+    if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
+      const v = out[key];
+      // Keep a stable prefix for cross-entry correlation without exposing the full id.
+      out[key] = typeof v === 'string' ? `${v.slice(0, 4)}***` : '[REDACTED]';
+    } else if (
+      lk.includes('amount') || lk.includes('diff') || lk.includes('gross') ||
+      lk.includes('fee') || lk.includes('net')
+    ) {
+      out[key] = '[REDACTED]';
+    }
+  }
+  return out as T;
+}
 import { startSettlementReaper } from './settlement-reaper.js';
+import { runSettlementBatching } from './settlement-batch-processor.js';
 import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
 
 upstream/main
@@ -84,6 +113,7 @@ import {
   isValidTransition,
   propagateTracingHeaders,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -172,6 +202,7 @@ const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 setupPrismaQueryLogging(prismaBase, fastify.log);
 startPrismaPoolMetricsCollector(pool, promClient.register, 10000, fastify.log, promClient);
@@ -268,6 +299,14 @@ const settlementDelayCounter = new promClient.Counter({
   labelNames: ['merchant_id'],
 });
 
+// Reconciliation status labels for metrics
+const RECONCILIATION_STATUS = {
+  UPSTREAM_ERROR: 'upstream_error',
+  CLEAN: 'clean',
+  DISCREPANCIES_FOUND: 'discrepancies_found',
+  ERROR: 'error',
+} as const;
+
 // Reconciliation metrics (#490)
 const reconciliationRunCounter = new promClient.Counter({
   name: 'settlement_reconciliation_runs_total',
@@ -285,6 +324,21 @@ const reconciliationAmountDiffGauge = new promClient.Gauge({
   name: 'settlement_reconciliation_amount_diff',
   help: 'Absolute difference in amounts between local and gateway',
   labelNames: ['merchant_id', 'amount_type'],
+});
+
+// Issue #890 — settlement queue depth gauge.
+// Uses prom-client's async collect callback so the gauge always reflects the
+// live BullMQ waiting+active count at the moment Prometheus scrapes the metric.
+const settlementQueueDepthGauge = new promClient.Gauge({
+  name: 'settlement_queue_depth',
+  help: 'Current number of jobs in the settlement queue (waiting + active)',
+  collect() {
+    settlementQueue.getJobCounts('waiting', 'active').then((counts) => {
+      this.set((counts.waiting ?? 0) + (counts.active ?? 0));
+    }).catch(() => {
+      // Queue unreachable — leave the gauge at its last value.
+    });
+  },
 });
 
 // Served on its own port (see startMetricsServer below), not on the
@@ -429,8 +483,11 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
       await settlementQueue.add('process-settlement', job.data, {
         delay: requeueDelayMs,
-        attempts: job.opts.attempts,
-        backoff: job.opts.backoff,
+        priority: job.opts.priority,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2_000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
       });
       return;
     }
@@ -477,6 +534,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
+        traceId: job.data.traceId,
       });
     }
   } catch (error) {
@@ -494,6 +552,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
         eventId,
         url: updatedSettlement.webhookUrl,
         eventId: crypto.randomUUID(),
+        traceId: job.data.traceId,
         event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
       }).catch((err: unknown) => {
@@ -519,6 +578,18 @@ const worker = new Worker(
     connection: redis,
     concurrency: 5,
   },
+);
+
+// Domain events consumer (#770): mirrors payment.created events emitted by
+// the gateway. Runs in parallel with the reconcile endpoint; an empty queue
+// is an idle poll and a missing mirror table is a guarded no-op.
+const domainWorker = new Worker(
+  DOMAIN_EVENTS_QUEUE,
+  createDomainEventProcessor(
+    () => (prisma as unknown as { paymentMirror?: MirrorDelegate }).paymentMirror,
+    fastify.log,
+  ),
+  { connection: redis, concurrency: 10 },
 );
 
 const MAX_SETTLEMENT_RETRY_COUNT = 3;
@@ -606,8 +677,11 @@ webhookQueue.on('error', (err) => {
 webhookWorker.on('error', (err) => {
   fastify.log.error({ err: err.message }, 'BullMQ webhook worker connection error');
 });
+domainWorker.on('error', (err) => {
+  fastify.log.error({ err: err.message }, 'Domain events worker error');
+});
 
-fastify.get('/api/health', async (_request, reply) => {
+fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
     queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
@@ -802,7 +876,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     });
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -828,7 +902,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       gatewayRecords = data.data;
     } catch (error) {
       fastify.log.error({ error }, 'Failed to fetch settlements from API Gateway');
-      reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'upstream_error' });
+      reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: RECONCILIATION_STATUS.UPSTREAM_ERROR });
       return reply.code(504).send(
         createErrorResponse(ErrorCodes.GATEWAY_TIMEOUT, 'Failed to fetch settlement records from api-gateway'),
       );
@@ -981,14 +1055,15 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         });
         continue;
       }
+    }
 
     const matchedCount = matchedIds.size - mismatched.length;
     const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;
 
     // Emit metrics (#490)
-    reconciliationRunCounter.inc({ 
-      merchant_id: merchantIdLabel, 
-      status: hasDiscrepancies ? 'discrepancies_found' : 'clean' 
+    reconciliationRunCounter.inc({
+      merchant_id: merchantIdLabel,
+      status: hasDiscrepancies ? RECONCILIATION_STATUS.DISCREPANCIES_FOUND : RECONCILIATION_STATUS.CLEAN
     });
 
     // Update discrepancy gauges
@@ -1005,9 +1080,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
     reconciliationAmountDiffGauge.set({ merchant_id: merchantIdLabel, amount_type: 'fee' }, parseFloat(feeDiff.toString()));
     reconciliationAmountDiffGauge.set({ merchant_id: merchantIdLabel, amount_type: 'net' }, parseFloat(netDiff.toString()));
 
-    // Log discrepancies for alerting
+    // Log discrepancies for alerting (#905: PII fields pass through redactReconcileLog)
     if (hasDiscrepancies) {
-      fastify.log.warn({
+      fastify.log.warn(redactReconcileLog({
         merchantId: merchantIdLabel,
         missing: missing.length,
         extra: extra.length,
@@ -1015,12 +1090,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         grossDiff: grossDiff.toString(),
         feeDiff: feeDiff.toString(),
         netDiff: netDiff.toString(),
-      }, 'Reconciliation discrepancies detected');
+      }), 'Reconciliation discrepancies detected');
     } else {
-      fastify.log.info({
+      fastify.log.info(redactReconcileLog({
         merchantId: merchantIdLabel,
         matched: matchedCount,
-      }, 'Reconciliation completed with no discrepancies');
+      }), 'Reconciliation completed with no discrepancies');
       validCount++;
     }
 
@@ -1090,11 +1165,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       ...(detailMode ? { diffs, truncated } : {}),
       reconciliationType: 'local_consistency_check',
     };
-    }
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation error');
-    reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: 'error' });
-    return reply.code(400).send({ error: 'Failed to perform reconciliation' });
+    reconciliationRunCounter.inc({ merchant_id: merchantIdLabel, status: RECONCILIATION_STATUS.ERROR });
+    return reply.code(422).send(
+      createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Reconciliation diff failed', undefined, request.id),
+    );
   }
 });
 
@@ -1150,7 +1226,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     }
 
     // 2. Fetch api-gateway records via HTTP call
-    const gatewayUrl = process.env.API_GATEWAY_URL || 'http://localhost:3000';
+    const gatewayUrl = env.API_GATEWAY_URL ?? process.env.API_GATEWAY_URL ?? 'http://localhost:3000';
     const url = new URL(`${gatewayUrl}/api/settlements`);
     if (merchantId) url.searchParams.append('merchantId', merchantId);
     if (from) url.searchParams.append('from', from);
@@ -1313,12 +1389,9 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
     };
   } catch (error) {
     fastify.log.error({ error }, 'Reconciliation report error');
-    return reply.code(500).send({ 
-      error: { 
-        code: 'RECONCILIATION_ERROR', 
-        message: 'Failed to generate reconciliation report' 
-      } 
-    });
+    return reply.code(500).send(
+      createErrorResponse(ErrorCodes.INTERNAL_ERROR, 'Failed to generate reconciliation report'),
+    );
   }
 });
 
@@ -1543,7 +1616,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Merchant is suspended'));
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {
@@ -1813,100 +1886,31 @@ const batchWorker = new Worker(
     const batchStartTime = Date.now();
     fastify.log.info({ traceId }, 'Starting settlement batching job');
 
-    // Detect late batch (missed interval)
-    const elapsedMs = batchStartTime - lastBatchCompletedAt;
-    const expectedIntervalMs = env.BATCH_INTERVAL_SECONDS * 1000;
-    if (elapsedMs > expectedIntervalMs * 1.5) {
-      const missedIntervals = Math.floor(elapsedMs / expectedIntervalMs) - 1;
-      fastify.log.warn(
-        { traceId, elapsedMs, missedIntervals },
-        'Batching job running late — catching up missed windows',
-      );
-    }
-
     try {
-      // Fetch all pending settlements (catch-up: these may span missed windows)
-      const pendingSettlements = await prisma.settlement.findMany({
-        where: { status: 'pending' },
-      });
-
-      if (pendingSettlements.length === 0) {
-        fastify.log.info({ traceId }, 'No pending settlements to batch');
-        lastBatchCompletedAt = batchStartTime;
-        return { batched: 0 };
-      }
-
-      // Group by asset
-      const grouped = pendingSettlements.reduce((acc, s) => {
-        if (!acc[s.asset]) acc[s.asset] = [];
-        acc[s.asset].push(s);
-        return acc;
-      }, {} as Record<string, typeof pendingSettlements>);
-
-      let batchedCount = 0;
-
-      // Create batches for assets meeting count or volume threshold
-      for (const [asset, settlements] of Object.entries(grouped)) {
-        const totalCount = settlements.length;
-        const totalGrossBN = settlements.reduce(
-          (sum, s) => sum.plus(s.grossAmount),
-          new BigNumber(0),
-        );
-        const meetsCount = totalCount >= env.BATCH_MIN_COUNT;
-        const meetsVolume = env.BATCH_VOLUME_THRESHOLD > 0 &&
-          totalGrossBN.isGreaterThanOrEqualTo(env.BATCH_VOLUME_THRESHOLD);
-
-        if (meetsCount || meetsVolume) {
-          const totalGross = totalGrossBN.toString();
-          const totalFees = settlements.reduce(
-            (sum, s) => sum.plus(s.feeAmount),
-            new BigNumber(0),
-          ).toString();
-          const totalNet = settlements.reduce(
-            (sum, s) => sum.plus(s.netAmount),
-            new BigNumber(0),
-          ).toString();
-
-          const batch = await prisma.settlementBatch.create({
-            data: {
-              asset,
-              totalCount: settlements.length,
-              totalGross,
-              totalFees,
-              totalNet,
-            },
-          });
-
-          // Update settlements to processing first
-          await prisma.settlement.updateMany({
-            where: { id: { in: settlements.map((s) => s.id) } },
-            data: { status: 'processing' },
-          });
-
-          fastify.log.info(
-            { traceId, batchId: batch.id, asset, count: totalCount, trigger: meetsCount ? 'count' : 'volume' },
-            'Created settlement batch',
-          );
-
-          batchedCount += totalCount;
-        } else {
-          fastify.log.info(
-            { traceId, asset, count: totalCount, grossTotal: totalGrossBN.toString() },
-            'Skipping batch (below min count and volume threshold)',
-          );
-        }
-      }
+      const result = await runSettlementBatching(
+        prisma,
+        {
+          intervalMs: env.BATCH_INTERVAL_SECONDS * 1000,
+          minCount: env.BATCH_MIN_COUNT,
+          volumeThreshold: env.BATCH_VOLUME_THRESHOLD,
+          maxBatchSize: env.BATCH_MAX_SIZE,
+        },
+        lastBatchCompletedAt,
+        fastify.log,
+        batchStartTime,
+        traceId,
+      );
 
       // Emit late-batch metric if we missed the interval
-      if (elapsedMs > expectedIntervalMs * 1.5) {
-        for (const asset of Object.keys(grouped)) {
+      if (result.late) {
+        for (const asset of result.assets) {
           lateBatchCounter.inc({ asset });
         }
       }
 
       lastBatchCompletedAt = batchStartTime;
-      fastify.log.info({ traceId, batchedCount }, 'Settlement batching job completed');
-      return { batched: batchedCount };
+      fastify.log.info({ traceId, batchedCount: result.batched }, 'Settlement batching job completed');
+      return { batched: result.batched };
     } catch (error) {
       fastify.log.error({ traceId, error }, 'Settlement batching job failed');
       throw error;
@@ -1974,6 +1978,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
     await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
+    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
     fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues
@@ -2087,6 +2092,7 @@ export async function closeTestResources(): Promise<void> {
   await step('worker', () => worker.close());
   await step('batchWorker', () => batchWorker.close());
   await step('webhookWorker', () => webhookWorker.close());
+  await step('domainWorker', () => domainWorker.close());
   await step('settlementQueue', () => settlementQueue.close());
   await step('settlementDLQ', () => settlementDLQ.close());
   await step('batchQueue', () => batchQueue.close());

@@ -20,11 +20,14 @@ test('reapStuckSettlements drains processing rows in batches of 200', async (t) 
           .filter((settlement) => settlement.status === args.where.status && settlement.initiatedAt < args.where.initiatedAt.lt)
           .slice(0, args.take);
       },
-      update: async (args: { where: { id: string }; data: { status: string } }) => {
+      updateMany: async (args: { where: { id: string; status: string }; data: { status: string } }) => {
+        const settlement = settlements.find(
+          (row) => row.id === args.where.id && row.status === args.where.status,
+        );
+        if (!settlement) return { count: 0 };
         updates.push(args.where.id);
-        const settlement = settlements.find((row) => row.id === args.where.id);
-        if (settlement) settlement.status = args.data.status;
-        return settlement;
+        settlement.status = args.data.status;
+        return { count: 1 };
       },
     },
   };
@@ -52,8 +55,9 @@ test('reapStuckSettlements does nothing when there are no stale rows', async (t)
   const prisma = {
     settlement: {
       findMany: async () => [],
-      update: async () => {
+      updateMany: async () => {
         updateCount++;
+        return { count: 1 };
       },
     },
   };

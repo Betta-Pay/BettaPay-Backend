@@ -47,11 +47,19 @@ export const ErrorCodes = {
   UNSUPPORTED_CURRENCY_PAIR: "UNSUPPORTED_CURRENCY_PAIR",
   INVALID_AMOUNT: "INVALID_AMOUNT",
   INVALID_QUERY: "INVALID_QUERY",
+  // #911 — a request body exceeded the route's configured limit. Returned as
+  // a typed 413 so clients can distinguish it from a malformed JSON 400.
+  PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
   INVALID_ORIGIN: "INVALID_ORIGIN",
   CONCURRENCY_EXCEEDED: "CONCURRENCY_EXCEEDED",
   // #317 — returned when a suspended merchant attempts to create a payment
   // or settlement. Distinct from INVALID_REQUEST so clients can branch on it.
   MERCHANT_SUSPENDED: "MERCHANT_SUSPENDED",
+  // Returned when a state-transition request is a no-op because the entity is
+  // already in the requested state (e.g. suspending a suspended merchant).
+  // Distinct from INVALID_REQUEST so operators can tell a retry-safe no-op
+  // apart from a genuinely malformed request.
+  MERCHANT_STATE_CONFLICT: "MERCHANT_STATE_CONFLICT",
   QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
   QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
 } as const;
@@ -352,6 +360,17 @@ export const EnvSchema = z
       .transform((s) => parseInt(s, 10))
       .default("500"),
 
+    // FX Engine — maximum accepted body size for the quote verification
+    // route. Configurable so operators can tighten the limit without a code
+    // change; the route applies it with Fastify's per-route bodyLimit.
+    FX_QUOTE_BODY_LIMIT_BYTES: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1048576")
+      .refine((val) => Number.isFinite(val) && val > 0, {
+        message: "FX_QUOTE_BODY_LIMIT_BYTES must be a positive integer",
+      }),
+
     // FX Engine — quote age validation
     QUOTE_MIN_AGE_MS: z
       .string()
@@ -429,6 +448,23 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val >= 1 && val <= 10000, {
         message: "BATCH_MIN_COUNT must be between 1 and 10000",
       }),
+    // Gross volume that batches an asset even when below BATCH_MIN_COUNT (0 disables).
+    BATCH_VOLUME_THRESHOLD: z
+      .string()
+      .transform((s) => Number(s))
+      .default("0")
+      .refine((val) => Number.isFinite(val) && val >= 0, {
+        message: "BATCH_VOLUME_THRESHOLD must be >= 0",
+      }),
+    // Max settlements processed per batching run (0 = unlimited). Remaining
+    // pending settlements are picked up, oldest first, by the next run.
+    BATCH_MAX_SIZE: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("0")
+      .refine((val) => Number.isFinite(val) && val >= 0, {
+        message: "BATCH_MAX_SIZE must be >= 0",
+      }),
 
     // Settlement Engine — optional daily volume limit for pre-validation.
     // When set, the settlement engine rejects settlement creation requests
@@ -446,6 +482,33 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val > 0, {
         message: "SETTLEMENT_JOB_TIMEOUT_MS must be a positive integer",
       }),
+
+    // Abandoned-payments cron — a payment with no activity past this many
+    // minutes is considered abandoned. Also the correlation mechanism for
+    // the webhook reliability metric. Default matches the gateway health
+    // check's current inline fallback (api-gateway/src/health.ts).
+    ABANDONMENT_THRESHOLD_MINUTES: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1440"),
+    // How often the abandoned-payments cron runs (ms). Default matches the
+    // cron's current inline `setInterval` value (api-gateway/src/abandoned-payments-cron.ts).
+    ABANDONED_PAYMENTS_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+    // How often the idempotency-key cleanup cron runs (ms). Default matches
+    // the cron's current inline fallback (api-gateway/src/idempotency-key-cleanup-cron.ts).
+    IDEMPOTENCY_KEY_CLEANUP_CRON_INTERVAL_MS: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("3600000"),
+
+    // Rate-limit kill-switch. Validated here so a typo like "False" (capital
+    // F) fails fast at boot instead of silently being treated as enabled —
+    // the gateway's own disable check (api-gateway/src/index.ts) only matches
+    // exactly 'false' or '0' and is left untouched.
+    RATE_LIMIT_ENABLED: z.enum(["true", "false", "1", "0"]).default("true"),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
@@ -575,6 +638,17 @@ export function validateEnv(env: Record<string, unknown>): Env {
     if (contractIds.length === 0) {
       throw new Error(
         "\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n",
+      );
+    }
+
+    // Issue #910 — Stellar contract strkeys must start with 'C' and be 56
+    // base32 chars (A-Z, 2-7). A malformed ID at startup indicates a config
+    // error that would silently break all on-chain interactions.
+    const CONTRACT_STRKEY_RE = /^C[A-Z2-7]{55}$/;
+    const invalidContractIds = contractIds.filter((id) => !CONTRACT_STRKEY_RE.test(id));
+    if (invalidContractIds.length > 0) {
+      throw new Error(
+        `\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: the following are not valid Stellar contract strkeys: ${invalidContractIds.join(", ")}\n`,
       );
     }
 

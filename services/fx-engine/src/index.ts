@@ -28,6 +28,10 @@ import {
 } from "./quote-computation.js";
 import { Queue, Worker } from "bullmq";
 import {
+  createFallbackTracker,
+  startFallbackWarningLoop,
+} from "./fallback-tracker.js";
+import {
   validateEnvOrExit,
   registerErrorHandler,
   registerRequestId,
@@ -45,12 +49,18 @@ import {
   startMetricsServer,
   RateOverrideBody,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import {
   createHistoryQuerySchema,
   createQuoteQuerySchema,
   createVerifyQuoteBodySchema,
+  resolveFxQuoteBodyLimit,
 } from "./validation.js";
+import {
+  createCircuitBreakerRegistry,
+  type CircuitBreakerState,
+} from "./circuit-breaker.js";
 
 const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? "3002");
@@ -315,105 +325,43 @@ const fxFallbackActive = new promClient.Gauge({
   name: "fx_fallback_active",
   help: "Indicates if the system is currently in fallback mode (1 = fallback, 0 = live)",
 });
-fxFallbackActive.set(0);
 
-// Log every 5 minutes when in fallback mode
-const FALLBACK_WARNING_INTERVAL_MS = 5 * 60 * 1000;
+// Sustained fallback raises an alert through the notifier (#883). The default
+// notifier logs at error level so log-based alerting can pick it up.
+const fallbackTracker = createFallbackTracker({
+  counter: fxFallbackEventsTotal,
+  gauge: fxFallbackActive,
+  notifier: (alert) =>
+    fastify.log.error(alert, "FX fallback alert: sustained fallback to seed rates"),
+});
 
 // ── Circuit breaker for CoinGecko API calls ────────────────────────────────
 //
-// States:
-//   CLOSED   — normal operation; failures are counted.
-//   OPEN     — tripped after CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive
-//              failures; fetches are skipped until the cooldown expires.
-//   HALF_OPEN — after the cooldown a single probe fetch is allowed.
-//              Success → CLOSED, failure → OPEN (resets cooldown).
-//
-// The threshold is hardcoded to 5 (spec requirement). The cooldown window is
-// driven by CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
+// Breakers are keyed per upstream route (see circuit-breaker.ts) so a failing
+// route cannot open the breaker for the others. The threshold is hardcoded to
+// 5 (spec requirement). The cooldown window is driven by
+// CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
 
-export type CircuitBreakerState = "CLOSED" | "OPEN" | "HALF_OPEN";
+export type { CircuitBreakerState };
 
-const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
-
-interface CircuitBreaker {
-  state: CircuitBreakerState;
-  consecutiveFailures: number;
-  openedAt: number | null; // Unix ms when state became OPEN
-  lastTransitionAt: number; // Unix ms of last state change (for observability)
-}
-
-const circuitBreaker: CircuitBreaker = {
-  state: "CLOSED",
-  consecutiveFailures: 0,
-  openedAt: null,
-  lastTransitionAt: Date.now(),
-};
-
-function transitionCircuitBreaker(
-  newState: CircuitBreakerState,
-  log: { info: (obj: object, msg: string) => void },
-): void {
-  const prev = circuitBreaker.state;
-  if (prev === newState) return;
-
-  circuitBreaker.state = newState;
-  circuitBreaker.lastTransitionAt = Date.now();
-
-  if (newState === "OPEN") {
-    circuitBreaker.openedAt = Date.now();
-  } else if (newState === "CLOSED") {
-    circuitBreaker.consecutiveFailures = 0;
-    circuitBreaker.openedAt = null;
-  }
-
-  log.info(
-    {
-      from: prev,
-      to: newState,
-      consecutiveFailures: circuitBreaker.consecutiveFailures,
-    },
-    `Circuit breaker transition: ${prev} → ${newState}`,
-  );
-}
+const RATES_ROUTE = "coingecko";
+const circuitBreakers = createCircuitBreakerRegistry();
 
 function recordCircuitBreakerSuccess(log: {
   info: (obj: object, msg: string) => void;
 }): void {
-  circuitBreaker.consecutiveFailures = 0;
-  if (circuitBreaker.state !== "CLOSED") {
-    transitionCircuitBreaker("CLOSED", log);
-  }
+  circuitBreakers.recordSuccess(RATES_ROUTE, log);
 }
 
 function recordCircuitBreakerFailure(
   log: { info: (obj: object, msg: string) => void },
-  cooldownMs: number,
+  _cooldownMs: number,
 ): void {
-  circuitBreaker.consecutiveFailures += 1;
-
-  if (
-    circuitBreaker.state === "HALF_OPEN" ||
-    (circuitBreaker.state === "CLOSED" &&
-      circuitBreaker.consecutiveFailures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD)
-  ) {
-    transitionCircuitBreaker("OPEN", log);
-  }
+  circuitBreakers.recordFailure(RATES_ROUTE, log);
 }
 
 function getCircuitBreakerState(cooldownMs: number): CircuitBreakerState {
-  if (
-    circuitBreaker.state === "OPEN" &&
-    circuitBreaker.openedAt !== null &&
-    Date.now() - circuitBreaker.openedAt >= cooldownMs
-  ) {
-    // Cooldown elapsed — advance to HALF_OPEN for the next probe.
-    // We do not call transitionCircuitBreaker here to avoid needing a logger
-    // reference; the probe in refreshTick will perform the actual transition.
-    circuitBreaker.state = "HALF_OPEN";
-    circuitBreaker.lastTransitionAt = Date.now();
-  }
-  return circuitBreaker.state;
+  return circuitBreakers.getState(RATES_ROUTE, cooldownMs);
 }
 
 async function fetchBaseRates(): Promise<Record<string, number> | null> {
@@ -461,7 +409,7 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
     };
     lastSuccessfulFetch = Date.now();
     fallbackStartTime = null;
-    fxFallbackActive.set(0);
+    fallbackTracker.recordLive();
     return fetched;
   } catch (err) {
     const e = err as Error;
@@ -524,7 +472,7 @@ async function refreshTick(): Promise<void> {
     if (cbState === "HALF_OPEN") {
       // Log the probe intent for auditing purposes
       fastify.log.info(
-        { consecutiveFailures: circuitBreaker.consecutiveFailures },
+        { consecutiveFailures: circuitBreakers.snapshot(RATES_ROUTE).consecutiveFailures },
         "Circuit breaker HALF_OPEN: probing CoinGecko",
       );
     }
@@ -569,9 +517,8 @@ async function refreshTick(): Promise<void> {
           if (fallbackStartTime === null) {
             fallbackStartTime = Date.now();
             fastify.log.warn("Entering fallback FX rate mode");
-            fxFallbackEventsTotal.inc();
-            fxFallbackActive.set(1);
           }
+          fallbackTracker.recordFallback();
         }
       } finally {
         await releaseRateFetchLock(lockToken);
@@ -618,9 +565,8 @@ async function refreshTick(): Promise<void> {
       if (fallbackStartTime === null) {
         fallbackStartTime = Date.now();
         fastify.log.warn("Entering fallback FX rate mode");
-        fxFallbackEventsTotal.inc();
-        fxFallbackActive.set(1);
       }
+      fallbackTracker.recordFallback();
     }
   } catch (err) {
     fastify.log.error({ err }, "Unexpected error in refresh tick");
@@ -786,19 +732,10 @@ function startRefreshLoop(): void {
 
   // Log warning every 5 minutes if in fallback mode (#236)
   if (fallbackWarningIntervalHandle === null) {
-    fallbackWarningIntervalHandle = setInterval(() => {
-      if (fallbackStartTime !== null) {
-        const durationMs = Date.now() - fallbackStartTime;
-        const durationMin = Math.round(durationMs / 60000);
-        fastify.log.warn(
-          { durationMs, durationMin },
-          `Operating in fallback FX rate mode for ${durationMin} minute(s); rates API unavailable`,
-        );
-      }
-    }, FALLBACK_WARNING_INTERVAL_MS);
-    if (typeof fallbackWarningIntervalHandle.unref === "function") {
-      fallbackWarningIntervalHandle.unref();
-    }
+    fallbackWarningIntervalHandle = startFallbackWarningLoop({
+      getStartTime: () => fallbackStartTime,
+      warn: (ctx, msg) => fastify.log.warn(ctx, msg),
+    }) as ReturnType<typeof setInterval>;
   }
 }
 
@@ -837,6 +774,7 @@ export const fastify = Fastify({
   bodyLimit: 1_048_576,
 });
 
+installCrashHandlers(fastify.log);
 registerRequestId(fastify);
 // #386 — exponential backoff retry strategy
 const redisHealthState: import('@bettapay/validation').RedisHealthState = {
@@ -1038,7 +976,10 @@ function logRateStalenessIfStale(
 
 auditRouteAuthPolicy(fastify);
 
-fastify.get("/api/health", async (_request, reply) => {
+// Upstream health probes (gateway aggregation, Render) share the global
+// 200/min bucket. Exempt so a traffic spike on another route cannot 429 the
+// liveness probe and get the service killed.
+fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildFxEngineHealthResponse({
     pingRedis: () => redis.ping(),
     redisHealthState,
@@ -1132,7 +1073,7 @@ fastify.get("/api/health", async (_request, reply) => {
     ratesApi.details = {
       ...(ratesApi.details ?? {}),
       latencyMs: lastRefresh?.durationMs ?? null,
-      circuitBreakerState: circuitBreaker.state,
+      circuitBreakerState: circuitBreakers.snapshot(RATES_ROUTE).state,
     };
     if (fallbackExceeded) {
       ratesApi.details.fallbackModeDuration = "exceeded 1 hour";
@@ -1179,6 +1120,7 @@ fastify.get(
     const fallbackDurationMin = Math.round(fallbackDurationMs / 60000);
 
     // Evaluate cooldown expiry without side-effects (read-only snapshot)
+    const circuitBreaker = circuitBreakers.snapshot(RATES_ROUTE);
     const cbSnapshot = {
       state: circuitBreaker.state,
       consecutiveFailures: circuitBreaker.consecutiveFailures,
@@ -1278,9 +1220,19 @@ fastify.post<{ Body: unknown }>(
 
 const QuoteQuerySchema = createQuoteQuerySchema(env.NODE_ENV);
 
+// #911 — route-level ceiling for the POST quote body. Sourced from validated
+// configuration so operators can tune it without changing code.
+const FX_QUOTE_BODY_LIMIT_BYTES = resolveFxQuoteBodyLimit(
+  env.FX_QUOTE_BODY_LIMIT_BYTES,
+);
+
 fastify.get(
   "/api/quote",
   {
+    // Quotes are computed from the query string, so the body (if any) is not
+    // used — but the same ceiling keeps an accidental payload from being
+    // buffered without a bound.
+    bodyLimit: FX_QUOTE_BODY_LIMIT_BYTES,
     config: {
       rateLimit: {
         max: 100,
@@ -1298,12 +1250,17 @@ fastify.get(
       query = QuoteQuerySchema.parse(request.query);
     } catch (err) {
       if (err instanceof z.ZodError) {
+        // #912 — an amount problem is reported as INVALID_AMOUNT (with the
+        // field path in details) rather than the generic query code.
+        const amountInvalid = err.errors.some(
+          (issue) => issue.path[0] === "amount",
+        );
         return reply
           .code(400)
           .send(
             createErrorResponse(
-              ErrorCodes.INVALID_QUERY,
-              "Invalid query parameters",
+              amountInvalid ? ErrorCodes.INVALID_AMOUNT : ErrorCodes.INVALID_QUERY,
+              amountInvalid ? "Invalid amount" : "Invalid query parameters",
               err.errors,
             ),
           );
@@ -1315,7 +1272,7 @@ fastify.get(
     const to = query.to.toUpperCase();
     const amount = parseFloat(query.amount);
 
-    if (amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return reply
         .code(400)
         .send(
@@ -1368,6 +1325,11 @@ fastify.get(
     const resolvedAt = Date.now();
     const resolved = resolvePairRate(from, to, resolvedAt);
     cacheHit = resolved.source === "cache";
+    if (cacheHit) {
+      fxQuoteCacheHitsTotal.inc();
+    } else {
+      fxQuoteCacheMissesTotal.inc();
+    }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
     const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
@@ -1577,6 +1539,9 @@ interface VerifyQuoteRouteBody {
 fastify.post<{ Body: VerifyQuoteRouteBody }>(
   "/api/quote/verify",
   {
+    // #911 — reject oversized JSON before parsing it. The shared error
+    // handler turns Fastify's 413 into the typed PAYLOAD_TOO_LARGE envelope.
+    bodyLimit: FX_QUOTE_BODY_LIMIT_BYTES,
     config: {
       rateLimit: {
         max: 100,
@@ -1727,6 +1692,16 @@ const fxQuoteCreationDurationHistogram = new promClient.Histogram({
   help: "Duration of FX quote creation in milliseconds",
   labelNames: ["cache_hit"] as const,
   buckets: [1, 2, 5, 10, 20, 50, 100],
+});
+
+// Issue #891 — FX quote cache hit/miss counters
+const fxQuoteCacheHitsTotal = new promClient.Counter({
+  name: "fx_quote_cache_hits_total",
+  help: "Total number of FX quote resolutions served from the rate cache",
+});
+const fxQuoteCacheMissesTotal = new promClient.Counter({
+  name: "fx_quote_cache_misses_total",
+  help: "Total number of FX quote resolutions that required a live rate computation",
 });
 
 // Served on its own port (see startMetricsServer below), not on the
