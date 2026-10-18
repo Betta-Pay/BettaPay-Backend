@@ -144,7 +144,7 @@ import {
 import { Queue } from "bullmq";
 import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
-import { MerchantCache, getCachedMerchant } from "../../shared/validation/merchant-cache.js";
+import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
 declare module "fastify" {
   export interface FastifyInstance {

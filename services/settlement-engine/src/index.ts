@@ -48,12 +48,10 @@ import {
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { startSettlementReaper } from './settlement-reaper.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
-
-upstream/main
+import { MerchantCache, getCachedMerchant } from '../../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
