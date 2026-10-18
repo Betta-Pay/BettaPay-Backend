@@ -6,9 +6,8 @@ import {
   buildIndexerHealthResponse,
   buildSettlementEngineHealthResponse,
   checkBullMQ,
-
-checkPostgresql,
-  checkRedisPing,ain
+  checkPostgresql,
+  checkRedisPing,
   computeOverallStatus,
 } from './health.js';
 
