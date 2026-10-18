@@ -51,7 +51,6 @@ import {
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { startSettlementReaper } from './settlement-reaper.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -82,6 +81,8 @@ import {
   isValidTransition,
   propagateTracingHeaders,
   auditRouteAuthPolicy,
+  MerchantCache,
+  getCachedMerchant,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';

@@ -23,6 +23,10 @@ export * from './feature-flags.js';
 export * from './startup-checks.js';
 export * from './encryption.js';
 export * from './route-audit.js';
+// Expose the merchant cache through the package entry point so services can
+// import it via "@bettapay/validation" instead of relative paths that break
+// in the built output.
+export * from './merchant-cache.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
