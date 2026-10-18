@@ -22,7 +22,7 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/latest-migration-selection.test.ts",
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/settlement-superseded-cascade.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/latest-migration-selection.test.ts",
     "test:load": "k6 run test/load/gateway-scenarios.js",
     "test:mutation": "pnpm -w dlx stryker run"
   },

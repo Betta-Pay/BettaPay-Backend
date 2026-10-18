@@ -106,7 +106,11 @@ model Settlement {
   // Fee audit snapshot — records the exact fee parameters used at settlement
   // time for forensic analysis of historical fees (#330).
   feeSnapshot             Json?
-  // Retry mechanism (#322) — links to the new settlement that supersedes this one
+  // Retry mechanism (#322) — links to the new settlement that supersedes this one.
+  // Cascade policy (#852): onDelete: SetNull — deleting a settlement that superseded
+  // others clears their `supersededById` link instead of deleting the retries or
+  // leaving them pointing at a missing row; retries stay as standalone settlements.
+  // Pinned by test/settlement-superseded-cascade.test.ts.
   supersededById          String?
   supersededBy            Settlement?      @relation("SettlementRetry", fields: [supersededById], references: [id], onDelete: SetNull)
   supersedes              Settlement[]     @relation("SettlementRetry")
