@@ -174,9 +174,12 @@ jobs:
       - name: Determine latest migration
         id: latest_migration
         run: |
-          LATEST=$(ls -1 prisma/migrations | grep -v migration_lock.toml | sort | tail -1)
+          LATEST=$(node scripts/latest-migration.mjs)
           echo "name=$LATEST" >> "$GITHUB_OUTPUT"
           echo "Latest migration: $LATEST"
+
+      - name: Self-check latest migration selection
+        run: node scripts/latest-migration.mjs --self-check
 
       - name: Build a migrations directory without the latest migration
         run: |
