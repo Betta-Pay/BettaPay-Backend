@@ -47,6 +47,33 @@ test('getPaymentEvents returns only PaymentCompleted events on success', async (
   t.end();
 });
 
+test('getPaymentEvents accepts the paginated { data } envelope used by /api/events', async (t) => {
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async () =>
+      jsonResponse({
+        data: [
+          {
+            id: 'evt_paginated',
+            contractId: 'C123',
+            topics: [PAYMENT_COMPLETED_TYPE],
+            type: PAYMENT_COMPLETED_TYPE,
+            rawValue: 'AAAA',
+            ledger: 101,
+            indexedAt: new Date().toISOString(),
+          },
+        ],
+        pagination: { page: 1, limit: 50, total: 1 },
+      }),
+  });
+
+  const events = await client.getPaymentEvents('merchant_1');
+  t.equal(events?.length, 1, 'parses events from the paginated data envelope');
+  t.equal(events?.[0]?.id, 'evt_paginated', 'returns the indexed event');
+
+  t.end();
+});
+
 test('getPaymentEvents sends the x-service-token header when a serviceToken is set (#117)', async (t) => {
   let sentHeaders: Record<string, string> | undefined;
   const client = createIndexerClient({

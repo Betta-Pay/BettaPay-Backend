@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 
-const PUBLIC_PATHS = new Set(['/api/health', '/api/health/live', '/api/deployments']);
+export const PUBLIC_PATHS = new Set(['/api/health', '/api/health/live', '/api/deployments']);
 
 export function auditRouteAuthPolicy(
   fastify: FastifyInstance,

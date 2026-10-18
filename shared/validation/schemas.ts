@@ -295,6 +295,8 @@ export const DependencyHealth = z.object({
   name: z.string(),
   status: DependencyConnectionStatus,
   latencyMs: z.number().optional(),
+  healthy: z.boolean().optional(),
+  serverVersion: z.string().nullable().optional(),
   details: z.record(z.unknown()).optional(),
 });
 export type DependencyHealth = z.infer<typeof DependencyHealth>;
@@ -663,6 +665,16 @@ export const PaginationQuery = z.object({
 });
 export type PaginationQuery = z.infer<typeof PaginationQuery>;
 
+/** #913 — payments listing page-size ceiling and unchanged default. */
+export const PAYMENTS_MAX_PAGE_SIZE = 100;
+export const PAYMENTS_DEFAULT_PAGE_SIZE = 50;
+
+/** A query-string boolean that refuses values other than true/false. */
+export const StrictBooleanQuery = z.union([
+  z.boolean(),
+  z.enum(["true", "false"]).transform((value) => value === "true"),
+]);
+
 export const EventListQuery = PaginationQuery.extend({
   type: z.string().optional(),
   topic: z.string().optional(),
@@ -700,18 +712,31 @@ export const SettlementListQuery = PaginationQuery.extend({
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 
 export const PaymentListQuery = PaginationQuery.extend({
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(PAYMENTS_MAX_PAGE_SIZE)
+    .default(PAYMENTS_DEFAULT_PAGE_SIZE),
   status: z.enum(["initiated", "completed", "failed", "cancelled"]).optional(),
+  // Inclusive UTC bounds on createdAt: from <= createdAt <= to (#915).
   from: isoDateString.optional(),
   to: isoDateString.optional(),
   // Batches on-chain event enrichment across the page instead of querying the
   // indexer once per payment (#553): see the /api/payments handler.
   includeEvents: z.coerce.boolean().default(false),
+  // #914 — admin-only recovery/audit view. Strict parsing means
+  // includeDeleted=false is not silently treated as true.
+  includeDeleted: StrictBooleanQuery.default(false),
 }).refine(
   (data) => {
-    if (data.from && data.to) return data.from <= data.to;
+    // Compare instants, not lexicographic strings: ISO-8601 inputs may carry
+    // offsets, so "2026-10-01T10:00:00+02:00" is earlier than
+    // "2026-10-01T09:00:00Z" even though it sorts later as text.
+    if (data.from && data.to) return Date.parse(data.from) <= Date.parse(data.to);
     return true;
   },
-  { message: "to must be after from" },
+  { message: "to must not be before from" },
 );
 export type PaymentListQuery = z.infer<typeof PaymentListQuery>;
 

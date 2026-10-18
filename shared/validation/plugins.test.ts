@@ -73,13 +73,15 @@ test('Generic error returns 500 and does not leak stack trace with reqId', async
 
   assert.strictEqual(response.statusCode, 500);
   const body = JSON.parse(response.body);
-  // Generic fallback shape (with referenceId for error tracking), not the
-  // standard error envelope — no internal details are exposed.
-  assert.strictEqual(body.error, 'Internal Server Error');
-  assert.strictEqual(body.statusCode, 500);
-  assert.ok(body.referenceId, 'referenceId is present for traceability');
-  assert.ok(body.reqId, 'reqId is present in generic error response');
-  assert.strictEqual(body.details, undefined);
+  // #666: the generic 500 now uses the same envelope as every other error, so
+  // clients can branch on `error.code` during an incident. The referenceId
+  // travels inside error.details for traceability and no internal detail leaks.
+  assert.strictEqual(body.error.code, 'INTERNAL_ERROR');
+  assert.strictEqual(body.error.message, 'Internal Server Error');
+  assert.ok(body.error.details?.referenceId, 'referenceId is present for traceability');
+  assert.ok(body.error.reqId, 'reqId is present in generic error response');
+  assert.strictEqual(body.statusCode, undefined);
+  assert.strictEqual(body.referenceId, undefined);
   assert.strictEqual(response.body.includes('Database connection failed'), false);
   assert.strictEqual(logged, true, 'Logger should be called when error occurs');
 });
@@ -285,4 +287,46 @@ test('buildCsrfCookieHeader omits Secure when x-forwarded-proto is http (#560)',
 test('buildCsrfCookieHeader uses correct name and value (#560)', () => {
   const header = buildCsrfCookieHeader('myCsrf', 'token-value', { protocol: 'https' });
   assert.ok(header.startsWith('myCsrf=token-value'), 'cookie should start with name=value');
+});
+
+// Issue #893 — structured rejection logging in createServiceAuth
+test('serviceAuth rejection log includes route, caller hint, and reason (#893)', async (t) => {
+  const loggedWarnings: object[] = [];
+  const capturingLogger: any = {
+    warn: (obj: object) => loggedWarnings.push(obj),
+    info: () => {},
+    error: () => {},
+    debug: () => {},
+    trace: () => {},
+    child: () => capturingLogger,
+    level: 'warn',
+  };
+
+  const app = Fastify({ logger: capturingLogger as any });
+  registerServiceAuth(app, 'correct-secret');
+  app.get('/internal', { preValidation: [app.serviceAuth] }, async () => ({ ok: true }));
+
+  // Missing token — reason should be "missing_token"
+  await app.inject({ method: 'GET', url: '/internal' });
+  const missingLog = loggedWarnings.find((w: any) => w.reason === 'missing_token') as any;
+  assert.ok(missingLog, 'a warning with reason=missing_token is emitted when no token is sent');
+  assert.ok(typeof missingLog.route === 'string', 'route field is present');
+  assert.strictEqual(missingLog.caller, null, 'caller is null when no token is sent');
+
+  // Wrong token — reason should be "invalid_token" and caller is a prefix hint
+  const badToken = 'wrong-secret-value';
+  await app.inject({ method: 'GET', url: '/internal', headers: { 'x-service-token': badToken } });
+  const invalidLog = loggedWarnings.find((w: any) => w.reason === 'invalid_token') as any;
+  assert.ok(invalidLog, 'a warning with reason=invalid_token is emitted for a wrong token');
+  assert.ok(typeof invalidLog.route === 'string', 'route field is present');
+  assert.ok(
+    typeof invalidLog.caller === 'string' && invalidLog.caller.endsWith('***'),
+    'caller is a masked prefix ending in ***',
+  );
+  assert.ok(
+    !invalidLog.caller.includes(badToken),
+    'full token value is never logged',
+  );
+
+  await app.close();
 });

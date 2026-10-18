@@ -18,9 +18,10 @@
  *   POST   /api/payments             — initiate payment session (protected)
  *   GET    /api/payments             — list payments, merchant-scoped (protected, #553)
  *   GET    /api/payments/:id         — fetch payment session
+ *   GET    /api/payments/:id/events  — ordered on-chain events for one payment (owner/admin)
  *   PATCH  /api/payments/:id/status  — transition payment status (protected)
  *   POST   /api/settlements          — trigger settlement (protected)
- *   GET    /api/deployments          — Soroban contract addresses (testnet)
+ *   GET    /api/deployments          — Soroban contract addresses (testnet, ETag-aware)
  *   GET    /api/rates                — proxy to FX engine (timeout-aware)
  *   GET    /api/currencies           — proxy to FX engine (timeout-aware)
  *   GET    /api/quote                — proxy to FX engine (timeout-aware)
@@ -34,6 +35,7 @@ import Fastify, {
 import cors from "@fastify/cors";
 import fastifyJwt from "@fastify/jwt";
 import rateLimit from "@fastify/rate-limit";
+import compression from "@fastify/compress";
 import crypto from "crypto";
 import zlib from "zlib";
 import { Transform } from "stream";
@@ -61,6 +63,7 @@ import {
   decryptSensitiveFields,
   createValidationContext,
   auditRouteAuthPolicy,
+  installCrashHandlers,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -100,6 +103,8 @@ import {
   AuthIpScoreQuery,
   SettlementListQuery,
   PaymentListQuery,
+  PAYMENTS_MAX_PAGE_SIZE,
+  PAYMENTS_DEFAULT_PAGE_SIZE,
   PaginationQuery,
   BulkCancelPaymentsBody,
   UpdateMerchantKycBody,
@@ -110,13 +115,15 @@ import {
   ErrorCodes,
   registerErrorHandler,
   registerServiceAuth,
+  createAdminApiKeyAuth,
   createAuditLogger,
   timingSafeStrEqual,
+  type AuditLogRequestLike,
 } from "@bettapay/validation";
 import type { Merchant } from "@prisma/client";
 import type { ApiResponse, PaginatedResponse } from "@bettapay/shared-types";
 import { buildPaginationMeta } from "@bettapay/shared-types";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import pg from "pg";
 import helmet from "@fastify/helmet";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -154,8 +161,99 @@ declare module "fastify" {
   }
 }
 
+// Set by the auth rejection paths so the onResponse audit hook (#665) can
+// persist a queryable row for every authentication failure. Modelled as an
+// intersection rather than a FastifyRequest augmentation: Fastify's request
+// interface is generic, and merging a non-generic declaration into it is an
+// error.
+type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
+
+// #913 — payments listing bounds, named here so the route and its OpenAPI
+// schema cannot drift from the validation schema in @bettapay/validation.
+const PAYMENT_LIST_MAX_PAGE_SIZE = PAYMENTS_MAX_PAGE_SIZE;
+const PAYMENT_LIST_DEFAULT_PAGE_SIZE = PAYMENTS_DEFAULT_PAGE_SIZE;
+
+// OpenAPI/querystring schema for GET /api/payments. Kept as one object so the
+// route validator, the swagger document and the docs endpoint cannot drift.
+const PAYMENT_LIST_QUERY_SCHEMA = {
+  type: "object",
+  additionalProperties: true,
+  properties: {
+    merchantId: {
+      type: "string",
+      description:
+        "Filter to one merchant. Honoured only for service-auth admin callers; JWT callers are always scoped to their own merchant.",
+    },
+    page: { type: "integer", minimum: 1, default: 1 },
+    limit: {
+      type: "integer",
+      minimum: 1,
+      maximum: PAYMENT_LIST_MAX_PAGE_SIZE,
+      default: PAYMENT_LIST_DEFAULT_PAGE_SIZE,
+      description: `Page size. Maximum ${PAYMENT_LIST_MAX_PAGE_SIZE}; default ${PAYMENT_LIST_DEFAULT_PAGE_SIZE}.`,
+    },
+    status: {
+      type: "string",
+      enum: ["initiated", "completed", "failed", "cancelled"],
+    },
+    from: { type: "string", format: "date-time" },
+    to: { type: "string", format: "date-time" },
+    includeEvents: {
+      type: "boolean",
+      default: false,
+      description: "Batch on-chain event enrichment for the page.",
+    },
+    eventPage: {
+      type: "integer",
+      minimum: 1,
+      default: 1,
+      description: "Event pagination page (used when includeEvents=true). Requires includeEvents.",
+    },
+    eventLimit: {
+      type: "integer",
+      minimum: 1,
+      maximum: 100,
+      default: 10,
+      description: "Event pagination page size (used when includeEvents=true). Maximum 100; default 10.",
+    },
+    includeDeleted: {
+      type: "boolean",
+      default: false,
+      description:
+        "Admin-only (service-auth) flag. When true, payments belonging to soft-deleted merchants are included. A merchant JWT caller is rejected with 403.",
+    },
+  },
+} as const;
+
+const PAYMENT_LIST_OPENAPI_PATH = {
+  get: {
+    summary: "List payments",
+    description:
+      "Lists payments with a bounded page size. By default soft-deleted (deleted-merchant) payments are excluded. Service-auth admin callers may pass includeDeleted=true to include them; merchant JWT callers may not.",
+    parameters: Object.entries(PAYMENT_LIST_QUERY_SCHEMA.properties).map(
+      ([name, schema]) => ({
+        name,
+        in: "query",
+        required: false,
+        schema,
+        description: (schema as { description?: string }).description,
+      }),
+    ),
+    responses: {
+      "200": { description: "Paginated payments" },
+      "400": { description: "Invalid query parameters" },
+      "401": { description: "Authentication required" },
+      "403": { description: "includeDeleted requested by a non-admin caller" },
+    },
+  },
+};
+
 const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const IDEMPOTENCY_TTL_SECONDS = IDEMPOTENCY_TTL_MS / 1000;
+// Bulk-cancel summaries share the existing Redis idempotency store. The key is
+// deliberately namespaced so it cannot collide with payment/settlement keys.
+const BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX = "idempotency:bulk-cancel:";
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -215,6 +313,210 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
   return (key as string).trim() || null;
 }
 
+// ── Conditional requests (#918) ──────────────────────────────────────────────
+// Deployment metadata is derived from process environment variables, so it
+// cannot change while the process is running. Hashing the exact serialized
+// response lets clients revalidate it with If-None-Match instead of
+// re-downloading the whole payload on every dashboard load.
+export function computeDeploymentsEtag(serializedPayload: string): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(serializedPayload)
+    .digest("base64url");
+  return `W/"${digest}"`;
+}
+
+/** Weak comparison for If-None-Match, accepting a comma-separated tag list. */
+export function isEtagMatch(
+  ifNoneMatch: string | string[] | undefined,
+  etag: string,
+): boolean {
+  if (!ifNoneMatch) return false;
+  const header = Array.isArray(ifNoneMatch)
+    ? ifNoneMatch.join(",")
+    : ifNoneMatch;
+  const normalized = etag.replace(/^W\//, "");
+  return header
+    .split(",")
+    .map((candidate) => candidate.trim())
+    .some(
+      (candidate) =>
+        candidate === "*" || candidate.replace(/^W\//, "") === normalized,
+    );
+}
+
+export interface DeploymentsResponsePayload {
+  data: {
+    network: string;
+    contracts: { name: string; contractId: string; explorerUrl: string }[];
+    updatedAt: string;
+  };
+}
+
+/**
+ * Builds the public deployment-descriptor response. `updatedAt` is supplied by
+ * the caller so a process can snapshot the descriptor once and serve a stable
+ * representation (and ETag) for its whole lifetime.
+ */
+export function buildDeploymentsResponse(input: {
+  networkPassphrase: string;
+  settlementContractId: string;
+  governanceContractId: string;
+  updatedAt?: string;
+}): DeploymentsResponsePayload {
+  // #761 — explorer links must follow the configured network, not assume
+  // testnet, or a mainnet receipt points a member at the wrong ledger viewer
+  // during an incident.
+  const isMainnet = input.networkPassphrase
+    .toLowerCase()
+    .includes("public global");
+  const explorerContractBase = isMainnet
+    ? "https://stellar.expert/explorer/public/contract"
+    : "https://lab.stellar.org/r/testnet/contract";
+
+  return {
+    data: {
+      network: input.networkPassphrase,
+      contracts: [
+        {
+          name: "Settlement contract",
+          contractId: input.settlementContractId,
+          explorerUrl: `${explorerContractBase}/${input.settlementContractId}`,
+        },
+        {
+          name: "Governance contract",
+          contractId: input.governanceContractId,
+          explorerUrl: `${explorerContractBase}/${input.governanceContractId}`,
+        },
+      ],
+      updatedAt: input.updatedAt ?? new Date().toISOString(),
+    },
+  };
+}
+
+// ── Payment event helpers (#916) ─────────────────────────────────────────────
+// Indexer payloads have varied slightly across event versions, so accept the
+// documented envelope (`payload.payment.id`) as well as the flatter shapes
+// emitted by older deployments. Topics are also checked because some events
+// carry the payment id there rather than in the decoded body.
+export interface PaymentEventLike {
+  id?: string;
+  ledger: number;
+  indexedAt: string;
+  topics?: string[];
+  decodedPayload?: unknown;
+}
+
+export function eventBelongsToPayment(
+  event: PaymentEventLike,
+  paymentId: string,
+): boolean {
+  const payload = event.decodedPayload as any;
+  const candidates = [
+    payload?.payload?.payment?.id,
+    payload?.payload?.paymentId,
+    payload?.payment?.id,
+    payload?.paymentId,
+    payload?.payment_id,
+  ];
+  if (
+    candidates.some(
+      (candidate) => typeof candidate === "string" && candidate === paymentId,
+    )
+  ) {
+    return true;
+  }
+  return Boolean(event.topics?.includes(paymentId));
+}
+
+/** Deterministic order: ledger ascending, then indexed timestamp, then id. */
+export function comparePaymentEvents(
+  a: PaymentEventLike,
+  b: PaymentEventLike,
+): number {
+  if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+  const at = Date.parse(a.indexedAt);
+  const bt = Date.parse(b.indexedAt);
+  if (at !== bt) return at - bt;
+  return String(a.id ?? "").localeCompare(String(b.id ?? ""));
+}
+
+// ── Route contracts ──────────────────────────────────────────────────────────
+// Exported so the tests can assert the published contract even though Fastify's
+// swagger plugin is registered without an await in this synchronous app factory
+// (a pre-existing limitation that leaves /api/docs/json empty).
+const ETAG_HEADER_DOC = {
+  description:
+    "Weak entity tag derived from the serialized deployments payload. Send " +
+    "this value as If-None-Match to receive 304 Not Modified when the " +
+    "deployment metadata has not changed.",
+  schema: { type: "string" },
+};
+
+export const deploymentsRouteSchema = {
+  description:
+    "Soroban contract addresses for the configured network. Supports " +
+    "conditional requests: the ETag header identifies the current " +
+    "deployments payload and a matching If-None-Match returns 304 with " +
+    "an empty body.",
+  response: {
+    200: {
+      description: "Current deployment metadata.",
+      headers: {
+        ETag: ETAG_HEADER_DOC,
+      },
+    },
+    304: {
+      description:
+        "The caller's If-None-Match matched the current ETag; the body " +
+        "is empty.",
+      headers: {
+        ETag: ETAG_HEADER_DOC,
+      },
+    },
+  },
+};
+
+export const paymentsListRouteSchema = {
+  description:
+    "List payments, merchant-scoped and paginated. The optional `from` " +
+    "and `to` bounds filter on `createdAt`; both boundaries are " +
+    "inclusive (createdAt >= from and createdAt <= to) and interpreted " +
+    "as UTC instants. `from` must not be after `to`.",
+  querystring: {
+    type: "object",
+    additionalProperties: true,
+    properties: {
+      from: {
+        type: "string",
+        description:
+          "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
+      },
+      to: {
+        type: "string",
+        description:
+          "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
+      },
+    },
+  },
+};
+
+export const paymentEventsRouteSchema = {
+  description:
+    "Return the indexed on-chain events for a single payment, ordered " +
+    "deterministically by ledger sequence, then indexed timestamp, then " +
+    "event id. Only the owning merchant or an admin may read them; other " +
+    "callers receive 404 so the endpoint does not reveal whether a " +
+    "payment id exists.",
+  params: {
+    type: "object",
+    required: ["id"],
+    properties: {
+      id: { type: "string", description: "Payment id." },
+    },
+  },
+};
+
 // Derive isProduction via the shared createValidationContext utility so
 // env-based branching is consistent with the rest of the validation layer
 // (cors.ts, webhookSchema.ts) rather than being duplicated ad-hoc here.
@@ -227,6 +529,8 @@ const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
 
 // --- Request lifecycle timeouts ---------------------------------------------
+
+const CLIENT_TIMEOUT_HEADER = "x-client-timeout-ms";
 
 // REQUEST_TIMEOUT_MS bounds how long a single request may run. If a handler
 // (e.g. a slow DB query or a hung upstream service) exceeds it, the per-request
@@ -440,6 +744,11 @@ export function buildApp(opts: AppOptions = {}) {
   registerTracing(fastify);
   registerServiceAuth(fastify, opts.interServiceSecret ?? env.INTER_SERVICE_SECRET);
 
+  // Issue #908 — timing-safe admin API key guard
+  if (env.ADMIN_API_KEY) {
+    fastify.decorate('adminAuth', createAdminApiKeyAuth(env.ADMIN_API_KEY));
+  }
+
   // Centralized query and path parameter sanitization preHandler hook:
   // Recursively strips unsafe ASCII control characters (0x00-0x1F except \t, 0x7F)
   fastify.addHook("preHandler", async (request: FastifyRequest) => {
@@ -520,6 +829,50 @@ export function buildApp(opts: AppOptions = {}) {
     hsts: { maxAge: 31536000 },
   });
 
+  // Per-request timeout: replies 408 once the configured limit elapses so a
+  // hung handler cannot hold the connection open. A client may shorten (never
+  // extend) the limit with x-client-timeout-ms. The limit is read from
+  // GATEWAY_TIMEOUT_CONFIG on every request.
+  const requestTimers = new WeakMap<FastifyRequest, NodeJS.Timeout>();
+  fastify.addHook(
+    "onRequest",
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const configured = GATEWAY_TIMEOUT_CONFIG.requestTimeoutMs;
+      const requested = Number(request.headers[CLIENT_TIMEOUT_HEADER]);
+      const limitMs =
+        Number.isInteger(requested) && requested > 0 && requested < configured
+          ? requested
+          : configured;
+      const timer = setTimeout(() => {
+        if (reply.sent) return;
+        request.log.warn(
+          { method: request.method, url: request.url, limitMs },
+          "Request timed out",
+        );
+        reply
+          .code(408)
+          .send(
+            createErrorResponse(
+              ErrorCodes.REQUEST_TIMEOUT,
+              "Request Timeout",
+              undefined,
+              request.id,
+            ),
+          );
+      }, limitMs);
+      timer.unref();
+      requestTimers.set(request, timer);
+    },
+  );
+  fastify.addHook("onResponse", async (request: FastifyRequest) => {
+    const timer = requestTimers.get(request);
+    if (timer) clearTimeout(timer);
+  });
+  fastify.addHook("onRequestAbort", async (request: FastifyRequest) => {
+    const timer = requestTimers.get(request);
+    if (timer) clearTimeout(timer);
+  });
+
   fastify.addHook("onSend", async (_request, reply, _payload) => {
     reply.header(
       GATEWAY_TIMEOUT_CONFIG.responseHeader,
@@ -544,6 +897,10 @@ export function buildApp(opts: AppOptions = {}) {
     credentials: true,
   });
 
+  fastify.register(compression, {
+    threshold: 1024,
+  });
+
   fastify.register(fastifyJwt, {
     secret: env.JWT_SECRET,
     sign: {
@@ -563,7 +920,19 @@ export function buildApp(opts: AppOptions = {}) {
     {
       config: { rateLimit: false },
     },
-    async (_req, reply) => reply.send(fastify.swagger()),
+    async (_req, reply) => {
+      const doc = fastify.swagger() as {
+        paths?: Record<string, unknown>;
+      };
+      // @fastify/swagger is registered after the routes in this synchronous
+      // builder, so its onRoute hook misses them. Merge the payment listing
+      // path explicitly rather than serving a docs document with no routes.
+      doc.paths = {
+        ...(doc.paths ?? {}),
+        "/api/payments": doc.paths?.["/api/payments"] ?? PAYMENT_LIST_OPENAPI_PATH,
+      };
+      return reply.send(doc);
+    },
   );
 
   // Rate limiting: global default and route overrides.
@@ -906,6 +1275,13 @@ export function buildApp(opts: AppOptions = {}) {
     }
   }
 
+  // Flags a request as an authentication rejection so the onResponse audit
+  // hook (#665) can persist a queryable row. Only the fact of the rejection is
+  // recorded downstream — never the credential that caused it.
+  function markAuthRejected(request: FastifyRequest): void {
+    (request as AuthFailureMarkedRequest).authFailed = true;
+  }
+
   // Authentication hook — verifies the JWT, rejects revoked tokens (jti
   // blocklist), and keeps the per-merchant session index fresh.
   fastify.decorate(
@@ -915,12 +1291,14 @@ export function buildApp(opts: AppOptions = {}) {
         await request.jwtVerify();
         const payload = request.user as MerchantJwtPayload;
         if (payload.jti && (await isJtiRevoked(payload.jti))) {
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
         }
       } catch (err) {
         request.log.error(err);
+        markAuthRejected(request);
         return reply
           .code(401)
           .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -939,6 +1317,7 @@ export function buildApp(opts: AppOptions = {}) {
             { jti, merchantId },
             "[Auth] JWT session missing or revoked",
           );
+          markAuthRejected(request);
           return reply
             .code(401)
             .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, "Unauthorized"));
@@ -1017,6 +1396,19 @@ export function buildApp(opts: AppOptions = {}) {
     },
   );
 
+  // Issue #889 — record latency after every response.
+  fastify.addHook("onResponse", async (request, reply) => {
+    const route = request.routeOptions?.url ?? "unknown";
+    httpRequestDurationHistogram.observe(
+      {
+        method: request.method,
+        route,
+        status_code: String(reply.statusCode),
+      },
+      reply.elapsedTime / 1000,
+    );
+  });
+
   fastify.addHook("preHandler", async (request) => {
     if (request.body !== undefined) {
       request.body = sanitizeInput(request.body);
@@ -1027,6 +1419,33 @@ export function buildApp(opts: AppOptions = {}) {
   // schemas receive trimmed, control-character-free, NFC-normalized strings.
 
   auditRouteAuthPolicy(fastify);
+
+  // Persist authentication rejections to the audit log (#665). Auth probing was
+  // log-only, so security review had no queryable rejection history; this adds
+  // one without ever changing what the caller sees.
+  //
+  // Best-effort end to end: `logAuditEvent` already swallows DB errors, and the
+  // explicit catch guarantees an audit-layer problem can never surface on the
+  // response path. No tokens, headers, cookies or query strings are recorded —
+  // only the route, the caller's IP reputation score and the timestamp (ip and
+  // createdAt are filled in by the audit logger itself).
+  fastify.addHook("onResponse", async (request, reply) => {
+    const rejected = (request as AuthFailureMarkedRequest).authFailed === true;
+    if (!rejected && reply.statusCode !== 401) return;
+
+    // Route pattern (e.g. "/api/auth/refresh") rather than the raw URL, so
+    // rejections group by endpoint and no query-string credential is stored.
+    const path = request.routeOptions?.url ?? request.url.split("?")[0];
+    const ipReputationScore = await getAuthIpScore(request.ip);
+
+    await logAuditEvent(
+      "auth.rejected",
+      "request",
+      request.id,
+      { path, method: request.method, ipReputationScore, rejectedAt: new Date().toISOString() },
+      request,
+    ).catch(() => null);
+  });
 
   // Routes
   registerGatewayHealthRoutes({
@@ -1362,23 +1781,27 @@ export function buildApp(opts: AppOptions = {}) {
   } catch (err) {
     request.log.error(err);
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const payload = request.user as MerchantJwtPayload;
   if (!payload.merchantId || !payload.ownerId || !payload.jti || !payload.exp) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   if (await isJtiRevoked(payload.jti)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
   const remainingLifetime = payload.exp - Math.floor(Date.now() / 1000);
   if (remainingLifetime <= 0) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
@@ -1418,21 +1841,39 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     stored = await consumeWalletChallenge(redis, d.address);
   } catch (err) {
     request.log.error({ err }, 'Failed to read wallet challenge from Redis');
-    return reply.code(503).send({ error: 'Authentication service unavailable' });
+    return reply
+      .code(503)
+      .send(
+        createErrorResponse(
+          ErrorCodes.INTERNAL_ERROR,
+          'Authentication service unavailable',
+        ),
+      );
   }
 
   if (!stored) {
     await recordAuthIpFailure(request);
     return reply
       .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .send(
+        createErrorResponse('CHALLENGE_REUSED', 'Wallet challenge already used', undefined, request.id),
+      );
   }
 
-  if (stored.address !== d.address || Date.now() > stored.expiresAt) {
+  if (Date.now() > stored.expiresAt) {
     await recordAuthIpFailure(request);
     return reply
-      .code(409)
-      .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge expired or already used'));
+      .code(400)
+      .send(createErrorResponse("CHALLENGE_EXPIRED", 'Challenge expired'));
+  }
+
+  if (stored.address !== d.address) {
+    await recordAuthIpFailure(request);
+    return reply
+      .code(400)
+      .send(
+        createErrorResponse('CHALLENGE_MISMATCH', 'Wallet challenge mismatch', undefined, request.id),
+      );
   }
 
   // If the client echoed a challenge, it must be the one we issued.
@@ -1446,6 +1887,7 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   // Verify against the *stored* challenge string, never the client-supplied one.
   if (!verifyWalletSignature(d.address, stored.challenge, d.signature)) {
     await recordAuthIpFailure(request);
+    markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
 
@@ -1471,11 +1913,15 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
 });
 
 fastify.get('/api/admin/auth/ip-score', {
-  preValidation: [fastify.authenticate]
+  preValidation: env.ADMIN_API_KEY
+    ? [fastify.adminAuth]
+    : [fastify.authenticate],
 }, async (request, reply) => {
-  const payload = request.user as MerchantJwtPayload;
-  if (payload.merchantId !== env.ADMIN_ADDRESS) {
-    return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Forbidden'));
+  if (!env.ADMIN_API_KEY) {
+    const payload = request.user as MerchantJwtPayload;
+    if (payload.merchantId !== env.ADMIN_ADDRESS) {
+      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Forbidden'));
+    }
   }
 
   const { ip } = AuthIpScoreQuery.parse(request.query ?? {});
@@ -1728,6 +2174,22 @@ fastify.get('/api/admin/auth/ip-score', {
               { email, domain },
               "[Auth] Google OAuth rejected: email domain not allowed",
             );
+            // #904 — audit the rejection so unauthorized access attempts leave a
+            // traceable record. Tokens are never written; only the domain and a
+            // stable, non-sensitive account identifier are included.
+            await logAuditEvent(
+              "auth.google.domain_rejected",
+              "google_oauth",
+              "domain_check",
+              {
+                reason: "domain_not_allowed",
+                domain: domain ?? null,
+                // Partial-mask the local part so the entry is non-sensitive
+                // but still useful for correlation across attempts.
+                accountHint: email.replace(/^[^@]+/, (local) => local[0] + "***"),
+              },
+              request as unknown as AuditLogRequestLike,
+            ).catch(() => {});
             return reply
               .code(403)
               .send(
@@ -1829,6 +2291,23 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
       }
 
+      // Issue #909 — replay protection: throttle to one test per 30s per
+      // (merchantId, webhookId) pair so the endpoint cannot be used to
+      // flood a merchant's endpoint repeatedly.
+      const replayKey = `webhook-test-throttle:${payload.merchantId}:${id}`;
+      const REPLAY_TTL_MS = 30_000;
+      try {
+        const claimed = await redis.set(replayKey, '1', 'PX', REPLAY_TTL_MS, 'NX');
+        if (claimed === null) {
+          return reply
+            .code(429)
+            .header('Retry-After', '30')
+            .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Webhook test already in progress; please wait 30 seconds before retrying'));
+        }
+      } catch {
+        // Redis failure must not block the test; proceed without throttle guard.
+      }
+
       try {
         const testResult = await indexerClient.testWebhook(
           id,
@@ -1926,6 +2405,11 @@ fastify.get('/api/admin/auth/ip-score', {
       }
       await revokeAuthSession(merchantId, jti);
 
+      // #903 — expire any outstanding wallet challenge for this address so a
+      // stale challenge cannot be replayed after the session ends. discard()
+      // is a no-op when no challenge is outstanding, keeping logout idempotent.
+      await walletChallenges.discard(merchantId).catch(() => {});
+
       return reply.send({ status: "logged_out" });
     },
   );
@@ -1980,6 +2464,9 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply): Promise<ApiResponse<Merchant>> => {
       const { id } = request.params;
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const payload = request.user as MerchantJwtPayload;
+
       const merchant = await prisma.merchant.findFirst({
         where: { id, deletedAt: null },
       });
@@ -1992,6 +2479,18 @@ fastify.get('/api/admin/auth/ip-score', {
           ),
         };
       }
+
+      // Check authorization: service-auth can view any merchant, JWT callers only their own
+      if (!isServiceAuth && payload.merchantId !== id) {
+        reply.code(403);
+        return {
+          error: createErrorResponse(
+            ErrorCodes.FORBIDDEN,
+            "You do not have access to this merchant",
+          ),
+        };
+      }
+
       return { data: merchant };
     },
   );
@@ -2030,23 +2529,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: cancel initiated payments
         try {
-          const initiatedPayments = await tx.payment.findMany({
+          const cancelled = await tx.payment.updateMany({
             where: { merchantId: id, status: "initiated" },
+            data: { status: "cancelled" },
           });
-          for (const payment of initiatedPayments) {
-            const cancelled = await tx.payment.update({
-              where: { id: payment.id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              payment.id,
-              { before: payment, after: cancelled },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "payments.bulk-cancelled",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: cancelled.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2056,23 +2550,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Best-effort cascade: fail pending settlements
         try {
-          const pendingSettlements = await tx.settlement.findMany({
+          const failed = await tx.settlement.updateMany({
             where: { merchantId: id, status: "pending" },
+            data: { status: "failed", completedAt: new Date() },
           });
-          for (const settlement of pendingSettlements) {
-            const failed = await tx.settlement.update({
-              where: { id: settlement.id },
-              data: { status: "failed", completedAt: new Date() },
-            });
-            await logAuditEvent(
-              "settlement.status.changed",
-              "settlement",
-              settlement.id,
-              { before: settlement, after: failed },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
+          await logAuditEvent(
+            "settlements.bulk-failed",
+            "merchant",
+            id,
+            { before: null, after: { affectedCount: failed.count } },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
         } catch (err) {
           request.log.error(
             { err, merchantId: id },
@@ -2138,10 +2627,19 @@ fastify.get('/api/admin/auth/ip-score', {
       status === "suspended"
         ? "Merchant is already suspended"
         : "Merchant is already active";
+    // Retry-safe no-op: the merchant is already in the requested state, so
+    // there is nothing to write and no audit event to emit. Uses a dedicated
+    // code so operators can distinguish it from a malformed request; 409 is
+    // preserved.
     if (merchant.status === status)
       return {
         code: 409 as const,
-        body: createErrorResponse(ErrorCodes.INVALID_REQUEST, conflictMessage),
+        body: createErrorResponse(
+          ErrorCodes.MERCHANT_STATE_CONFLICT,
+          conflictMessage,
+          { current: merchant.status },
+          request.id,
+        ),
       };
 
     await prisma.$transaction(async (tx) => {
@@ -2440,30 +2938,48 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      const payment = await prisma.$transaction(async (tx) => {
-        const created = await tx.payment.create({
-          data: {
-            id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
-            merchantId: d.merchantId,
-            payerId: d.payerId,
-            amount: d.amount,
-            asset: d.asset,
-            reference: d.reference,
-            status: "initiated",
-            idempotencyKey: idempotencyKey ?? undefined,
-            idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
-          },
+      let payment;
+      try {
+        payment = await prisma.$transaction(async (tx) => {
+          const created = await tx.payment.create({
+            data: {
+              id: "pay_" + crypto.randomUUID().replace(/-/g, ""),
+              merchantId: d.merchantId,
+              payerId: d.payerId,
+              amount: d.amount,
+              asset: d.asset,
+              reference: d.reference,
+              status: "initiated",
+              idempotencyKey: idempotencyKey ?? undefined,
+              idempotencyKeyExpiresAt: idempotencyKeyExpiresAt ?? undefined,
+            },
+          });
+          await logAuditEvent(
+            "payment.created",
+            "payment",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "payment.created",
-          "payment",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
+      } catch (err: unknown) {
+        if (
+          idempotencyKey !== null &&
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        ) {
+          const raced = await prisma.payment.findFirst({
+            where: { idempotencyKey, idempotencyKeyExpiresAt: { gt: new Date() } },
+          });
+          if (raced) {
+            request.log.info({ idempotencyKey, paymentId: raced.id }, "Idempotency race lost — returning winner");
+            return reply.code(200).send({ data: raced });
+          }
+        }
+        throw err;
+      }
 
       request.log.info(
         { idempotencyKey, paymentId: payment.id },
@@ -2527,15 +3043,37 @@ fastify.get('/api/admin/auth/ip-score', {
         }
         await fastify.authenticate(request, reply);
       },
+      // The OpenAPI schema below is also used by Fastify for validation; keep
+      // the Zod parser as the single source of the error envelope.
+      attachValidation: true,
+      schema: {
+        summary: "List payments",
+        description: PAYMENT_LIST_OPENAPI_PATH.get.description,
+        querystring: PAYMENT_LIST_QUERY_SCHEMA,
+      },
       config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+      schema: paymentsListRouteSchema,
     },
     async (request, reply) => {
       const query = PaymentListQuery.parse(request.query);
-      const { status, from, to, limit, page, includeEvents } = query;
+      const { status, from, to, limit, page, includeEvents, includeDeleted } = query;
+      const eventPage = parseInt((request.query as any)?.eventPage ?? "1", 10) || 1;
+      const eventLimit = parseInt((request.query as any)?.eventLimit ?? "10", 10) || 10;
       const requestedMerchantId = (request.query as { merchantId?: string })
         .merchantId;
 
       const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      if (includeDeleted && !isServiceAuth) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "includeDeleted is restricted to admin callers",
+              { field: "includeDeleted" },
+            ),
+          );
+      }
       const scopedMerchantId = isServiceAuth
         ? requestedMerchantId
         : (request.user as { merchantId?: string } | undefined)?.merchantId;
@@ -2551,6 +3089,12 @@ fastify.get('/api/admin/auth/ip-score', {
         where.createdAt = {};
         if (from) where.createdAt.gte = new Date(from);
         if (to) where.createdAt.lte = new Date(to);
+      }
+      // #914 — payments are associated with a merchant, and a merchant's
+      // soft delete is the only soft-delete state a payment can inherit.
+      // The default listing hides those rows; the admin-only flag opts in.
+      if (!includeDeleted) {
+        where.merchant = { deletedAt: null };
       }
 
       const [records, total] = await Promise.all([
@@ -2586,10 +3130,25 @@ fastify.get('/api/admin/auth/ip-score', {
         ),
       );
 
-      const data = records.map((payment: { merchantId: string }) => ({
-        ...payment,
-        events: eventsByMerchant.get(payment.merchantId) ?? null,
-      }));
+      const data = records.map((payment: { merchantId: string }) => {
+        const allEvents = eventsByMerchant.get(payment.merchantId) ?? null;
+        if (!allEvents || allEvents.length === 0) {
+          return { ...payment, events: null };
+        }
+        // Apply event pagination: slice events based on eventPage and eventLimit
+        const startIdx = (eventPage - 1) * eventLimit;
+        const endIdx = startIdx + eventLimit;
+        const paginatedEvents = allEvents.slice(startIdx, endIdx);
+        return {
+          ...payment,
+          events: paginatedEvents,
+          eventsMeta: {
+            total: allEvents.length,
+            page: eventPage,
+            limit: eventLimit,
+          },
+        };
+      });
 
       return reply.send({
         data,
@@ -2623,6 +3182,64 @@ fastify.get('/api/admin/auth/ip-score', {
 
     return { data: payment };
   });
+
+  // GET /api/payments/:id/events — ordered on-chain event trail for one payment.
+  //
+  // Ownership: only the payment's merchant (or the configured admin) may read
+  // the events. Non-owning callers receive the same 404 as an unknown id so the
+  // endpoint cannot be used to probe which payment ids exist.
+  fastify.get<{ Params: { id: string } }>(
+    "/api/payments/:id/events",
+    {
+      preValidation: [fastify.authenticate],
+      config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
+      schema: paymentEventsRouteSchema,
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const payment = await prisma.payment.findUnique({ where: { id } });
+      if (!payment) {
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Payment not found"));
+      }
+
+      const requesterMerchantId = (request.user as { merchantId?: string })
+        ?.merchantId;
+      const ownsPayment = requesterMerchantId === payment.merchantId;
+      const isAdmin = requesterMerchantId === env.ADMIN_ADDRESS;
+      if (!ownsPayment && !isAdmin) {
+        // Deliberately 404 rather than 403: a 403 would confirm that the
+        // payment id belongs to another merchant.
+        return reply
+          .code(404)
+          .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Payment not found"));
+      }
+
+      const events = await indexerClient.getPaymentEvents(
+        payment.merchantId,
+        request.headers,
+      );
+      if (events === null) {
+        // Do not return [] — that would claim the payment has no event trail
+        // when the indexer is simply unreachable.
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.GATEWAY_TIMEOUT,
+              "Event index unavailable, please retry",
+            ),
+          );
+      }
+
+      const paymentEvents = events
+        .filter((event) => eventBelongsToPayment(event, id))
+        .sort(comparePaymentEvents);
+
+      return reply.send({ data: paymentEvents });
+    },
+  );
 
   // Enforce valid status transitions. The DB enum and Prisma allow any status, so
   // this route is the single place that guards the payment state machine.
@@ -2683,6 +3300,13 @@ fastify.get('/api/admin/auth/ip-score', {
   );
 
   // Bulk-cancel initiated payments belonging to the authenticated merchant.
+  //
+  // Replay safety (#917): when the caller supplies an Idempotency-Key, the
+  // summary is stored in the existing Redis idempotency namespace for the same
+  // 24h TTL as payment/settlement keys. A retry with the same key returns the
+  // stored summary verbatim instead of recomputing over already-cancelled rows,
+  // so operators see the same per-item statuses and totals. Redis expiry is the
+  // cleanup mechanism for these summaries (no new table).
   fastify.post<{ Body: z.infer<typeof BulkCancelPaymentsBody> }>(
     "/api/payments/bulk-cancel",
     {
@@ -2693,8 +3317,59 @@ fastify.get('/api/admin/auth/ip-score', {
     async (request, reply) => {
       const d = BulkCancelPaymentsBody.parse(request.body);
       const merchantId = (request.user as any).merchantId as string;
+      const idempotencyKey = readIdempotencyKey(request);
 
-      // Deduplicate IDs
+      if (
+        idempotencyKey !== null &&
+        idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LEN
+      ) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              "Idempotency-Key must not exceed 255 characters",
+            ),
+          );
+      }
+
+      const summaryKey =
+        idempotencyKey !== null
+          ? `${BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX}${idempotencyKey}`
+          : null;
+
+      if (summaryKey) {
+        try {
+          const cached = await redis.get(summaryKey);
+          if (cached) {
+            try {
+              const replayed = JSON.parse(cached);
+              if (replayed && typeof replayed === "object") {
+                request.log.info(
+                  { idempotencyKey },
+                  "Bulk-cancel idempotency hit — replaying stored summary",
+                );
+                return reply.code(200).send(replayed);
+              }
+            } catch (err) {
+              request.log.warn(
+                { err, idempotencyKey },
+                "Ignoring unparseable bulk-cancel idempotency summary",
+              );
+            }
+          }
+        } catch (err) {
+          // Redis-down: fall through and perform the cancel. The summary will
+          // not be replayable, but the operation must not be blocked.
+          request.log.warn(
+            { err, idempotencyKey },
+            "Bulk-cancel idempotency lookup failed — proceeding without replay",
+          );
+        }
+      }
+
+      // Deduplicate IDs. The per-item result list mirrors this deduplicated,
+      // input-ordered set so summary shape is stable across replays.
       const uniqueIds = [...new Set(d.paymentIds)];
 
       const payments = await prisma.payment.findMany({
@@ -2705,28 +3380,50 @@ fastify.get('/api/admin/auth/ip-score', {
 
       const cancelledIds: string[] = [];
       const skippedIds: string[] = [];
-      const errors: { id: string; reason: string }[] = [];
+      const errorIds: string[] = [];
+      const toCancelIds: string[] = [];
+      const items: {
+        id: string;
+        status: "cancelled" | "skipped" | "error";
+        reason?: string;
+      }[] = [];
 
       for (const id of uniqueIds) {
         const payment = paymentMap.get(id);
         if (!payment) {
           skippedIds.push(id);
+          items.push({ id, status: "skipped", reason: "not_found" });
           continue;
         }
         if (payment.merchantId !== merchantId) {
           skippedIds.push(id);
+          items.push({ id, status: "skipped", reason: "not_owned" });
+          continue;
+        }
+        if (payment.status === "cancelled") {
+          // A retry (or a fresh-key replay) must report an already-cancelled
+          // payment as cancelled, not as an error/skip.
+          cancelledIds.push(id);
+          items.push({ id, status: "cancelled" });
           continue;
         }
         if (payment.status !== "initiated") {
           skippedIds.push(id);
+          items.push({
+            id,
+            status: "skipped",
+            reason: `status:${payment.status}`,
+          });
           continue;
         }
         cancelledIds.push(id);
+        toCancelIds.push(id);
+        items.push({ id, status: "cancelled" });
       }
 
-      if (cancelledIds.length > 0) {
+      if (toCancelIds.length > 0) {
         await prisma.$transaction(async (tx) => {
-          for (const id of cancelledIds) {
+          for (const id of toCancelIds) {
             const before = paymentMap.get(id)!;
             const updated = await tx.payment.update({
               where: { id },
@@ -2744,13 +3441,33 @@ fastify.get('/api/admin/auth/ip-score', {
         });
       }
 
-      return reply.code(200).send({
+      const summary = {
         cancelled: cancelledIds.length,
         skipped: skippedIds.length,
-        errors: errors.length,
+        errors: errorIds.length,
         cancelledIds,
         skippedIds,
-      });
+        errorIds,
+        items,
+      };
+
+      if (summaryKey) {
+        try {
+          await redis.set(
+            summaryKey,
+            JSON.stringify(summary),
+            "EX",
+            IDEMPOTENCY_TTL_SECONDS,
+          );
+        } catch (err) {
+          request.log.warn(
+            { err, idempotencyKey },
+            "Failed to persist bulk-cancel idempotency summary",
+          );
+        }
+      }
+
+      return reply.code(200).send(summary);
     },
   );
 
@@ -2769,15 +3486,21 @@ fastify.get('/api/admin/auth/ip-score', {
       try {
         d = UpdateSettlementStatusBody.parse(request.body);
       } catch (error) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
-              "Invalid request body",
-              error,
-            ),
-          );
+        if (error instanceof z.ZodError) {
+          return reply
+            .code(400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.VALIDATION_ERROR,
+                "Invalid request body",
+                error.issues.map((issue) => ({
+                  path: issue.path,
+                  message: issue.message,
+                })),
+              ),
+            );
+        }
+        throw error;
       }
 
       const { id } = request.params;
@@ -2957,25 +3680,14 @@ fastify.get('/api/admin/auth/ip-score', {
         (d.amount && d.asset ? [{ amount: d.amount, asset: d.asset }] : []);
 
       // #319 — Validate each asset against SupportedAsset table
-      // #743 — Cache the allowlist with a 5-minute TTL to avoid re-reading
-      // the reference table on every settlement-create call.
-      let assetSet: Set<string>;
-      const cachedCodes = await redis
-        .get("supported-asset-codes")
-        .catch(() => null);
-      if (cachedCodes) {
-        assetSet = new Set<string>(JSON.parse(cachedCodes) as string[]);
-      } else {
-        const codes = (
-          await prisma.supportedAsset.findMany({
-            select: { code: true },
-          })
-        ).map((a) => a.code);
-        assetSet = new Set<string>(codes);
-        await redis
-          .set("supported-asset-codes", JSON.stringify([...assetSet]), "EX", 300)
-          .catch(() => {});
-      }
+      // #716 — Collapse per-item lookups into a single findMany for the
+      // distinct batch codes (one query regardless of item count).
+      const codes = [...new Set(items.map((item: any) => item.asset))];
+      const assets = await prisma.supportedAsset.findMany({
+        where: { code: { in: codes } },
+        select: { code: true },
+      });
+      const assetSet = new Set<string>(assets.map((a) => a.code));
 
       for (const item of items) {
         if (!assetSet.has(item.asset)) {
@@ -3067,7 +3779,7 @@ fastify.get('/api/admin/auth/ip-score', {
         if (newDailyTotal > dailyLimit) {
           return reply.code(422).send(
             createErrorResponse(
-              ErrorCodes.VALIDATION_ERROR,
+              "QUOTA_EXCEEDED",
               `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
@@ -3156,36 +3868,36 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
-  fastify.get("/api/deployments", async (request, reply) => {
-    // #761 — explorer links must follow the configured network, not assume
-    // testnet, or a mainnet receipt points a member at the wrong ledger
-    // viewer during an incident.
-    const isMainnet = env.STELLAR_NETWORK_PASSPHRASE.toLowerCase().includes(
-      "public global",
-    );
-    const explorerContractBase = isMainnet
-      ? "https://stellar.expert/explorer/public/contract"
-      : "https://lab.stellar.org/r/testnet/contract";
-
-    return {
-      data: {
-        network: env.STELLAR_NETWORK_PASSPHRASE,
-        contracts: [
-          {
-            name: "Settlement contract",
-            contractId: env.SETTLEMENT_CONTRACT_ID,
-            explorerUrl: `${explorerContractBase}/${env.SETTLEMENT_CONTRACT_ID}`,
-          },
-          {
-            name: "Governance contract",
-            contractId: env.GOVERNANCE_CONTRACT_ID,
-            explorerUrl: `${explorerContractBase}/${env.GOVERNANCE_CONTRACT_ID}`,
-          },
-        ],
-        updatedAt: new Date().toISOString(),
-      },
-    };
+  // Deployment metadata is fixed for the lifetime of the process (it comes
+  // from env), so snapshot the representation once. This keeps the ETag stable
+  // instead of changing on every request because of a fresh `updatedAt`.
+  const deploymentsPayload = buildDeploymentsResponse({
+    networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE,
+    settlementContractId: env.SETTLEMENT_CONTRACT_ID,
+    governanceContractId: env.GOVERNANCE_CONTRACT_ID,
   });
+  const deploymentsBody = JSON.stringify(deploymentsPayload);
+  const deploymentsEtag = computeDeploymentsEtag(deploymentsBody);
+
+  fastify.get(
+    "/api/deployments",
+    {
+      schema: deploymentsRouteSchema,
+    },
+    async (request, reply) => {
+      if (isEtagMatch(request.headers["if-none-match"], deploymentsEtag)) {
+        return reply
+          .code(304)
+          .header("ETag", deploymentsEtag)
+          .send();
+      }
+
+      return reply
+        .header("ETag", deploymentsEtag)
+        .type("application/json")
+        .send(deploymentsBody);
+    },
+  );
 
   async function proxyFxUpstream(
     request: FastifyRequest,
@@ -3240,9 +3952,11 @@ fastify.get('/api/admin/auth/ip-score', {
     }
   }
 
-  fastify.get("/api/rates", async (request, reply) =>
-    proxyFxUpstream(request, reply, "/api/rates"),
-  );
+  fastify.get("/api/rates", async (request, reply) => {
+    const result = await proxyFxUpstream(request, reply, "/api/rates");
+    reply.header("Cache-Control", "public, max-age=60");
+    return result;
+  });
   fastify.get("/api/currencies", async (request, reply) =>
     proxyFxUpstream(request, reply, "/api/currencies"),
   );
@@ -3616,6 +4330,7 @@ const isDirectRun = Boolean(
 );
 if (isDirectRun) {
   mainApp = buildApp();
+  installCrashHandlers(mainApp.log);
 
   // Served on its own port (see startMetricsServer), not the application
   // port — keeps the scrape endpoint unauthenticated without exposing it

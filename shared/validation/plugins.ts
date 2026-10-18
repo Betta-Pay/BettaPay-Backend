@@ -7,6 +7,7 @@ import { createErrorResponse, ErrorCodes } from './index.js';
 declare module 'fastify' {
   interface FastifyInstance {
     serviceAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    adminAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
 
@@ -114,6 +115,21 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
 
     if ((error as FastifyError).statusCode) {
       const fastifyErr = error as FastifyError & { validation?: unknown };
+      // #911 — normalise Fastify's body-limit failure into the shared typed
+      // envelope so clients branch on PAYLOAD_TOO_LARGE rather than the
+      // framework-specific FST_ERR_CTP_BODY_TOO_LARGE string.
+      if (fastifyErr.statusCode === 413) {
+        return reply
+          .code(413)
+          .send(
+            createErrorResponse(
+              ErrorCodes.PAYLOAD_TOO_LARGE,
+              'Request body exceeds the maximum allowed size',
+              undefined,
+              reqId,
+            ),
+          );
+      }
       const code = fastifyErr.code || ErrorCodes.INVALID_REQUEST;
       const details = fastifyErr.validation ? redactPiiFromDetails(fastifyErr.validation) : undefined;
       const response = createErrorResponse(code, sanitizeErrorMessage(fastifyErr.message), details, reqId);
@@ -122,7 +138,10 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
 
     // Generic fallback for unhandled errors — assign a referenceId so the
     // client can quote it when reporting the problem, and the server log entry
-    // ties back to exactly that request.
+    // ties back to exactly that request. The body uses the standard error
+    // envelope (#666) so clients can branch on `error.code` during an incident
+    // exactly as they do for every other failure; the referenceId travels in
+    // `error.details` rather than replacing the envelope.
     const referenceId = crypto.randomUUID();
     const errorClass = classifyError(error);
     const errObj = error instanceof Error ? error : new Error(String(error));
@@ -131,12 +150,14 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       'Unhandled internal error',
     );
 
-    return reply.code(500).send({
-      error: 'Internal Server Error',
-      statusCode: 500,
-      referenceId,
-      reqId,
-    });
+    return reply.code(500).send(
+      createErrorResponse(
+        ErrorCodes.INTERNAL_ERROR,
+        'Internal Server Error',
+        { referenceId },
+        reqId,
+      ),
+    );
   });
 
   // Belt-and-suspenders: Fastify's onError lifecycle hook fires after the
@@ -157,12 +178,14 @@ export function registerErrorHandler(fastify: FastifyInstance, customLogger?: Fa
       'Panic recovery: unhandled error reached onError hook',
     );
 
-    return reply.code(500).send({
-      error: 'Internal Server Error',
-      statusCode: 500,
-      referenceId,
-      reqId: request.id,
-    });
+    return reply.code(500).send(
+      createErrorResponse(
+        ErrorCodes.INTERNAL_ERROR,
+        'Internal Server Error',
+        { referenceId },
+        request.id,
+      ),
+    );
   });
 }
 
@@ -263,7 +286,17 @@ export function createServiceAuth(
 
     const valid = token && secrets.some((s) => timingSafeStrEqual(token, s));
     if (!valid) {
-      request.log?.warn({ reqId: request.id }, 'serviceAuth: missing or invalid service token');
+      const reason = !token ? 'missing_token' : 'invalid_token';
+      const callerHint = token ? `${token.slice(0, 4)}***` : null;
+      request.log?.warn(
+        {
+          reqId: request.id,
+          route: `${request.method} ${request.url}`,
+          caller: callerHint,
+          reason,
+        },
+        'serviceAuth: rejected',
+      );
       return reply
         .code(401)
         .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid or missing service token'));
@@ -277,4 +310,34 @@ export function createServiceAuth(
  */
 export function registerServiceAuth(fastify: FastifyInstance, secret: string | string[]): void {
   fastify.decorate('serviceAuth', createServiceAuth(secret));
+}
+
+/**
+ * Issue #908 — Create a preValidation hook that checks `x-admin-api-key`
+ * against the supplied secret using a timing-safe comparison, preventing
+ * timing-based enumeration of the key.
+ */
+export function createAdminApiKeyAuth(
+  secret: string,
+): (request: FastifyRequest, reply: FastifyReply) => Promise<void> {
+  if (!secret || secret.length < 32) {
+    throw new Error('createAdminApiKeyAuth: secret must be at least 32 characters');
+  }
+
+  return async function adminApiKeyAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const header = request.headers['x-admin-api-key'];
+    const key = Array.isArray(header) ? header[0] : header;
+
+    const valid = key && timingSafeStrEqual(key, secret);
+    if (!valid) {
+      const reason = !key ? 'missing_key' : 'invalid_key';
+      request.log?.warn(
+        { reqId: request.id, route: `${request.method} ${request.url}`, reason },
+        'adminApiKeyAuth: rejected',
+      );
+      return reply
+        .code(401)
+        .send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid or missing admin API key'));
+    }
+  };
 }

@@ -4,19 +4,32 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { resolveMetricsPort, startMetricsServer } from './metrics-server.js';
 
-function get(port: number, path: string, headers?: Record<string, string>): Promise<{ status: number; contentType?: string; body: string }> {
+// Issue #864: Unit tests for startMetricsServer scrape-token auth branch and listener behavior.
+
+interface HttpResponse {
+  status: number;
+  contentType?: string;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+function request(
+  port: number,
+  method: string,
+  path: string,
+  headers?: Record<string, string>,
+): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     // agent: false + Connection: close avoids a keep-alive socket lingering
-    // past this request — each test binds its own ephemeral (port 0) server,
-    // and the OS can reissue that port number for the next test's server.
+    // past this request — each test binds its own ephemeral (port 0) server.
     const req = http.request(
-      { 
-        host: '127.0.0.1', 
-        port, 
-        path, 
-        method: 'GET', 
-        agent: false, 
-        headers: { Connection: 'close', ...headers } 
+      {
+        host: '127.0.0.1',
+        port,
+        path,
+        method,
+        agent: false,
+        headers: { Connection: 'close', ...headers },
       },
       (res) => {
         let body = '';
@@ -24,13 +37,22 @@ function get(port: number, path: string, headers?: Record<string, string>): Prom
           body += chunk;
         });
         res.on('end', () => {
-          resolve({ status: res.statusCode ?? 0, contentType: res.headers['content-type'], body });
+          resolve({
+            status: res.statusCode ?? 0,
+            contentType: res.headers['content-type'],
+            headers: res.headers,
+            body,
+          });
         });
       },
     );
     req.on('error', reject);
     req.end();
   });
+}
+
+function get(port: number, path: string, headers?: Record<string, string>): Promise<HttpResponse> {
+  return request(port, 'GET', path, headers);
 }
 
 function createLogSpy() {
@@ -92,13 +114,18 @@ test('startMetricsServer: serves metrics on GET /metrics with the given content 
   }
 });
 
-test('startMetricsServer: returns 404 for any path other than /metrics', async () => {
+test('startMetricsServer: non-GET request or path other than /metrics yields HTTP 404 before auth evaluation', async () => {
   process.env.METRICS_PORT = '0';
   const log = createLogSpy();
+  let getMetricsCalls = 0;
   const server = startMetricsServer({
     appPort: 3000,
     contentType: 'text/plain',
-    getMetrics: () => 'ok',
+    getMetrics: () => {
+      getMetricsCalls++;
+      return 'ok';
+    },
+    scrapeToken: 'required-token-abc',
     log,
   });
 
@@ -106,8 +133,25 @@ test('startMetricsServer: returns 404 for any path other than /metrics', async (
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const port = (server.address() as AddressInfo).port;
 
-    const res = await get(port, '/health');
-    assert.equal(res.status, 404);
+    // Path other than /metrics
+    const resPath = await get(port, '/health');
+    assert.equal(resPath.status, 404);
+    assert.equal(resPath.body, 'Not Found');
+
+    const resNested = await get(port, '/metrics/sub');
+    assert.equal(resNested.status, 404);
+
+    // Non-GET methods on /metrics
+    const resPost = await request(port, 'POST', '/metrics');
+    assert.equal(resPost.status, 404);
+
+    const resPut = await request(port, 'PUT', '/metrics');
+    assert.equal(resPut.status, 404);
+
+    const resDelete = await request(port, 'DELETE', '/metrics');
+    assert.equal(resDelete.status, 404);
+
+    assert.equal(getMetricsCalls, 0, 'getMetrics must not be called on 404');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.METRICS_PORT;
@@ -137,53 +181,22 @@ test('startMetricsServer: responds 500 and logs when getMetrics rejects', async 
   }
 });
 
-// ── Auth tests (#528) ─────────────────────────────────────────────────────────
+// ── Auth tests (#528 & #864) ──────────────────────────────────────────────────
 
-test('startMetricsServer: rejects unauthorized scrape when scrapeToken is set', async () => {
+test('startMetricsServer: scrapeToken auth branch with valid Bearer token yields HTTP 200 and exact payload', async () => {
   process.env.METRICS_PORT = '0';
   const log = createLogSpy();
-  const server = startMetricsServer({
-    appPort: 3000,
-    contentType: 'text/plain',
-    getMetrics: () => 'test_metric 1',
-    scrapeToken: 'secret-token-12345',
-    log,
-  });
+  const metricsBody = '# HELP http_requests_total\nhttp_requests_total 42\n';
+  const scrapeToken = 'valid-super-secret-token';
+  let getMetricsCalls = 0;
 
-  try {
-    await new Promise<void>((resolve) => server.once('listening', resolve));
-    const port = (server.address() as AddressInfo).port;
-
-    // Request without Authorization header
-    const res1 = await get(port, '/metrics');
-    assert.equal(res1.status, 401, 'should reject request without auth header');
-    assert.equal(res1.body, 'Unauthorized');
-
-    // Request with wrong token
-    const res2 = await get(port, '/metrics', { Authorization: 'Bearer wrong-token' });
-    assert.equal(res2.status, 401, 'should reject request with wrong token');
-    assert.equal(res2.body, 'Unauthorized');
-
-    // Request with malformed auth header
-    const res3 = await get(port, '/metrics', { Authorization: 'InvalidFormat' });
-    assert.equal(res3.status, 401, 'should reject request with malformed auth header');
-    assert.equal(res3.body, 'Unauthorized');
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
-  }
-});
-
-test('startMetricsServer: serves metrics when correct scrapeToken is provided', async () => {
-  process.env.METRICS_PORT = '0';
-  const log = createLogSpy();
-  const metricsBody = '# HELP test_metric\ntest_metric 1\n';
-  const scrapeToken = 'correct-secret-token';
-  
   const server = startMetricsServer({
     appPort: 3000,
     contentType: 'text/plain; version=0.0.4',
-    getMetrics: () => metricsBody,
+    getMetrics: () => {
+      getMetricsCalls++;
+      return metricsBody;
+    },
     scrapeToken,
     log,
   });
@@ -193,36 +206,126 @@ test('startMetricsServer: serves metrics when correct scrapeToken is provided', 
     const port = (server.address() as AddressInfo).port;
 
     const res = await get(port, '/metrics', { Authorization: `Bearer ${scrapeToken}` });
-    assert.equal(res.status, 200, 'should serve metrics with valid token');
+    assert.equal(res.status, 200);
     assert.equal(res.contentType, 'text/plain; version=0.0.4');
     assert.equal(res.body, metricsBody);
+    assert.equal(getMetricsCalls, 1, 'getMetrics was invoked once for authenticated request');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.METRICS_PORT;
   }
 });
 
-test('startMetricsServer: serves metrics unauthenticated when scrapeToken is omitted', async () => {
+test('startMetricsServer: scrapeToken set and missing Authorization header yields HTTP 401 without calling getMetrics', async () => {
   process.env.METRICS_PORT = '0';
   const log = createLogSpy();
-  const metricsBody = 'test_metric 2';
-  
+  let getMetricsCalls = 0;
+
   const server = startMetricsServer({
     appPort: 3000,
     contentType: 'text/plain',
-    getMetrics: () => metricsBody,
+    getMetrics: () => {
+      getMetricsCalls++;
+      return 'should-not-be-called';
+    },
+    scrapeToken: 'configured-secret-token',
     log,
-    // No scrapeToken provided
   });
 
   try {
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const port = (server.address() as AddressInfo).port;
 
-    // Request without auth should succeed when no token is configured
     const res = await get(port, '/metrics');
-    assert.equal(res.status, 200, 'should serve metrics without auth when token not configured');
+    assert.equal(res.status, 401);
+    assert.equal(res.body, 'Unauthorized');
+    assert.equal(getMetricsCalls, 0, 'spy asserts getMetrics was not called on 401');
+    assert.ok(
+      res.headers['www-authenticate']?.includes('Bearer realm="metrics"') ||
+      res.headers['www-authenticate']?.includes('Bearer realm=metrics'),
+      'includes WWW-Authenticate challenge header',
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    delete process.env.METRICS_PORT;
+  }
+});
+
+test('startMetricsServer: scrapeToken set and wrong or malformed token yields HTTP 401 with WWW-Authenticate header and no getMetrics call', async () => {
+  process.env.METRICS_PORT = '0';
+  const log = createLogSpy();
+  let getMetricsCalls = 0;
+
+  const server = startMetricsServer({
+    appPort: 3000,
+    contentType: 'text/plain',
+    getMetrics: () => {
+      getMetricsCalls++;
+      return 'should-not-be-called';
+    },
+    scrapeToken: 'correct-secret-token-123',
+    log,
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    // Wrong token
+    const resWrong = await get(port, '/metrics', { Authorization: 'Bearer wrong-secret-token' });
+    assert.equal(resWrong.status, 401);
+    assert.equal(resWrong.body, 'Unauthorized');
+    assert.ok(
+      resWrong.headers['www-authenticate']?.includes('Bearer realm="metrics"') ||
+      resWrong.headers['www-authenticate']?.includes('Bearer realm=metrics'),
+      'must include WWW-Authenticate challenge on wrong token',
+    );
+
+    // Malformed token without Bearer prefix
+    const resMalformed = await get(port, '/metrics', { Authorization: 'Basic correct-secret-token-123' });
+    assert.equal(resMalformed.status, 401);
+    assert.equal(resMalformed.body, 'Unauthorized');
+    assert.ok(
+      resMalformed.headers['www-authenticate']?.includes('Bearer realm="metrics"') ||
+      resMalformed.headers['www-authenticate']?.includes('Bearer realm=metrics'),
+    );
+
+    // Invalid format
+    const resInvalid = await get(port, '/metrics', { Authorization: 'InvalidFormat' });
+    assert.equal(resInvalid.status, 401);
+
+    assert.equal(getMetricsCalls, 0, 'spy asserts getMetrics was never called for any unauthorized request');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    delete process.env.METRICS_PORT;
+  }
+});
+
+test('startMetricsServer: with scrapeToken omitted, unauthenticated GET /metrics yields HTTP 200', async () => {
+  process.env.METRICS_PORT = '0';
+  const log = createLogSpy();
+  const metricsBody = 'test_metric 2\n';
+  let getMetricsCalls = 0;
+
+  const server = startMetricsServer({
+    appPort: 3000,
+    contentType: 'text/plain',
+    getMetrics: () => {
+      getMetricsCalls++;
+      return metricsBody;
+    },
+    log,
+    // scrapeToken intentionally omitted
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    const res = await get(port, '/metrics');
+    assert.equal(res.status, 200);
     assert.equal(res.body, metricsBody);
+    assert.equal(getMetricsCalls, 1, 'getMetrics called for unauthenticated request');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.METRICS_PORT;
@@ -232,7 +335,7 @@ test('startMetricsServer: serves metrics unauthenticated when scrapeToken is omi
 test('startMetricsServer: logs auth status on startup', async () => {
   process.env.METRICS_PORT = '0';
   const log = createLogSpy();
-  
+
   const serverWithAuth = startMetricsServer({
     appPort: 3000,
     contentType: 'text/plain',
