@@ -17,7 +17,7 @@ export interface AuditLogRequestLike {
   user?: unknown;
 }
 
-function parseTrustedProxyCount(raw: string | undefined): number {
+export function parseTrustedProxyCount(raw: string | undefined): number {
   const parsed = raw !== undefined ? parseInt(raw, 10) : 0;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }

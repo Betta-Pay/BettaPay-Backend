@@ -1,0 +1,10 @@
+{
+  "name": "@bettapay/worker-shutdown",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" } },
+  "scripts": { "build": "tsc", "type-check": "tsc --noEmit" },
+  "dependencies": { "bullmq": "*" },
+  "devDependencies": { "@types/node": "^20.10.0", "typescript": "^5.3.3" }
+}

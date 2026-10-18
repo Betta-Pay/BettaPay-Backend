@@ -1,66 +1,98 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFeatureFlags, isFeatureEnabled, getEnabledFlags, logFeatureFlags } from './feature-flags.js';
+import {
+  parseFeatureFlags,
+  isFeatureEnabled,
+  getEnabledFlags,
+  logFeatureFlags,
+  reloadFeatureFlags,
+} from './feature-flags.js';
+
+// Issue #865: feature-flag parsing edge cases and isFeatureEnabled / getEnabledFlags contract
 
 test('parseFeatureFlags: empty / undefined input returns empty Set', () => {
   assert.equal(parseFeatureFlags(undefined).size, 0);
   assert.equal(parseFeatureFlags('').size, 0);
+});
+
+test('parseFeatureFlags: whitespace-only string returns an empty Set', () => {
   assert.equal(parseFeatureFlags('   ').size, 0);
+  assert.equal(parseFeatureFlags('\t\n  ').size, 0);
 });
 
-test('parseFeatureFlags: single flag is parsed correctly', () => {
-  const flags = parseFeatureFlags('new_settlement_flow');
-  assert.ok(flags.has('new_settlement_flow'));
+test('parseFeatureFlags: duplicate entries collapse to a single normalized name (a,a,a has size 1)', () => {
+  const flags = parseFeatureFlags('a,a,a');
   assert.equal(flags.size, 1);
+  assert.ok(flags.has('a'));
 });
 
-test('parseFeatureFlags: multiple flags separated by commas', () => {
-  const flags = parseFeatureFlags('flag_a,flag_b,flag_c');
-  assert.ok(flags.has('flag_a'));
-  assert.ok(flags.has('flag_b'));
-  assert.ok(flags.has('flag_c'));
-  assert.equal(flags.size, 3);
-});
-
-test('parseFeatureFlags: normalises to lowercase', () => {
-  const flags = parseFeatureFlags('FlagA,FLAG_B');
-  assert.ok(flags.has('flaga'));
-  assert.ok(flags.has('flag_b'));
-});
-
-test('parseFeatureFlags: trims whitespace around flag names', () => {
-  const flags = parseFeatureFlags(' flag_x , flag_y ');
-  assert.ok(flags.has('flag_x'));
-  assert.ok(flags.has('flag_y'));
-});
-
-test('parseFeatureFlags: skips empty segments from trailing/double commas', () => {
-  const flags = parseFeatureFlags('flag_a,,flag_b,');
+test('parseFeatureFlags: mixed case and surrounding whitespace are trimmed and lowercased', () => {
+  const flags = parseFeatureFlags(' New_Settlement_Flow , enhanced_fx_quotes ');
   assert.equal(flags.size, 2);
-  assert.ok(flags.has('flag_a'));
-  assert.ok(flags.has('flag_b'));
+  assert.ok(flags.has('new_settlement_flow'));
+  assert.ok(flags.has('enhanced_fx_quotes'));
+  assert.deepEqual(Array.from(flags).sort(), ['enhanced_fx_quotes', 'new_settlement_flow']);
 });
 
-test('isFeatureEnabled: returns true when flag is present (case-insensitive lookup)', () => {
-  const flags = parseFeatureFlags('webhook_cache_ttl_refresh,new_settlement_flow');
-  // isFeatureEnabled reads from the module-level _flags set which is fixed at
-  // import time, so we exercise parseFeatureFlags directly for gate logic.
-  assert.ok(flags.has('webhook_cache_ttl_refresh'));
-  assert.ok(!flags.has('unknown_flag'));
+test('parseFeatureFlags: empty tokens from leading, trailing, or doubled commas are filtered out', () => {
+  // Two commas returns an empty Set
+  const commasOnly = parseFeatureFlags(',,');
+  assert.equal(commasOnly.size, 0);
+
+  const leadingTrailing = parseFeatureFlags(',flag_a,,flag_b,');
+  assert.equal(leadingTrailing.size, 2);
+  assert.ok(leadingTrailing.has('flag_a'));
+  assert.ok(leadingTrailing.has('flag_b'));
 });
 
-test('getEnabledFlags: returns sorted array of all enabled flags', () => {
-  // Re-parse locally to verify sort order without relying on env state.
-  const flags = parseFeatureFlags('zebra_flag,alpha_flag,middle_flag');
-  const sorted = Array.from(flags).sort();
-  assert.deepEqual(sorted, ['alpha_flag', 'middle_flag', 'zebra_flag']);
+test('isFeatureEnabled: case-insensitive matching and returns true for uppercase lookup of lowercase configured flag', () => {
+  const prev = process.env.FEATURE_FLAGS;
+  try {
+    process.env.FEATURE_FLAGS = 'new_settlement_flow,enhanced_fx_quotes';
+    reloadFeatureFlags();
+
+    // Uppercase form returns true
+    assert.equal(isFeatureEnabled('NEW_SETTLEMENT_FLOW'), true);
+    assert.equal(isFeatureEnabled('New_Settlement_Flow'), true);
+    assert.equal(isFeatureEnabled('new_settlement_flow'), true);
+    assert.equal(isFeatureEnabled('  ENHANCED_FX_QUOTES  '), true);
+  } finally {
+    if (prev !== undefined) {
+      process.env.FEATURE_FLAGS = prev;
+    } else {
+      delete process.env.FEATURE_FLAGS;
+    }
+    reloadFeatureFlags();
+  }
+});
+
+test('isFeatureEnabled and getEnabledFlags: unconfigured flag returns false and is absent from sorted getEnabledFlags', () => {
+  const prev = process.env.FEATURE_FLAGS;
+  try {
+    process.env.FEATURE_FLAGS = 'zebra_flag,alpha_flag,middle_flag';
+    reloadFeatureFlags();
+
+    assert.equal(isFeatureEnabled('unknown_flag'), false);
+    assert.equal(isFeatureEnabled('not_configured'), false);
+
+    const enabled = getEnabledFlags();
+    assert.deepEqual(enabled, ['alpha_flag', 'middle_flag', 'zebra_flag']);
+    assert.equal(enabled.includes('unknown_flag'), false);
+    assert.equal(enabled.includes('not_configured'), false);
+  } finally {
+    if (prev !== undefined) {
+      process.env.FEATURE_FLAGS = prev;
+    } else {
+      delete process.env.FEATURE_FLAGS;
+    }
+    reloadFeatureFlags();
+  }
 });
 
 test('logFeatureFlags: emits structured log with active flag names', () => {
   const logged: Array<{ obj: object; msg?: string }> = [];
   const log = { info: (obj: object, msg?: string) => logged.push({ obj, msg }) };
 
-  // Provide a test-time closure that mimics logFeatureFlags but uses a local set.
   const testFlags = parseFeatureFlags('new_settlement_flow,webhook_cache_ttl_refresh');
   const flagList = Array.from(testFlags).sort();
 
@@ -93,11 +125,6 @@ test('logFeatureFlags: emits "No feature flags enabled" when set is empty', () =
 });
 
 // ── Flag-gated behavior: webhook_cache_ttl_refresh ───────────────────────────
-//
-// The indexer's persistEvent uses this flag to decide whether a cache hit
-// should renew the TTL (keeping hot subscription lists alive indefinitely)
-// or let the fixed 30-second window expire as before. The helper below
-// mirrors the same logic the production code path uses.
 
 function simulateCacheCheck(
   cachedAt: number,
@@ -120,7 +147,7 @@ function simulateCacheCheck(
 test('webhook_cache_ttl_refresh flag: hit refreshes TTL when flag is enabled', () => {
   const flags = parseFeatureFlags('webhook_cache_ttl_refresh');
   const now = Date.now();
-  const cachedAt = now - 10_000; // 10 s old — within the 30 s window
+  const cachedAt = now - 10_000;
 
   const result = simulateCacheCheck(cachedAt, now, flags);
   assert.equal(result, 'hit-refreshed');
@@ -138,7 +165,7 @@ test('webhook_cache_ttl_refresh flag: hit does NOT refresh TTL when flag is disa
 test('webhook_cache_ttl_refresh flag: expired cache is always a miss regardless of flag', () => {
   const flags = parseFeatureFlags('webhook_cache_ttl_refresh');
   const now = Date.now();
-  const cachedAt = now - 35_000; // 35 s old — past the 30 s window
+  const cachedAt = now - 35_000;
 
   const result = simulateCacheCheck(cachedAt, now, flags);
   assert.equal(result, 'miss');

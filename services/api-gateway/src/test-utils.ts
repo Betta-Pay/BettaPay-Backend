@@ -107,6 +107,13 @@ export function createMockPrisma(initialData: MockData = {}) {
       if (where?.status && p.status !== where.status) return false;
       if (where?.createdAt?.gte && new Date(p.createdAt) < new Date(where.createdAt.gte)) return false;
       if (where?.createdAt?.lte && new Date(p.createdAt) > new Date(where.createdAt.lte)) return false;
+      // #914 — mirror Prisma's relation filter used by the payments listing.
+      // A payment with no merchant row in the fixture is treated as active,
+      // like a real orphan would be rejected by the FK.
+      if (where?.merchant?.deletedAt === null) {
+        const merchant = store.merchants.find((m) => m.id === p.merchantId);
+        if (merchant?.deletedAt) return false;
+      }
       return true;
     });
   }

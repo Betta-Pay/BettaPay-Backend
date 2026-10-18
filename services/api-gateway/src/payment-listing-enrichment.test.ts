@@ -2,7 +2,7 @@ import test from 'tape';
 import type { IndexerClient, IndexerEvent } from './clients/indexer-client.js';
 import { validateEnv } from '@bettapay/validation';
 import { buildApp } from './index.js';
-import { createMockPrisma, generateTestJwt } from './test-utils.js';
+import { createMockPrisma, createTestApp, generateTestJwt } from './test-utils.js';
 
 const env = validateEnv(process.env);
 const SERVICE_TOKEN = env.INTER_SERVICE_SECRET || 'inter-service-secret-value';
@@ -215,6 +215,151 @@ test('Payment listing bulk enrichment: indexer unavailability degrades every pay
     body.data.every((p: any) => p.events === null),
     'every payment gracefully degrades to events: null',
   );
+
+  await app.close();
+  t.end();
+});
+
+// ── #914 / #913 — includeDeleted authorization and page-size bounds ────────
+
+const LIST_ACTIVE_MERCHANT = { id: 'merchant-active', deletedAt: null };
+const LIST_DELETED_MERCHANT = {
+  id: 'merchant-deleted',
+  deletedAt: new Date('2026-01-01T00:00:00.000Z'),
+};
+
+test('Payment listing: default excludes payments belonging to a soft-deleted merchant', async (t) => {
+  const payments = [
+    ...makePayments('merchant-active', 2),
+    ...makePayments('merchant-deleted', 2),
+  ];
+  const { app } = await createTestApp(
+    {},
+    { merchants: [LIST_ACTIVE_MERCHANT, LIST_DELETED_MERCHANT], payments },
+  );
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/payments',
+    headers: { 'x-service-token': SERVICE_TOKEN },
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200');
+  const body = JSON.parse(res.body);
+  t.equal(body.data.length, 2, 'only active-merchant payments are returned');
+  t.ok(
+    body.data.every((p: FakePayment) => p.merchantId === 'merchant-active'),
+    'deleted-merchant payments are excluded by default',
+  );
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: admin includeDeleted=true returns soft-deleted payments', async (t) => {
+  const payments = [
+    ...makePayments('merchant-active', 2),
+    ...makePayments('merchant-deleted', 2),
+  ];
+  const { app } = await createTestApp(
+    {},
+    { merchants: [LIST_ACTIVE_MERCHANT, LIST_DELETED_MERCHANT], payments },
+  );
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/payments?includeDeleted=true',
+    headers: { 'x-service-token': SERVICE_TOKEN },
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200');
+  const body = JSON.parse(res.body);
+  t.equal(body.data.length, 4, 'all payments are returned to the admin caller');
+  t.ok(
+    body.data.some((p: FakePayment) => p.merchantId === 'merchant-deleted'),
+    'soft-deleted merchant payments are visible',
+  );
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: merchant JWT cannot request includeDeleted=true', async (t) => {
+  const { app } = await createTestApp(
+    {},
+    {
+      merchants: [LIST_ACTIVE_MERCHANT, LIST_DELETED_MERCHANT],
+      payments: makePayments('merchant-active', 1),
+    },
+  );
+  const token = generateTestJwt(app, { merchantId: 'merchant-active', ownerId: 'owner-a' });
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/payments?includeDeleted=true',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  t.equal(res.statusCode, 403, 'returns 403 for a merchant caller');
+  t.equal(JSON.parse(res.body).error.code, 'FORBIDDEN', 'uses FORBIDDEN');
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: includeDeleted rejects values other than true/false', async (t) => {
+  const { app } = await createTestApp({}, { payments: makePayments('merchant-active', 1) });
+  const token = generateTestJwt(app, { merchantId: 'merchant-active', ownerId: 'owner-a' });
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/payments?includeDeleted=yes',
+    headers: { authorization: `Bearer ${token}` },
+  });
+
+  t.equal(res.statusCode, 400, 'returns 400');
+  t.equal(JSON.parse(res.body).error.code, 'VALIDATION_ERROR', 'uses VALIDATION_ERROR');
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: limit defaults to 50, accepts 100 and rejects 101', async (t) => {
+  const payments = makePayments('merchant-active', 105);
+  const { app } = await createTestApp(
+    {},
+    { merchants: [LIST_ACTIVE_MERCHANT], payments },
+  );
+
+  const token = generateTestJwt(app, { merchantId: 'merchant-active', ownerId: 'owner-a' });
+  const auth = { authorization: `Bearer ${token}` };
+
+  const defaulted = await app.inject({ method: 'GET', url: '/api/payments', headers: auth });
+  t.equal(defaulted.statusCode, 200, 'default page returns 200');
+  t.equal(JSON.parse(defaulted.body).data.length, 50, 'default limit is 50');
+
+  const atMax = await app.inject({
+    method: 'GET',
+    url: '/api/payments?limit=100',
+    headers: auth,
+  });
+  t.equal(atMax.statusCode, 200, 'limit at the maximum is accepted');
+  t.equal(JSON.parse(atMax.body).data.length, 100, 'returns the requested page size');
+
+  const overMax = await app.inject({
+    method: 'GET',
+    url: '/api/payments?limit=101',
+    headers: auth,
+  });
+  t.equal(overMax.statusCode, 400, 'limit above the maximum is rejected');
+  t.equal(JSON.parse(overMax.body).error.code, 'VALIDATION_ERROR', 'uses VALIDATION_ERROR');
+
+  const nonNumeric = await app.inject({
+    method: 'GET',
+    url: '/api/payments?limit=abc',
+    headers: auth,
+  });
+  t.equal(nonNumeric.statusCode, 400, 'non-numeric limit is rejected');
 
   await app.close();
   t.end();

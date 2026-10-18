@@ -9,6 +9,7 @@
  * reclaims expired keys by nulling them out, freeing the value for reuse.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { PrismaClient } from '@prisma/client';
 import type { FastifyLoggerInstance } from 'fastify';
 
@@ -80,6 +81,8 @@ export async function reclaimExpiredIdempotencyKeys(
   }
 
   isCronRunning = true;
+  const traceId = randomUUID();
+  logger.info({ traceId }, 'Starting idempotency key cleanup run');
   try {
     const now = new Date();
     const where = {
@@ -96,13 +99,13 @@ export async function reclaimExpiredIdempotencyKeys(
     const total = payments.count + settlements.count;
     if (total > 0) {
       logger.info(
-        { paymentsReclaimed: payments.count, settlementsReclaimed: settlements.count },
+        { traceId, paymentsReclaimed: payments.count, settlementsReclaimed: settlements.count },
         'Reclaimed expired idempotency keys.',
       );
     }
     return total;
   } catch (error) {
-    logger.error({ err: error }, 'Error during idempotency key cleanup cron job.');
+    logger.error({ traceId, err: error }, 'Error during idempotency key cleanup cron job.');
     return 0;
   } finally {
     isCronRunning = false;

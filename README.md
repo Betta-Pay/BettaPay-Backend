@@ -72,6 +72,16 @@ pnpm indexer:dev
 | POST   | /api/settlements         | Trigger settlement       |
 | GET    | /api/deployments         | Testnet contract info    |
 
+### Listing payments (`GET /api/payments`)
+
+- `limit` defaults to **50** and is capped at **100**. Values above 100 or
+  non-numeric values are rejected with `400 VALIDATION_ERROR`; the default is
+  unchanged for callers that omit it.
+- `includeDeleted` defaults to `false`, so payments belonging to soft-deleted
+  merchants are excluded. Only service-auth (admin) callers may pass
+  `includeDeleted=true`; a merchant JWT caller receives
+  `403 FORBIDDEN`. The parameter accepts only `true` or `false`.
+
 ## Contract Integration
 
 The services reference Soroban contracts via environment variables:
