@@ -62,6 +62,7 @@ export const ErrorCodes = {
   MERCHANT_STATE_CONFLICT: "MERCHANT_STATE_CONFLICT",
   QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
   QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
+  WALLET_AUTH_LOCKOUT: "WALLET_AUTH_LOCKOUT",
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -492,6 +493,9 @@ export const EnvSchema = z
     // the gateway's own disable check (api-gateway/src/index.ts) only matches
     // exactly 'false' or '0' and is left untouched.
     RATE_LIMIT_ENABLED: z.enum(["true", "false", "1", "0"]).default("true"),
+
+    // Webhook test URL allowlist for SSRF prevention (#900).
+    WEBHOOK_TEST_ALLOWED_HOSTS: z.string().default("example.com,*.example.com,webhook.site"),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
@@ -578,12 +582,13 @@ export const EnvSchema = z
 
 export type Env = Omit<
   z.infer<typeof EnvSchema>,
-  "ALLOWED_ORIGINS" | "CONTRACT_IDS" | "FEATURE_FLAGS" | "ALLOWED_EMAIL_DOMAINS"
+  "ALLOWED_ORIGINS" | "CONTRACT_IDS" | "FEATURE_FLAGS" | "ALLOWED_EMAIL_DOMAINS" | "WEBHOOK_TEST_ALLOWED_HOSTS"
 > & {
   ALLOWED_ORIGINS: string[];
   CONTRACT_IDS: string[];
   ALLOWED_EMAIL_DOMAINS: string[];
   FEATURE_FLAGS: string[];
+  WEBHOOK_TEST_ALLOWED_HOSTS: string[];
 };
 
 // For string length issues, appends the received length (e.g. "(got 8)") rather
@@ -638,6 +643,11 @@ export function validateEnv(env: Record<string, unknown>): Env {
             .map((f) => f.trim().toLowerCase())
             .filter(Boolean)
         : [],
+      WEBHOOK_TEST_ALLOWED_HOSTS: parsed.WEBHOOK_TEST_ALLOWED_HOSTS
+        ? parsed.WEBHOOK_TEST_ALLOWED_HOSTS.split(",")
+            .map((h) => h.trim().toLowerCase())
+            .filter(Boolean)
+        : ["example.com", "*.example.com", "webhook.site"],
     };
   } catch (error) {
     if (error instanceof z.ZodError) {

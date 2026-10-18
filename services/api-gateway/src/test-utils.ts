@@ -1,6 +1,7 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import fastifyJwt from '@fastify/jwt';
 import { buildApp, AppOptions } from './index.js';
+import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
 import type {
   SettlementClient,
   SettlementClientResult,
@@ -95,7 +96,10 @@ export interface MockData {
 export function createMockPrisma(initialData: MockData = {}) {
   const store = {
     payments: [...(initialData.payments || [])],
-    merchants: [...(initialData.merchants || [])],
+    merchants: (initialData.merchants || []).map((m) => ({
+      ownerId: 'u1',
+      ...m,
+    })),
     settlements: [...(initialData.settlements || [])],
     auditLogs: [...(initialData.auditLogs || [])],
     supportedAssets: [...(initialData.supportedAssets || [])],
@@ -352,9 +356,22 @@ export function createMockPrisma(initialData: MockData = {}) {
 
 export function generateTestJwt(
   app: FastifyInstance,
-  payload: object = { merchantId: 'm1', ownerId: 'u1' }
+  payload?: object,
 ): string {
-  return app.jwt.sign(payload);
+  if (payload) {
+    return app.jwt.sign(payload);
+  }
+  const defaultMerchant = (app as any)._defaultMerchant;
+  if (defaultMerchant) {
+    return app.jwt.sign({
+      merchantId: defaultMerchant.id,
+      ownerId: defaultMerchant.ownerId || 'u1',
+    });
+  }
+  return app.jwt.sign({
+    merchantId: MOCK_MERCHANT_ACTIVE.id,
+    ownerId: MOCK_MERCHANT_ACTIVE.ownerId,
+  });
 }
 
 export async function createTestApp(
@@ -370,6 +387,9 @@ export async function createTestApp(
     logger: false,
     ...overrides,
   });
+  if (mockPrisma.store?.merchants?.length) {
+    (app as any)._defaultMerchant = mockPrisma.store.merchants[0];
+  }
   // Boot the app so decorated helpers (app.jwt) and route schemas are ready
   // before tests call generateTestJwt / inject.
   await app.ready();
