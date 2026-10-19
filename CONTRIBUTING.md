@@ -38,19 +38,24 @@ The repository uses **GitHub Actions** to automatically validate every pull requ
 
 - **Jobs executed**: lint, type‑check, test, migration rollback test, dependency audit, and PR title validation (Conventional Commits).
 - **Caching**: pnpm store is cached to speed up installations.
-- **Node.js version**: 20 (configured in the workflow).
+- **Node.js version**: 22 (pinned in `.node-version`, `package.json#engines`, CI workflows, and `render.yaml`).
 
 ### Running checks locally
 ```bash
 pnpm install
-pnpm lint               # Lint all packages
-pnpm type-check         # Run TypeScript type checking
+pnpm lint               # Run workspace syntax and pattern linter across all packages (node scripts/lint.mjs)
+pnpm type-check         # Run TypeScript type checking across all workspace packages (pnpm -r type-check)
 pnpm build              # Build the workspace packages
 pnpm test               # Execute the test suite
 pnpm test:load          # Run k6 load tests (requires k6 installed)
 pnpm test:mutation      # Run mutation tests (Stryker)
 pnpm audit --audit-level=high   # Security audit (fails on high/critical)
 ```
+
+### Environment Variables & Ports
+- `PORT`: Service application listener port (e.g. 3000 for api-gateway, 3001 for settlement-engine, 3002 for fx-engine, 3003 for indexer).
+- `METRICS_PORT`: Dedicated Prometheus `/metrics` listener port. Optional; defaults to `PORT + 1000` when unset. Validated as an integer in [0, 65535] (port 0 enables ephemeral port assignment for testing).
+
 
 ## Load testing
 

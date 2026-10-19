@@ -13,7 +13,8 @@
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm index.test.ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "lint": "node ../../scripts/lint.mjs"
   },
   "dependencies": {
     "bullmq": "^5.79.1",

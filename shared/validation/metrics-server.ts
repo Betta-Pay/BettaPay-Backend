@@ -6,15 +6,14 @@ interface MinimalLogger {
 }
 
 /**
- * Resolves the port the metrics server binds to. Defaults to `appPort + 1000`
- * (e.g. 4000 for a service running on 3000) so metrics stay separated from
- * the application port without requiring per-service config.
+ * Resolves the port the metrics server binds to (#835).
+ * When a validated metricsPort is provided, that value is used.
+ * Otherwise defaults to `appPort + 1000` (e.g. 4000 for a service running on 3000)
+ * so metrics stay separated from the application port without requiring per-service config.
  */
-export function resolveMetricsPort(appPort: number): number {
-  const raw = process.env.METRICS_PORT;
-  if (raw) {
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+export function resolveMetricsPort(appPort: number, metricsPort?: number): number {
+  if (typeof metricsPort === 'number') {
+    return metricsPort;
   }
   return appPort + 1000;
 }
@@ -22,6 +21,11 @@ export function resolveMetricsPort(appPort: number): number {
 export interface StartMetricsServerOptions {
   /** The service's application port, used to derive the default metrics port. */
   appPort: number;
+  /**
+   * Validated metrics port from environment/config (#835).
+   * If omitted, defaults to `appPort + 1000`.
+   */
+  metricsPort?: number;
   /** Content-Type header for the metrics response (e.g. prom-client's `register.contentType`). */
   contentType: string;
   /** Returns the current metrics payload (e.g. prom-client's `register.metrics()`). */
@@ -50,7 +54,7 @@ export interface StartMetricsServerOptions {
  * to keep scrape overhead minimal.
  */
 export function startMetricsServer(options: StartMetricsServerOptions): Server {
-  const port = resolveMetricsPort(options.appPort);
+  const port = resolveMetricsPort(options.appPort, options.metricsPort);
   const { scrapeToken } = options;
 
   const server = http.createServer((req, res) => {

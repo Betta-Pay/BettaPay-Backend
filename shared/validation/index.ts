@@ -103,6 +103,23 @@ export const EnvSchema = z
       .transform((s) => parseInt(s, 10))
       .default("3000"),
 
+    // Metrics server port (#835) — when set, overrides the default derived port
+    // (appPort + 1000). Validated as an integer in the valid TCP port range [0, 65535].
+    // Port 0 is allowed for ephemeral port assignment in tests and dynamic deployments.
+    METRICS_PORT: z
+      .string()
+      .optional()
+      .transform((s) => {
+        if (!s || s.trim() === "") return undefined;
+        return Number(s);
+      })
+      .refine(
+        (val) => val === undefined || (Number.isInteger(val) && val >= 0 && val <= 65535),
+        {
+          message: "METRICS_PORT must be an integer between 0 and 65535",
+        },
+      ),
+
     // Feature flags — comma-separated list of enabled flag names, e.g.
     // "new_settlement_flow,enhanced_fx_quotes". An absent or empty value means
     // all flags are disabled. Flag names are matched case-insensitively.

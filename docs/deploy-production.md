@@ -103,6 +103,8 @@ Set in the dashboard for every service that declares them:
 - [ ] `GOVERNANCE_CONTRACT_ID`
 - [ ] `ADMIN_ADDRESS` / `ADMIN_SECRET` (gateway + settlement)
 - [ ] `GOOGLE_CLIENT_ID` / `JWT` settings if required by your env schema beyond Blueprint defaults
+- [ ] `METRICS_PORT` (optional): Prometheus scrape listener port (defaults to `PORT + 1000` when unset). Validated as an integer in [0, 65535].
+- [ ] `NODE_VERSION`: pinned to `22` (Active LTS) in `render.yaml` across all services.
 
 ---
 

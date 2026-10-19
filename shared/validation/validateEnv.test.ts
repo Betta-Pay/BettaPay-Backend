@@ -213,5 +213,26 @@ test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
   }
 });
 
+test('validateEnv accepts valid METRICS_PORT integer values including 0', () => {
+  const envDefault = validateEnv(validEnv());
+  assert.equal(envDefault.METRICS_PORT, undefined);
 
+  const envCustom = validateEnv(validEnv({ METRICS_PORT: '9100' }));
+  assert.equal(envCustom.METRICS_PORT, 9100);
 
+  const envZero = validateEnv(validEnv({ METRICS_PORT: '0' }));
+  assert.equal(envZero.METRICS_PORT, 0);
+});
+
+test('validateEnv rejects invalid or out-of-range METRICS_PORT', () => {
+  for (const value of ['-1', '65536', 'not-a-number', '12.34']) {
+    assert.throws(
+      () => validateEnv(validEnv({ METRICS_PORT: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /METRICS_PORT/);
+        return true;
+      },
+    );
+  }
+});
