@@ -55,6 +55,7 @@ import {
 } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from '@bettapay/worker-shutdown';
 import { validateTimeoutConstants } from './timeout-constants.js';
+import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
 /**
  * Mask PII fields before writing to reconcile log lines (#905).
@@ -349,6 +350,7 @@ const metricsServer = startMetricsServer({
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
+  scrapeToken: env.METRICS_SCRAPE_TOKEN,
 });
 
 // ── Database & Redis Setup ───────────────────────────────────────────────────────
@@ -434,7 +436,7 @@ function withJobTimeout<T>(
   });
 }
 
-const baseSettlementProcessor = async (job: Job): Promise<void> => {
+export const baseSettlementProcessor = async (job: Job): Promise<void> => {
   const settlementId = job.data.id;
   const merchantId = job.data.merchantId;
   const traceId = job.data.traceId;
@@ -455,6 +457,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   // ── Per-merchant concurrency semaphore ──────────────────────────────────────
   const maxRetries = 3;
   const requeueDelayMs = 5000;
+  const merchantMaxConcurrency = getMerchantMaxConcurrency(env);
   // The member token this job holds; used to renew and to release exactly its
   // own slot (#487). null until acquired.
   let semaphoreToken: string | null = null;
@@ -468,7 +471,9 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   }, 'Processing settlement job');
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    semaphoreToken = await acquireSemaphore(redis, merchantId);
+    semaphoreToken = await acquireSemaphore(redis, merchantId, {
+      maxConcurrent: merchantMaxConcurrency,
+    });
     if (semaphoreToken) break;
 
     if (attempt < maxRetries) {
@@ -504,6 +509,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   // concurrent job for the merchant slips through (#486).
   const renewal = semaphoreToken
     ? startSemaphoreRenewal(redis, merchantId, semaphoreToken, {
+        maxConcurrent: merchantMaxConcurrency,
         onLost: () =>
           log.warn({ merchantId, settlementId }, 'Settlement semaphore slot lost mid-job'),
         onError: (err) =>

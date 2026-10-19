@@ -138,3 +138,19 @@ export function validateQueryTimeout(): void {
     );
   }
 }
+
+/**
+ * Settlement Engine merchant max concurrency (#839).
+ * Resolves MERCHANT_MAX_CONCURRENCY from validated environment or defaults to 10.
+ */
+export function getMerchantMaxConcurrency(env?: { MERCHANT_MAX_CONCURRENCY?: number | string }): number {
+  const raw = env?.MERCHANT_MAX_CONCURRENCY ?? process.env.MERCHANT_MAX_CONCURRENCY;
+  if (raw !== undefined && raw !== null && raw !== '') {
+    const val = Number(raw);
+    if (Number.isFinite(val) && val > 0) {
+      return Math.floor(val);
+    }
+  }
+  return 10;
+}
+

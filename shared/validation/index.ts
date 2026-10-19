@@ -223,6 +223,13 @@ export const EnvSchema = z
       .string()
       .min(16, "INTER_SERVICE_SECRET must be at least 16 characters"),
 
+    // Prometheus metrics — optional scrape auth Bearer token (#836)
+    // When set, must be at least 16 characters. Scrape auth is optional in development.
+    METRICS_SCRAPE_TOKEN: z
+      .string()
+      .min(16, "METRICS_SCRAPE_TOKEN must be at least 16 characters")
+      .optional(),
+
     // CORS — comma-separated origins (parsed to string[] in validateEnv)
     ALLOWED_ORIGINS: z.string().optional(),
 

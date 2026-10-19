@@ -213,5 +213,24 @@ test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
   }
 });
 
+test('validateEnv accepts valid METRICS_SCRAPE_TOKEN or leaves it optional when unset', () => {
+  const envWithoutToken = validateEnv(validEnv());
+  assert.equal(envWithoutToken.METRICS_SCRAPE_TOKEN, undefined);
+
+  const envWithToken = validateEnv(validEnv({ METRICS_SCRAPE_TOKEN: 'valid-metrics-scrape-token-16chars' }));
+  assert.equal(envWithToken.METRICS_SCRAPE_TOKEN, 'valid-metrics-scrape-token-16chars');
+});
+
+test('validateEnv rejects too-short METRICS_SCRAPE_TOKEN', () => {
+  assert.throws(
+    () => validateEnv(validEnv({ METRICS_SCRAPE_TOKEN: 'short' })),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /METRICS_SCRAPE_TOKEN/);
+      return true;
+    },
+  );
+});
+
 
 

@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  axios: ^1.7.4
-
 importers:
 
   .:
@@ -189,19 +186,19 @@ importers:
         specifier: workspace:^
         version: link:../../shared/types
       '@bettapay/validation':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../../shared/validation
       '@bettapay/webhook-delivery':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../../shared/webhook-delivery
       '@bettapay/worker-shutdown':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../../shared/worker-shutdown
       '@fastify/cors':
-        specifier: '*'
+        specifier: ^11.3.1
         version: 11.3.1
       '@fastify/helmet':
-        specifier: '*'
+        specifier: ^12.0.1
         version: 12.0.1
       '@fastify/rate-limit':
         specifier: ^11.1.0
@@ -210,19 +207,19 @@ importers:
         specifier: ^7.8.0
         version: 7.10.1
       '@prisma/client':
-        specifier: '*'
+        specifier: ^7.10.1
         version: 7.10.1(prisma@7.10.1(@types/node@20.19.43)(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(typescript@5.9.3))(typescript@5.9.3)
       '@stellar/stellar-sdk':
-        specifier: '*'
+        specifier: ^16.3.1
         version: 16.3.1
       bullmq:
-        specifier: '*'
+        specifier: ^5.81.5
         version: 5.81.5
       fastify:
-        specifier: '*'
+        specifier: ^5.12.7
         version: 5.12.7
       ioredis:
-        specifier: '*'
+        specifier: ^5.11.1
         version: 5.11.1
       pg:
         specifier: ^8.22.0
@@ -900,8 +897,11 @@ packages:
     resolution: {integrity: sha512-NZKeq9AfyQvEeNlN0zSYAaWrmBffJh3IELMZfRpJVWgrpEbtEpnjvzqBPf+mxoI287JohRDoa+/nsfqqiZmF6g==}
     engines: {node: '>= 6.0.0'}
 
-  axios@1.20.0:
-    resolution: {integrity: sha512-r8aOh8j9cGKpgQAqpzrUHnSIc6a59Y3Xf/cv8sy1DrHCkZHzQGEuoq1tARk6qSyDdtQGSDgpb9kFlruzPvrgwg==}
+  axios@1.15.0:
+    resolution: {integrity: sha512-wWyJDlAatxk30ZJer+GeCWS209sA42X+N5jU2jy6oHTp7ufw8uzUTVFBX9+wTfAlhiJXGS0Bq7X6efruWjuK9Q==}
+
+  axios@1.18.0:
+    resolution: {integrity: sha512-E32NzpYKp++W7XRe52rHiXV2ehxmh3wbdgO7MHeFM+vqxLBYHzt0ElkiImtOBxtOmyp0yoC8C6uESVV84Y2/hw==}
 
   balanced-match@1.0.2:
     resolution: {integrity: sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==}
@@ -2643,7 +2643,7 @@ snapshots:
   '@stellar/stellar-sdk@15.1.0':
     dependencies:
       '@stellar/stellar-base': 15.0.0
-      axios: 1.20.0
+      axios: 1.15.0
       bignumber.js: 9.3.1
       commander: 14.0.3
       eventsource: 2.0.2
@@ -2653,14 +2653,13 @@ snapshots:
       urijs: 1.19.11
     transitivePeerDependencies:
       - debug
-      - supports-color
 
   '@stellar/stellar-sdk@16.3.1':
     dependencies:
       '@noble/ed25519': 3.2.0
       '@noble/hashes': 2.4.0
       '@stellar/js-xdr': 4.0.0
-      axios: 1.20.0
+      axios: 1.18.0
       base32.js: 0.1.0
       bignumber.js: 11.1.5
       buffer: 6.0.3
@@ -2905,7 +2904,15 @@ snapshots:
 
   aws-ssl-profiles@1.1.2: {}
 
-  axios@1.20.0:
+  axios@1.15.0:
+    dependencies:
+      follow-redirects: 1.16.1
+      form-data: 4.0.6
+      proxy-from-env: 2.1.0
+    transitivePeerDependencies:
+      - debug
+
+  axios@1.18.0:
     dependencies:
       follow-redirects: 1.16.1
       form-data: 4.0.6
