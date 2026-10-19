@@ -270,6 +270,23 @@ function stubRedis(redis: ReturnType<typeof fakeRedis>) {
     ),
     sinon.stub(Redis.prototype, 'getdel').callsFake((key: any) => redis.getdel(key) as any),
     sinon.stub(Redis.prototype, 'del').callsFake((key: any) => redis.del(key) as any),
+    sinon.stub(Redis.prototype, 'get').callsFake((key: any) => {
+      const entry = (redis as any).raw?.get(key);
+      if (!entry) return Promise.resolve(null);
+      if ((redis as any).now && (redis as any).now() >= entry.expiresAt) {
+        (redis as any).raw.delete(key);
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(entry.value);
+    }),
+    sinon.stub(Redis.prototype, 'incr').callsFake((key: any) => {
+      const entry = (redis as any).raw?.get(key);
+      const current = entry ? parseInt(entry.value, 10) : 0;
+      const next = current + 1;
+      (redis as any).raw.set(key, { value: String(next), expiresAt: (redis as any).now() + 900_000 });
+      return Promise.resolve(next);
+    }),
+    sinon.stub(Redis.prototype, 'expire').callsFake(() => Promise.resolve(1)),
   ];
   return () => stubs.forEach((s) => s.restore());
 }
@@ -398,6 +415,7 @@ test('the challenge routes report 503 when Redis is unreachable', async (t) => {
   const stubs = [
     sinon.stub(Redis.prototype, 'set').rejects(new Error('Redis connection failed')),
     sinon.stub(Redis.prototype, 'getdel').rejects(new Error('Redis connection failed')),
+    sinon.stub(Redis.prototype, 'get').rejects(new Error('Redis connection failed')),
   ];
   const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
 
