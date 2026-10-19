@@ -23,6 +23,10 @@ export * from './feature-flags.js';
 export * from './startup-checks.js';
 export * from './encryption.js';
 export * from './route-audit.js';
+// Expose the merchant cache through the package entry point so services can
+// import it via "@bettapay/validation" instead of relative paths that break
+// in the built output.
+export * from './merchant-cache.js';
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -260,6 +264,16 @@ export const EnvSchema = z
       .transform((s) => parseInt(s, 10))
       .default("3"),
 
+    // BullMQ degraded health threshold — waiting jobs strictly above this count
+    // flip service health to degraded (#896).
+    BULLMQ_WAITING_DEGRADED_THRESHOLD: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1000")
+      .refine((val) => Number.isFinite(val) && val > 0, {
+        message: "BULLMQ_WAITING_DEGRADED_THRESHOLD must be a positive integer",
+      }),
+
     // Per-merchant concurrent request limiting
     MERCHANT_MAX_CONCURRENCY: z
       .string()
@@ -449,6 +463,23 @@ export const EnvSchema = z
       .refine((val) => Number.isFinite(val) && val >= 1 && val <= 10000, {
         message: "BATCH_MIN_COUNT must be between 1 and 10000",
       }),
+    // Gross volume that batches an asset even when below BATCH_MIN_COUNT (0 disables).
+    BATCH_VOLUME_THRESHOLD: z
+      .string()
+      .transform((s) => Number(s))
+      .default("0")
+      .refine((val) => Number.isFinite(val) && val >= 0, {
+        message: "BATCH_VOLUME_THRESHOLD must be >= 0",
+      }),
+    // Max settlements processed per batching run (0 = unlimited). Remaining
+    // pending settlements are picked up, oldest first, by the next run.
+    BATCH_MAX_SIZE: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("0")
+      .refine((val) => Number.isFinite(val) && val >= 0, {
+        message: "BATCH_MAX_SIZE must be >= 0",
+      }),
 
     // Settlement Engine — optional daily volume limit for pre-validation.
     // When set, the settlement engine rejects settlement creation requests
@@ -626,6 +657,17 @@ export function validateEnv(env: Record<string, unknown>): Env {
     if (contractIds.length === 0) {
       throw new Error(
         "\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: at least one contract ID must be provided\n",
+      );
+    }
+
+    // Issue #910 — Stellar contract strkeys must start with 'C' and be 56
+    // base32 chars (A-Z, 2-7). A malformed ID at startup indicates a config
+    // error that would silently break all on-chain interactions.
+    const CONTRACT_STRKEY_RE = /^C[A-Z2-7]{55}$/;
+    const invalidContractIds = contractIds.filter((id) => !CONTRACT_STRKEY_RE.test(id));
+    if (invalidContractIds.length > 0) {
+      throw new Error(
+        `\n[BettaPay] Invalid or missing environment variables:\n  CONTRACT_IDS: the following are not valid Stellar contract strkeys: ${invalidContractIds.join(", ")}\n`,
       );
     }
 

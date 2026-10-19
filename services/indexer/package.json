@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/worker-shutdown.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/webhook-cache.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/startup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-limit-backoff.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/dlq-replay-headers.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup-endpoint.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/event-decode.test.ts"
+    "test": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/worker-shutdown.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/webhook-cache.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/startup.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/index.test.ts && cross-env DOTENV_CONFIG_PATH=../../.env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/rate-limit-backoff.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/dlq-replay-headers.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/cleanup-endpoint.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/event-decode.test.ts && TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm src/indexer-dedup-counter.test.ts"
   },
   "dependencies": {
     "@bettapay/webhook-delivery": "workspace:*",
@@ -20,7 +20,7 @@
     "@fastify/rate-limit": "^11.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "*",
-    "@stellar/stellar-sdk": "*",
+    "@stellar/stellar-sdk": "^16.0.1",
     "bullmq": "*",
     "fastify": "*",
     "@fastify/helmet": "*",
@@ -35,7 +35,6 @@
     "@types/tape": "^5.6.4",
     "cross-env": "^7.0.3",
     "tape": "^5.9.0",
-    "typescript": "^5.3.3",
-    "@types/pg": "^8.20.0"
+    "typescript": "^5.3.3"
   }
 }

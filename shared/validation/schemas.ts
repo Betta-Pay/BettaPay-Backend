@@ -309,6 +309,8 @@ export const HealthResponse = z.object({
   lastDependencyCheck: z.string(),
   dependencies: z.array(DependencyHealth),
   upstream: z.array(DependencyHealth).optional(),
+  replica: DependencyHealth.optional().describe("Read-replica database connectivity detail (#895)"),
+  waitingJobs: z.number().int().nonnegative().optional().describe("Observed BullMQ waiting job count (#896)"),
   business: z
     .object({
       abandonedPayments: z.number().int().nonnegative(),

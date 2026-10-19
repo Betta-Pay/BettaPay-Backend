@@ -7,11 +7,13 @@ import {
   buildSettlementEngineHealthResponse,
   checkBullMQ,
   checkPostgresql,
+  checkPostgresqlReplica,
   checkRedisPing,
   computeOverallStatus,
+  getBullmqWaitingThreshold,
 } from './health.js';
 
-import type { DependencyHealth, HealthResponse } from './schemas.js';
+import { HealthResponse as HealthResponseSchema, type DependencyHealth, type HealthResponse } from './schemas.js';
 
 function dep(name: string, status: 'connected' | 'disconnected'): DependencyHealth {
   return { name, status, latencyMs: 1 };
@@ -242,7 +244,7 @@ test('checkPostgresql returns healthy with latency and optional serverVersion', 
   assert.equal(dependency.status, 'connected');
   assert.equal(dependency.healthy, true);
   assert.equal(typeof dependency.latencyMs, 'number');
-  assert.ok(dependency.latencyMs! < 1000);
+  assert.ok((dependency.latencyMs ?? 0) < 1000);
   assert.equal(typeof dependency.serverVersion, 'string');
 });
 
@@ -273,7 +275,7 @@ test('checkPostgresql measures slow latency as degraded in buildHealthResponse',
 
   assert.equal(dependency.status, 'connected');
   assert.equal(dependency.healthy, true);
-  assert.ok(dependency.latencyMs! > 1000);
+  assert.ok((dependency.latencyMs ?? 0) > 1000);
 
   const response = buildHealthResponse({
     service: 'db-service',
@@ -332,4 +334,140 @@ test('checkRedisPing omits details when healthState is not provided (backward co
 
   assert.equal(dep.status, 'connected');
   assert.equal(dep.details, undefined);
+});
+
+// ── Issue #895: Read-replica health detail ─────────────────────────────────────
+
+test('checkPostgresqlReplica probes read-replica independently and reports status and serverVersion', async () => {
+  const connectedReplica = await checkPostgresqlReplica(async () => [
+    { serverVersion: '15.4' },
+  ]);
+  assert.equal(connectedReplica.name, 'postgresql-replica');
+  assert.equal(connectedReplica.status, 'connected');
+  assert.equal(connectedReplica.healthy, true);
+  assert.equal(connectedReplica.serverVersion, '15.4');
+
+  const disconnectedReplica = await checkPostgresqlReplica(async () => {
+    throw new Error('connection to replica failed: timeout');
+  });
+  assert.equal(disconnectedReplica.name, 'postgresql-replica');
+  assert.equal(disconnectedReplica.status, 'disconnected');
+  assert.equal(disconnectedReplica.healthy, false);
+  assert.match(String(disconnectedReplica.details?.error), /connection to replica failed/);
+});
+
+test('buildHealthResponse: with primary healthy and replica down, overall status is degraded, not down (#895)', () => {
+  const primaryDep = dep('postgresql', 'connected');
+  const replicaDep: DependencyHealth = {
+    name: 'postgresql-replica',
+    status: 'disconnected',
+    latencyMs: 12,
+    details: { error: 'replica unreachable' },
+  };
+
+  const response = buildHealthResponse({
+    service: 'api-gateway',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [primaryDep],
+    replica: replicaDep,
+  });
+
+  assert.equal(response.status, 'degraded', 'degraded when replica is down and primary is healthy');
+  assert.deepEqual(response.replica, replicaDep, 'replica detail is exposed in payload');
+
+  // Verify existing schema parses payload cleanly
+  const parsed = HealthResponseSchema.parse(response);
+  assert.equal(parsed.status, 'degraded');
+  assert.equal(parsed.replica?.status, 'disconnected');
+});
+
+test('buildHealthResponse: with primary down, overall status is unhealthy (down) regardless of replica (#895)', () => {
+  const primaryDown = dep('postgresql', 'disconnected');
+  const replicaUp: DependencyHealth = {
+    name: 'postgresql-replica',
+    status: 'connected',
+    latencyMs: 5,
+  };
+
+  const response = buildHealthResponse({
+    service: 'api-gateway',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [primaryDown],
+    criticalDependencyNames: ['postgresql'],
+    replica: replicaUp,
+  });
+
+  assert.equal(response.status, 'unhealthy', 'overall status must be down (unhealthy) when primary is down');
+  assert.equal(response.replica?.status, 'connected');
+});
+
+// ── Issue #896: BullMQ waiting jobs degradation threshold ──────────────────────
+
+test('buildHealthResponse: boundary test just below, at, and above BULLMQ_WAITING_DEGRADED_THRESHOLD (#896)', () => {
+  const threshold = 1000;
+  const primaryDep = dep('postgresql', 'connected');
+  const redisDep = dep('redis', 'connected');
+
+  // 1. Just below threshold (999) -> healthy
+  const belowResp = buildHealthResponse({
+    service: 'settlement-engine',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [primaryDep, redisDep],
+    waitingJobs: 999,
+    waitingThreshold: threshold,
+  });
+  assert.equal(belowResp.status, 'healthy');
+  assert.equal(belowResp.waitingJobs, 999);
+
+  // 2. Exactly at threshold (1000) -> healthy
+  const atResp = buildHealthResponse({
+    service: 'settlement-engine',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [primaryDep, redisDep],
+    waitingJobs: 1000,
+    waitingThreshold: threshold,
+  });
+  assert.equal(atResp.status, 'healthy');
+  assert.equal(atResp.waitingJobs, 1000);
+
+  // 3. Just above threshold (1001) -> degraded
+  const aboveResp = buildHealthResponse({
+    service: 'settlement-engine',
+    version: '0.1.0',
+    startTime: Date.now() - 5000,
+    dependencies: [primaryDep, redisDep],
+    waitingJobs: 1001,
+    waitingThreshold: threshold,
+  });
+  assert.equal(aboveResp.status, 'degraded');
+  assert.equal(aboveResp.waitingJobs, 1001);
+
+  // Assert consumers parse payload with waitingJobs
+  const parsed = HealthResponseSchema.parse(aboveResp);
+  assert.equal(parsed.status, 'degraded');
+  assert.equal(parsed.waitingJobs, 1001);
+});
+
+test('getBullmqWaitingThreshold: reads env variable or defaults to 1000 (#896)', () => {
+  const originalEnv = process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD;
+  try {
+    delete process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD;
+    assert.equal(getBullmqWaitingThreshold(), 1000);
+
+    process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD = '2500';
+    assert.equal(getBullmqWaitingThreshold(), 2500);
+
+    process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD = 'invalid';
+    assert.equal(getBullmqWaitingThreshold(), 1000);
+  } finally {
+    if (originalEnv !== undefined) {
+      process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD = originalEnv;
+    } else {
+      delete process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD;
+    }
+  }
 });

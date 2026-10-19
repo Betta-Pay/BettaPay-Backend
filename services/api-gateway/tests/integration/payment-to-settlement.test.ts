@@ -202,6 +202,16 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
   });
   await app.ready();
 
+  // Mutating requests are rejected by the gateway's CSRF/origin hook unless
+  // they carry an Origin or `x-csrf-check` header (see src/index.ts). Fastify's
+  // inject() sends no Origin header, so every request acknowledges the check.
+  const originalInject = app.inject.bind(app);
+  const appInject = (opts: any) =>
+    originalInject({
+      ...opts,
+      headers: { 'x-csrf-check': '1', ...(opts.headers ?? {}) },
+    });
+
   const merchantStellarId = 'GC66IZZ6AKNEVGJDBSGCX7RO6FUKUB3HEAR65NHMWAYYPDDHUIGTTUHA';
   const ownerId = 'GCFDDJLNBB7YVSMGAMPV5W7NQCWB6BF6EBA7GHVXMAGYGRZ6VH7R5YRQ';
   const authToken = generateTestJwt(app, { merchantId: merchantStellarId, ownerId });
@@ -211,7 +221,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
 
   // ── Step 1: Create merchant ──────────────────────────────────────────────────
   await t.test('1. Create merchant via API Gateway', async () => {
-    const res = await app.inject({
+    const res = await appInject({
       method: 'POST',
       url: '/api/merchants',
       headers: { authorization: `Bearer ${authToken}` },
@@ -238,7 +248,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
   // ── Step 2: Verify merchant persistence ─────────────────────────────────────
   await t.test('2. Verify merchant persistence in PostgreSQL database', async () => {
     // API verification
-    const apiRes = await app.inject({
+    const apiRes = await appInject({
       method: 'GET',
       url: `/api/merchants/${merchantStellarId}`,
       headers: { authorization: `Bearer ${authToken}` },
@@ -258,7 +268,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
   await t.test('3. Initiate payment session via API Gateway', async () => {
     const idempotencyKey = `idem-e2e-${crypto.randomUUID()}`;
 
-    const res = await app.inject({
+    const res = await appInject({
       method: 'POST',
       url: '/api/payments',
       headers: {
@@ -297,7 +307,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
 
   // ── Step 5: Complete payment ─────────────────────────────────────────────────
   await t.test('5. Complete payment session via API Gateway', async () => {
-    const res = await app.inject({
+    const res = await appInject({
       method: 'PATCH',
       url: `/api/payments/${createdPaymentId}/status`,
       headers: { authorization: `Bearer ${authToken}` },
@@ -317,7 +327,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
     assert.equal(paymentDb.status, 'completed', 'Payment status in DB must be updated to completed');
 
     // Error handling test: invalid state transition from completed -> failed
-    const invalidRes = await app.inject({
+    const invalidRes = await appInject({
       method: 'PATCH',
       url: `/api/payments/${createdPaymentId}/status`,
       headers: { authorization: `Bearer ${authToken}` },
@@ -332,7 +342,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
 
   // ── Step 7: Trigger settlement process ─────────────────────────────────────
   await t.test('7. Trigger settlement process via API Gateway', async () => {
-    const res = await app.inject({
+    const res = await appInject({
       method: 'POST',
       url: '/api/settlements',
       headers: { authorization: `Bearer ${authToken}` },
@@ -432,7 +442,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
 
   // ── Error Handling Tests ──────────────────────────────────────────────────────
   await t.test('Error Handling: Settlement below minimum amount returns 422', async () => {
-    const res = await app.inject({
+    const res = await appInject({
       method: 'POST',
       url: '/api/settlements',
       headers: { authorization: `Bearer ${authToken}` },
@@ -449,7 +459,7 @@ test('End-to-End Integration: Payment-to-Settlement Lifecycle', async (t) => {
   });
 
   await t.test('Error Handling: Unsupported asset returns 422', async () => {
-    const res = await app.inject({
+    const res = await appInject({
       method: 'POST',
       url: '/api/settlements',
       headers: { authorization: `Bearer ${authToken}` },

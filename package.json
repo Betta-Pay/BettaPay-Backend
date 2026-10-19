@@ -22,7 +22,7 @@
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts",
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/migration-timestamps.test.ts",
     "test:load": "k6 run test/load/gateway-scenarios.js",
     "test:mutation": "pnpm -w dlx stryker run"
   },
@@ -43,7 +43,7 @@
     "@fastify/jwt": "^10.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
-    "@stellar/stellar-sdk": "^15.1.0",
+    "@stellar/stellar-sdk": "^16.0.1",
     "bullmq": "^5.78.0",
     "fastify": "^5.8.5",
     "ioredis": "^5.11.1",

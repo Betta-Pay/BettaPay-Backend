@@ -35,17 +35,17 @@ enum MerchantStatus {
 }
 
 model Merchant {
-  id          String          @id
+  id          String         @id
   name        String
   ownerId     String
-  createdAt   DateTime        @default(now())
+  createdAt   DateTime       @default(now())
   deletedAt   DateTime?
   // #317 — Merchant suspension status. Existing rows are backfilled to
   // 'active' by the add_merchant_status migration.
-  status      MerchantStatus  @default(active)
+  status      MerchantStatus @default(active)
   settings    Json?
   secretHash  String?
-  kycStatus   KycStatus    @default(unverified)
+  kycStatus   KycStatus      @default(unverified)
   payments    Payment[]
   settlements Settlement[]
 
@@ -69,12 +69,13 @@ model Payment {
   idempotencyKey          String?       @unique
   idempotencyKeyExpiresAt DateTime?
   // FX conversion metadata (populated when convertTo is supplied at creation)
-  convertTo              String?
+  convertTo               String?
   convertedAmount         String?
   fxRate                  String?
   fxQuoteId               String?
   fxQuoteExpiresAt        DateTime?
 
+  @@index([merchantId, createdAt(sort: Desc)])
   @@index([merchantId, status, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
   // #622 — supports the idempotency-key cleanup job's scan for expired keys.
@@ -106,7 +107,11 @@ model Settlement {
   // Fee audit snapshot — records the exact fee parameters used at settlement
   // time for forensic analysis of historical fees (#330).
   feeSnapshot             Json?
-  // Retry mechanism (#322) — links to the new settlement that supersedes this one
+  // Retry mechanism (#322) — links to the new settlement that supersedes this one.
+  // Cascade policy (#852): onDelete: SetNull — deleting a settlement that superseded
+  // others clears their `supersededById` link instead of deleting the retries or
+  // leaving them pointing at a missing row; retries stay as standalone settlements.
+  // Pinned by test/settlement-superseded-cascade.test.ts.
   supersededById          String?
   supersededBy            Settlement?      @relation("SettlementRetry", fields: [supersededById], references: [id], onDelete: SetNull)
   supersedes              Settlement[]     @relation("SettlementRetry")
@@ -124,17 +129,17 @@ model Settlement {
 }
 
 model IndexedEvent {
-  id               String   @id
-  stellarId        String?
-  contractId       String
-  contractName     String?
-  topics           String[]
-  type             String
-  rawValue         String
-  decodedPayload   Json?
-  validationError  String?
-  ledger           Int
-  indexedAt        DateTime @default(now())
+  id              String   @id
+  stellarId       String?
+  contractId      String
+  contractName    String?
+  topics          String[]
+  type            String
+  rawValue        String
+  decodedPayload  Json?
+  validationError String?
+  ledger          Int
+  indexedAt       DateTime @default(now())
 
   // The Prisma schema DSL cannot express NULLS NOT DISTINCT, but the actual
   // Postgres index (see migration 20260901000000_dedupe_null_stellarid_indexed_events,
@@ -156,7 +161,7 @@ enum WebhookDeliveryStatus {
 }
 
 model IndexedEventWebhookDelivery {
-  id             String   @id
+  id             String                @id
   indexedEventId String
   subscriptionId String
   url            String
@@ -164,11 +169,11 @@ model IndexedEventWebhookDelivery {
   signingSecret  String?
   headers        Json?
   status         WebhookDeliveryStatus @default(pending)
-  retryCount     Int      @default(0)
+  retryCount     Int                   @default(0)
   lastAttemptAt  DateTime?
   lastError      String?
   processedAt    DateTime?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime              @default(now())
 
   @@unique([indexedEventId, subscriptionId])
   @@index([status, createdAt])
@@ -208,22 +213,22 @@ model AuditLog {
 }
 
 model SupportedAsset {
-  code       String  @id
+  code       String   @id
   contractId String
   decimals   Int
   name       String
-  isActive   Boolean @default(true)
+  isActive   Boolean  @default(true)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 }
 
 model SettlementBatch {
-  id         String   @id @default(cuid())
-  asset      String
-  totalCount Int
-  totalGross String
-  totalFees  String
-  totalNet   String
-  createdAt  DateTime @default(now())
+  id          String    @id @default(cuid())
+  asset       String
+  totalCount  Int
+  totalGross  String
+  totalFees   String
+  totalNet    String
+  createdAt   DateTime  @default(now())
   processedAt DateTime?
 }

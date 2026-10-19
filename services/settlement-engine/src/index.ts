@@ -53,7 +53,7 @@ import {
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from '@bettapay/worker-shutdown';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 
 /**
@@ -79,9 +79,7 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
   return out as T;
 }
 import { startSettlementReaper } from './settlement-reaper.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
-
-upstream/main
+import { MerchantCache, getCachedMerchant } from '../../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -112,7 +110,8 @@ import {
   isValidTransition,
   propagateTracingHeaders,
   auditRouteAuthPolicy,
-  installCrashHandlers,
+  MerchantCache,
+  getCachedMerchant,
 } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
@@ -323,6 +322,21 @@ const reconciliationAmountDiffGauge = new promClient.Gauge({
   name: 'settlement_reconciliation_amount_diff',
   help: 'Absolute difference in amounts between local and gateway',
   labelNames: ['merchant_id', 'amount_type'],
+});
+
+// Issue #890 — settlement queue depth gauge.
+// Uses prom-client's async collect callback so the gauge always reflects the
+// live BullMQ waiting+active count at the moment Prometheus scrapes the metric.
+const settlementQueueDepthGauge = new promClient.Gauge({
+  name: 'settlement_queue_depth',
+  help: 'Current number of jobs in the settlement queue (waiting + active)',
+  collect() {
+    settlementQueue.getJobCounts('waiting', 'active').then((counts) => {
+      this.set((counts.waiting ?? 0) + (counts.active ?? 0));
+    }).catch(() => {
+      // Queue unreachable — leave the gauge at its last value.
+    });
+  },
 });
 
 // Served on its own port (see startMetricsServer below), not on the
@@ -1870,100 +1884,31 @@ const batchWorker = new Worker(
     const batchStartTime = Date.now();
     fastify.log.info({ traceId }, 'Starting settlement batching job');
 
-    // Detect late batch (missed interval)
-    const elapsedMs = batchStartTime - lastBatchCompletedAt;
-    const expectedIntervalMs = env.BATCH_INTERVAL_SECONDS * 1000;
-    if (elapsedMs > expectedIntervalMs * 1.5) {
-      const missedIntervals = Math.floor(elapsedMs / expectedIntervalMs) - 1;
-      fastify.log.warn(
-        { traceId, elapsedMs, missedIntervals },
-        'Batching job running late — catching up missed windows',
-      );
-    }
-
     try {
-      // Fetch all pending settlements (catch-up: these may span missed windows)
-      const pendingSettlements = await prisma.settlement.findMany({
-        where: { status: 'pending' },
-      });
-
-      if (pendingSettlements.length === 0) {
-        fastify.log.info({ traceId }, 'No pending settlements to batch');
-        lastBatchCompletedAt = batchStartTime;
-        return { batched: 0 };
-      }
-
-      // Group by asset
-      const grouped = pendingSettlements.reduce((acc, s) => {
-        if (!acc[s.asset]) acc[s.asset] = [];
-        acc[s.asset].push(s);
-        return acc;
-      }, {} as Record<string, typeof pendingSettlements>);
-
-      let batchedCount = 0;
-
-      // Create batches for assets meeting count or volume threshold
-      for (const [asset, settlements] of Object.entries(grouped)) {
-        const totalCount = settlements.length;
-        const totalGrossBN = settlements.reduce(
-          (sum, s) => sum.plus(s.grossAmount),
-          new BigNumber(0),
-        );
-        const meetsCount = totalCount >= env.BATCH_MIN_COUNT;
-        const meetsVolume = env.BATCH_VOLUME_THRESHOLD > 0 &&
-          totalGrossBN.isGreaterThanOrEqualTo(env.BATCH_VOLUME_THRESHOLD);
-
-        if (meetsCount || meetsVolume) {
-          const totalGross = totalGrossBN.toString();
-          const totalFees = settlements.reduce(
-            (sum, s) => sum.plus(s.feeAmount),
-            new BigNumber(0),
-          ).toString();
-          const totalNet = settlements.reduce(
-            (sum, s) => sum.plus(s.netAmount),
-            new BigNumber(0),
-          ).toString();
-
-          const batch = await prisma.settlementBatch.create({
-            data: {
-              asset,
-              totalCount: settlements.length,
-              totalGross,
-              totalFees,
-              totalNet,
-            },
-          });
-
-          // Update settlements to processing first
-          await prisma.settlement.updateMany({
-            where: { id: { in: settlements.map((s) => s.id) } },
-            data: { status: 'processing' },
-          });
-
-          fastify.log.info(
-            { traceId, batchId: batch.id, asset, count: totalCount, trigger: meetsCount ? 'count' : 'volume' },
-            'Created settlement batch',
-          );
-
-          batchedCount += totalCount;
-        } else {
-          fastify.log.info(
-            { traceId, asset, count: totalCount, grossTotal: totalGrossBN.toString() },
-            'Skipping batch (below min count and volume threshold)',
-          );
-        }
-      }
+      const result = await runSettlementBatching(
+        prisma,
+        {
+          intervalMs: env.BATCH_INTERVAL_SECONDS * 1000,
+          minCount: env.BATCH_MIN_COUNT,
+          volumeThreshold: env.BATCH_VOLUME_THRESHOLD,
+          maxBatchSize: env.BATCH_MAX_SIZE,
+        },
+        lastBatchCompletedAt,
+        fastify.log,
+        batchStartTime,
+        traceId,
+      );
 
       // Emit late-batch metric if we missed the interval
-      if (elapsedMs > expectedIntervalMs * 1.5) {
-        for (const asset of Object.keys(grouped)) {
+      if (result.late) {
+        for (const asset of result.assets) {
           lateBatchCounter.inc({ asset });
         }
       }
 
       lastBatchCompletedAt = batchStartTime;
-      fastify.log.info({ traceId, batchedCount }, 'Settlement batching job completed');
-      return { batched: batchedCount };
+      fastify.log.info({ traceId, batchedCount: result.batched }, 'Settlement batching job completed');
+      return { batched: result.batched };
     } catch (error) {
       fastify.log.error({ traceId, error }, 'Settlement batching job failed');
       throw error;

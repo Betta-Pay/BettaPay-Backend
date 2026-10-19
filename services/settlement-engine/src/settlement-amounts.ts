@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * settlement-amounts.ts
  *
@@ -8,15 +7,15 @@
  * Precision strategy
  * ──────────────────
  * BigNumber.js is used for all arithmetic with ROUND_DOWN to ensure
- * fees are never over-charged due to rounding.  All amounts are
+ * fees are never over-charged due to rounding. All amounts are
  * returned as full-precision decimal strings, preserving the number
  * of decimal places present in the original input.
  *
  * Volume-based fee discounts (#323)
  * ──────────────────────────────────
  * Callers may supply a `monthlyVolume` (USD gross settled in the current
- * calendar month) and a list of discount tiers.  The highest-matching
- * tier's `discountBps` is subtracted from the base `feeBps`.  The
+ * calendar month) and a list of discount tiers. The highest-matching
+ * tier's `discountBps` is subtracted from the base `feeBps`. The
  * effective fee is clamped to [0, feeBps] so it can never go negative.
  */
 
@@ -24,7 +23,10 @@ import BigNumber from "bignumber.js";
 import type { Amount } from "@bettapay/shared-types";
 import { feeSnapshotSchema } from "@bettapay/validation";
 import type { FeeScheduleItem } from "@bettapay/validation";
-import { ASSET_PRECISION_MAPPINGS } from "./settlement-properties.js";
+import {
+  ASSET_PRECISION_MAPPINGS,
+  assertSettlementInvariants,
+} from "./settlement-properties.js";
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({
@@ -38,6 +40,7 @@ BigNumber.config({
  * distinguish pre/post-change snapshots.
  */
 export const FEE_VERSION = '1.0' as const;
+export type FeeVersion = typeof FEE_VERSION;
 
 /**
  * Maximum allowed settlement amount in whole currency units (#481).
@@ -107,18 +110,20 @@ export function getMaxSettlementAmountForAsset(asset?: string): string {
   // must never silently lower (or raise) the limit.
   if (!config) return MAX_SETTLEMENT_AMOUNT;
   const decimals = config.decimals;
-  return new BigNumber(MAX_SETTLEMENT_BASE_UNITS).multipliedBy(new BigNumber(10).pow(decimals)).toFixed(0);
+  return new BigNumber(MAX_SETTLEMENT_BASE_UNITS)
+    .multipliedBy(new BigNumber(10).pow(decimals))
+    .toFixed(0);
 }
 
 /**
  * Resolve the discount (in bps) for a given monthly volume.
  *
  * Tiers are evaluated in descending `volumeUsd` order; the first tier
- * whose threshold is ≤ `monthlyVolume` wins.  Returns 0 when no tier
+ * whose threshold is ≤ `monthlyVolume` wins. Returns 0 when no tier
  * matches.
  *
- * @param monthlyVolume  Merchant's gross volume for the current month (USD).
- * @param tiers          Discount tier list from `FEE_DISCOUNT_TIERS` env var.
+ * @param monthlyVolume Merchant's gross volume for the current month (USD).
+ * @param tiers Discount tier list from `FEE_DISCOUNT_TIERS` env var.
  */
 export function resolveVolumeDiscount(
   monthlyVolume: number,
@@ -149,23 +154,14 @@ export function resolveVolumeDiscount(
  * - ROUND_DOWN: `feeAmount <= grossAmount * feeBps / 10000` (never overcharge)
  * - Effective fee is clamped to [0, feeBps] (discount never produces negative fee)
  *
- * @param grossAmountStr  Validated numeric string from the request body.
- * @param feeBps          Base fee in basis points (e.g. 100 = 1%).
- * @param monthlyVolume   Merchant's gross volume for the current calendar month (USD).
- *                        Defaults to 0 (no discount applied).
- * @param discountTiers   Volume-discount tier list from `FEE_DISCOUNT_TIERS`.
- *                        Defaults to [] (no tiers, no discount).
- * @param asset           Optional asset code for per-asset max validation (#481).
- * @returns               { grossAmount, feeAmount, netAmount, feeSnapshot }
- *
- * @example
- *   computeSettlementAmounts('100.123456', { feeBps: 100 })
- *   // → { grossAmount: '100.123456', feeAmount: '1.001234', netAmount: '99.122222' }
- *
- * @example  Volume discount: $15 000 volume, tier at $10 000 / 10 bps, base 100 bps
- *   computeSettlementAmounts('500.00', 100, 15_000, [{ volumeUsd: 10_000, discountBps: 10 }])
- *   // effective feeBps = 100 − 10 = 90
- *   // → { feeAmount: '4.50', netAmount: '495.50', feeSnapshot.discountApplied: 10 }
+ * @param grossAmountStr Validated numeric string from the request body.
+ * @param feeBps Base fee in basis points (e.g. 100 = 1%).
+ * @param monthlyVolume Merchant's gross volume for the current calendar month (USD).
+ * Defaults to 0 (no discount applied).
+ * @param discountTiers Volume-discount tier list from `FEE_DISCOUNT_TIERS`.
+ * Defaults to [] (no tiers, no discount).
+ * @param asset Optional asset code for per-asset max validation (#481).
+ * @returns { grossAmount, feeAmount, netAmount, feeSnapshot }
  */
 export function computeSettlementAmounts(
   grossAmountStr: Amount,
@@ -192,7 +188,7 @@ export function computeSettlementAmounts(
   );
   const effectiveFeeBps = Math.max(0, feeBps - discountBps);
 
-  // fee = gross × effectiveFeeBps / 10 000   (rounded DOWN to preserve net accuracy)
+  // fee = gross × effectiveFeeBps / 10 000 (rounded DOWN to preserve net accuracy)
   const fee = gross.multipliedBy(effectiveFeeBps).dividedBy(10_000);
 
   // Preserve the same decimal places as the original input string.
@@ -205,7 +201,7 @@ export function computeSettlementAmounts(
     maxFeeBpsApplied: feeBps,
     discountApplied: discountBps,
     monthlyVolumeAtTime: monthlyVolume,
-    feeVersion: "1.0",
+    feeVersion: FEE_VERSION,
   };
 
   // Validate fee snapshot against schema (#625)
@@ -216,7 +212,7 @@ export function computeSettlementAmounts(
     );
   }
 
-  return {
+  const result: SettlementAmounts = {
     grossAmount: grossAmountStr, // exact original — zero rounding
     feeAmount: feeStr,
     netAmount: netStr,
@@ -237,10 +233,10 @@ export function computeSettlementAmounts(
  * Computes the applicable fee BPS for a given asset based on fee schedules.
  * Falls back to defaultBps if no matching schedule is found.
  *
- * @param asset       The asset code (e.g., 'USDC', 'EURT')
- * @param feeSchedules  Array of fee schedule items [{ asset, bps }]
- * @param defaultBps    Default fee BPS to use if no schedule matches
- * @returns           The applicable fee BPS for the asset
+ * @param asset The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps Default fee BPS to use if no schedule matches
+ * @returns The applicable fee BPS for the asset
  */
 export function resolveFeeBpsForAsset(
   asset: string,
@@ -258,11 +254,11 @@ export function resolveFeeBpsForAsset(
  * Computes fee and net amounts with full decimal precision using BigNumber,
  * resolving the fee BPS from fee schedules based on the asset.
  *
- * @param grossAmountStr  Validated numeric string from the request body.
- * @param asset           The asset code (e.g., 'USDC', 'EURT')
- * @param feeSchedules    Array of fee schedule items [{ asset, bps }]
- * @param defaultBps      Default fee BPS to use if no schedule matches
- * @returns               { grossAmount, feeAmount, netAmount } as full-precision strings.
+ * @param grossAmountStr Validated numeric string from the request body.
+ * @param asset The asset code (e.g., 'USDC', 'EURT')
+ * @param feeSchedules Array of fee schedule items [{ asset, bps }]
+ * @param defaultBps Default fee BPS to use if no schedule matches
+ * @returns { grossAmount, feeAmount, netAmount } as full-precision strings.
  */
 export function computeSettlementAmountsWithSchedule(
   grossAmountStr: Amount,

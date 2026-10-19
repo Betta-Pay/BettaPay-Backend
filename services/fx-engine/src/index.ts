@@ -57,6 +57,10 @@ import {
   createVerifyQuoteBodySchema,
   resolveFxQuoteBodyLimit,
 } from "./validation.js";
+import {
+  createCircuitBreakerRegistry,
+  type CircuitBreakerState,
+} from "./circuit-breaker.js";
 
 const env = validateEnvOrExit(process.env);
 const PORT = Number(process.env.PORT ?? "3002");
@@ -333,98 +337,31 @@ const fallbackTracker = createFallbackTracker({
 
 // ── Circuit breaker for CoinGecko API calls ────────────────────────────────
 //
-// States:
-//   CLOSED   — normal operation; failures are counted.
-//   OPEN     — tripped after CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive
-//              failures; fetches are skipped until the cooldown expires.
-//   HALF_OPEN — after the cooldown a single probe fetch is allowed.
-//              Success → CLOSED, failure → OPEN (resets cooldown).
-//
-// The threshold is hardcoded to 5 (spec requirement). The cooldown window is
-// driven by CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
+// Breakers are keyed per upstream route (see circuit-breaker.ts) so a failing
+// route cannot open the breaker for the others. The threshold is hardcoded to
+// 5 (spec requirement). The cooldown window is driven by
+// CIRCUIT_BREAKER_COOLDOWN_MS (env, default 5 min).
 
-export type CircuitBreakerState = "CLOSED" | "OPEN" | "HALF_OPEN";
+export type { CircuitBreakerState };
 
-const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
-
-interface CircuitBreaker {
-  state: CircuitBreakerState;
-  consecutiveFailures: number;
-  openedAt: number | null; // Unix ms when state became OPEN
-  lastTransitionAt: number; // Unix ms of last state change (for observability)
-}
-
-const circuitBreaker: CircuitBreaker = {
-  state: "CLOSED",
-  consecutiveFailures: 0,
-  openedAt: null,
-  lastTransitionAt: Date.now(),
-};
-
-function transitionCircuitBreaker(
-  newState: CircuitBreakerState,
-  log: { info: (obj: object, msg: string) => void },
-): void {
-  const prev = circuitBreaker.state;
-  if (prev === newState) return;
-
-  circuitBreaker.state = newState;
-  circuitBreaker.lastTransitionAt = Date.now();
-
-  if (newState === "OPEN") {
-    circuitBreaker.openedAt = Date.now();
-  } else if (newState === "CLOSED") {
-    circuitBreaker.consecutiveFailures = 0;
-    circuitBreaker.openedAt = null;
-  }
-
-  log.info(
-    {
-      from: prev,
-      to: newState,
-      consecutiveFailures: circuitBreaker.consecutiveFailures,
-    },
-    `Circuit breaker transition: ${prev} → ${newState}`,
-  );
-}
+const RATES_ROUTE = "coingecko";
+const circuitBreakers = createCircuitBreakerRegistry();
 
 function recordCircuitBreakerSuccess(log: {
   info: (obj: object, msg: string) => void;
 }): void {
-  circuitBreaker.consecutiveFailures = 0;
-  if (circuitBreaker.state !== "CLOSED") {
-    transitionCircuitBreaker("CLOSED", log);
-  }
+  circuitBreakers.recordSuccess(RATES_ROUTE, log);
 }
 
 function recordCircuitBreakerFailure(
   log: { info: (obj: object, msg: string) => void },
-  cooldownMs: number,
+  _cooldownMs: number,
 ): void {
-  circuitBreaker.consecutiveFailures += 1;
-
-  if (
-    circuitBreaker.state === "HALF_OPEN" ||
-    (circuitBreaker.state === "CLOSED" &&
-      circuitBreaker.consecutiveFailures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD)
-  ) {
-    transitionCircuitBreaker("OPEN", log);
-  }
+  circuitBreakers.recordFailure(RATES_ROUTE, log);
 }
 
 function getCircuitBreakerState(cooldownMs: number): CircuitBreakerState {
-  if (
-    circuitBreaker.state === "OPEN" &&
-    circuitBreaker.openedAt !== null &&
-    Date.now() - circuitBreaker.openedAt >= cooldownMs
-  ) {
-    // Cooldown elapsed — advance to HALF_OPEN for the next probe.
-    // We do not call transitionCircuitBreaker here to avoid needing a logger
-    // reference; the probe in refreshTick will perform the actual transition.
-    circuitBreaker.state = "HALF_OPEN";
-    circuitBreaker.lastTransitionAt = Date.now();
-  }
-  return circuitBreaker.state;
+  return circuitBreakers.getState(RATES_ROUTE, cooldownMs);
 }
 
 async function fetchBaseRates(): Promise<Record<string, number> | null> {
@@ -535,7 +472,7 @@ async function refreshTick(): Promise<void> {
     if (cbState === "HALF_OPEN") {
       // Log the probe intent for auditing purposes
       fastify.log.info(
-        { consecutiveFailures: circuitBreaker.consecutiveFailures },
+        { consecutiveFailures: circuitBreakers.snapshot(RATES_ROUTE).consecutiveFailures },
         "Circuit breaker HALF_OPEN: probing CoinGecko",
       );
     }
@@ -1136,7 +1073,7 @@ fastify.get("/api/health", { config: { rateLimit: false } }, async (_request, re
     ratesApi.details = {
       ...(ratesApi.details ?? {}),
       latencyMs: lastRefresh?.durationMs ?? null,
-      circuitBreakerState: circuitBreaker.state,
+      circuitBreakerState: circuitBreakers.snapshot(RATES_ROUTE).state,
     };
     if (fallbackExceeded) {
       ratesApi.details.fallbackModeDuration = "exceeded 1 hour";
@@ -1183,6 +1120,7 @@ fastify.get(
     const fallbackDurationMin = Math.round(fallbackDurationMs / 60000);
 
     // Evaluate cooldown expiry without side-effects (read-only snapshot)
+    const circuitBreaker = circuitBreakers.snapshot(RATES_ROUTE);
     const cbSnapshot = {
       state: circuitBreaker.state,
       consecutiveFailures: circuitBreaker.consecutiveFailures,
@@ -1387,6 +1325,11 @@ fastify.get(
     const resolvedAt = Date.now();
     const resolved = resolvePairRate(from, to, resolvedAt);
     cacheHit = resolved.source === "cache";
+    if (cacheHit) {
+      fxQuoteCacheHitsTotal.inc();
+    } else {
+      fxQuoteCacheMissesTotal.inc();
+    }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
     const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
@@ -1749,6 +1692,16 @@ const fxQuoteCreationDurationHistogram = new promClient.Histogram({
   help: "Duration of FX quote creation in milliseconds",
   labelNames: ["cache_hit"] as const,
   buckets: [1, 2, 5, 10, 20, 50, 100],
+});
+
+// Issue #891 — FX quote cache hit/miss counters
+const fxQuoteCacheHitsTotal = new promClient.Counter({
+  name: "fx_quote_cache_hits_total",
+  help: "Total number of FX quote resolutions served from the rate cache",
+});
+const fxQuoteCacheMissesTotal = new promClient.Counter({
+  name: "fx_quote_cache_misses_total",
+  help: "Total number of FX quote resolutions that required a live rate computation",
 });
 
 // Served on its own port (see startMetricsServer below), not on the

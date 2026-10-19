@@ -35,7 +35,14 @@ export function parseFeatureFlags(raw: string | undefined): Set<string> {
  * Module-level singleton derived from process.env.FEATURE_FLAGS.
  * Re-read at module load time so it reflects the env state at startup.
  */
-const _flags: Set<string> = parseFeatureFlags(process.env.FEATURE_FLAGS);
+let _flags: Set<string> = parseFeatureFlags(process.env.FEATURE_FLAGS);
+
+/**
+ * Reloads the module-level feature flag set from process.env.FEATURE_FLAGS.
+ */
+export function reloadFeatureFlags(): void {
+  _flags = parseFeatureFlags(process.env.FEATURE_FLAGS);
+}
 
 /**
  * Returns true when `name` appears in the FEATURE_FLAGS env var.

@@ -228,6 +228,13 @@ const indexerLedgerSkipsCounter = new promClient.Counter({
   help: "Total number of ledger retries/skips due to stuck ledgers",
 });
 
+// Issue #892 — dedup-ratio counter: tracks how many events were dropped as
+// duplicates so operators can derive the ratio against eventsFetchedCounter.
+const indexerDedupEventsTotal = new promClient.Counter({
+  name: "indexer_dedup_events_total",
+  help: "Total number of on-chain events dropped as duplicates (Prisma P2002 / skipDuplicates)",
+});
+
 function parseRetryAfterMs(err: unknown): number | null {
   const status = (err as any)?.response?.status ?? (err as any)?.status;
   if (status !== 429) return null;
@@ -795,6 +802,7 @@ export async function persistEvent(
         { stellarId, contractId, ledger, type },
         "[Indexer] Duplicate event — skipping (composite constraint)",
       );
+      indexerDedupEventsTotal.inc();
       return null;
     }
     throw err;
@@ -912,6 +920,11 @@ async function flushIndexedEvents(
         skipDuplicates: true,
       });
     }
+  }
+
+  const deduped = data.length - records.length;
+  if (deduped > 0) {
+    indexerDedupEventsTotal.inc(deduped);
   }
 
   const maxInsertedLedger = records.reduce<number | null>((max, record) => {

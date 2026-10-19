@@ -27,6 +27,7 @@ export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrat
   onClose?: () => void;
   onReconnect?: () => void;
   healthState?: RedisHealthState;
+  redisFactory?: (url: string, options: RedisOptions) => Redis;
 }
 
 const sharedRedisClients = new Map<string, Redis>();
@@ -108,10 +109,11 @@ export function createRedisClient(
     logger: _ignoredLogger,
     url: _ignoredUrl,
     shared: _ignoredShared,
+    redisFactory = (redisUrl: string, redisOptions: RedisOptions) => new Redis(redisUrl, redisOptions),
     ...rest
   } = clientOpts;
 
-  const client = new Redis(url, {
+  const clientOptions: RedisOptions = {
     enableOfflineQueue: false,
     maxRetriesPerRequest: null,
     ...rest,
@@ -120,7 +122,8 @@ export function createRedisClient(
       log?.warn({ attempt, delayMs: delay }, 'Redis connection retry');
       return delay;
     },
-  });
+  };
+  const client = redisFactory(url, clientOptions);
 
   client.on('connect', () => {
     log?.info({ url }, 'Redis connection established');

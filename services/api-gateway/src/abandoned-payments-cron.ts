@@ -4,6 +4,7 @@
  * A cron job to automatically expire abandoned payments.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { PrismaClient } from '@prisma/client';
 import type { FastifyLoggerInstance } from 'fastify';
 import type { Queue } from 'bullmq';
@@ -52,6 +53,9 @@ export async function autoExpireAbandonedPayments(
     return 0;
   }
 
+  const traceId = randomUUID();
+  logger.info({ traceId }, 'Starting abandoned payments sweep');
+
   const cutoff = new Date(Date.now() - abandonmentHours * 60 * 60 * 1000);
 
   try {
@@ -98,6 +102,7 @@ export async function autoExpireAbandonedPayments(
               name: 'deliver',
               data: {
                 url: webhookUrl,
+                traceId,
                 event: {
                   type: 'payment.expired',
                   paymentId: payment.id,
@@ -128,10 +133,10 @@ export async function autoExpireAbandonedPayments(
 
     if (!foundPayments) return 0;
 
-    logger.info({ expiredCount, cutoff: cutoff.toISOString() }, 'Auto-expired abandoned payments.');
+    logger.info({ traceId, expiredCount, cutoff: cutoff.toISOString() }, 'Auto-expired abandoned payments.');
     return expiredCount;
   } catch (error) {
-    logger.error({ err: error }, 'Error during abandoned payment expiration cron job.');
+    logger.error({ traceId, err: error }, 'Error during abandoned payment expiration cron job.');
     return 0;
   }
 }

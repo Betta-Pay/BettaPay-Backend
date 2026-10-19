@@ -115,6 +115,7 @@ import {
   ErrorCodes,
   registerErrorHandler,
   registerServiceAuth,
+  createAdminApiKeyAuth,
   createAuditLogger,
   timingSafeStrEqual,
   type AuditLogRequestLike,
@@ -743,6 +744,11 @@ export function buildApp(opts: AppOptions = {}) {
   registerErrorHandler(fastify);
   registerTracing(fastify);
   registerServiceAuth(fastify, opts.interServiceSecret ?? env.INTER_SERVICE_SECRET);
+
+  // Issue #908 — timing-safe admin API key guard
+  if (env.ADMIN_API_KEY) {
+    fastify.decorate('adminAuth', createAdminApiKeyAuth(env.ADMIN_API_KEY));
+  }
 
   // Centralized query and path parameter sanitization preHandler hook:
   // Recursively strips unsafe ASCII control characters (0x00-0x1F except \t, 0x7F)
@@ -1391,6 +1397,19 @@ export function buildApp(opts: AppOptions = {}) {
     },
   );
 
+  // Issue #889 — record latency after every response.
+  fastify.addHook("onResponse", async (request, reply) => {
+    const route = request.routeOptions?.url ?? "unknown";
+    httpRequestDurationHistogram.observe(
+      {
+        method: request.method,
+        route,
+        status_code: String(reply.statusCode),
+      },
+      reply.elapsedTime / 1000,
+    );
+  });
+
   fastify.addHook("preHandler", async (request) => {
     if (request.body !== undefined) {
       request.body = sanitizeInput(request.body);
@@ -1925,11 +1944,15 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
 });
 
 fastify.get('/api/admin/auth/ip-score', {
-  preValidation: [fastify.authenticate]
+  preValidation: env.ADMIN_API_KEY
+    ? [fastify.adminAuth]
+    : [fastify.authenticate],
 }, async (request, reply) => {
-  const payload = request.user as MerchantJwtPayload;
-  if (payload.merchantId !== env.ADMIN_ADDRESS) {
-    return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Forbidden'));
+  if (!env.ADMIN_API_KEY) {
+    const payload = request.user as MerchantJwtPayload;
+    if (payload.merchantId !== env.ADMIN_ADDRESS) {
+      return reply.code(403).send(createErrorResponse(ErrorCodes.FORBIDDEN, 'Forbidden'));
+    }
   }
 
   const { ip } = AuthIpScoreQuery.parse(request.query ?? {});
@@ -2325,6 +2348,23 @@ fastify.get('/api/admin/auth/ip-score', {
         return reply
           .code(403)
           .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
+
+      // Issue #909 — replay protection: throttle to one test per 30s per
+      // (merchantId, webhookId) pair so the endpoint cannot be used to
+      // flood a merchant's endpoint repeatedly.
+      const replayKey = `webhook-test-throttle:${payload.merchantId}:${id}`;
+      const REPLAY_TTL_MS = 30_000;
+      try {
+        const claimed = await redis.set(replayKey, '1', 'PX', REPLAY_TTL_MS, 'NX');
+        if (claimed === null) {
+          return reply
+            .code(429)
+            .header('Retry-After', '30')
+            .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Webhook test already in progress; please wait 30 seconds before retrying'));
+        }
+      } catch {
+        // Redis failure must not block the test; proceed without throttle guard.
       }
 
       try {
