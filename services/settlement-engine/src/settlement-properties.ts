@@ -138,3 +138,21 @@ export function validateQueryTimeout(): void {
     );
   }
 }
+
+export const DEFAULT_MERCHANT_MAX_CONCURRENCY = 10;
+
+/**
+ * Resolves the maximum concurrent settlement batch jobs allowed per merchant.
+ * Reads MERCHANT_MAX_CONCURRENCY from environment or falls back to default.
+ */
+export function getMerchantMaxConcurrency(envVal?: string): number {
+  const val = envVal ?? process.env.MERCHANT_MAX_CONCURRENCY;
+  if (val) {
+    const parsed = parseInt(val, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_MERCHANT_MAX_CONCURRENCY;
+}
+

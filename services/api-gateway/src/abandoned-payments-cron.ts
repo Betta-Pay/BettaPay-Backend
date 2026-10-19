@@ -14,6 +14,7 @@ let cronInterval: NodeJS.Timeout | null = null;
 const CRON_BATCH = 200;
 
 export const DEFAULT_ABANDONED_PAYMENTS_CRON_INTERVAL_MS = 60 * 60 * 1000;
+export const DEFAULT_PAYMENT_ABANDONMENT_HOURS = 24;
 export const ABANDONED_PAYMENTS_CRON_INTERVAL_ENV =
   'ABANDONED_PAYMENTS_CRON_INTERVAL_MS';
 
@@ -144,7 +145,7 @@ export async function autoExpireAbandonedPayments(
 export function startAbandonedPaymentsCron(
   prisma: PrismaClient,
   logger: FastifyLoggerInstance,
-  abandonmentHours: number,
+  abandonmentHours: number = DEFAULT_PAYMENT_ABANDONMENT_HOURS,
   webhookQueue?: Queue<WebhookJobData>,
 ) {
   if (cronInterval) return;

@@ -213,5 +213,29 @@ test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
   }
 });
 
+test('validateEnv accepts default PAYMENT_ABANDONMENT_HOURS of 24', () => {
+  const env = validateEnv(validEnv());
+  assert.equal(env.PAYMENT_ABANDONMENT_HOURS, 24);
+});
+
+test('validateEnv parses valid PAYMENT_ABANDONMENT_HOURS', () => {
+  const env = validateEnv(validEnv({ PAYMENT_ABANDONMENT_HOURS: '48' }));
+  assert.equal(env.PAYMENT_ABANDONMENT_HOURS, 48);
+});
+
+test('validateEnv rejects PAYMENT_ABANDONMENT_HOURS out of range or malformed', () => {
+  for (const value of ['0', '-1', '169', 'abc', '24.5']) {
+    assert.throws(
+      () => validateEnv(validEnv({ PAYMENT_ABANDONMENT_HOURS: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /PAYMENT_ABANDONMENT_HOURS/);
+        return true;
+      },
+    );
+  }
+});
+
+
 
 

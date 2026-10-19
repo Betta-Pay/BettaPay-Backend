@@ -468,7 +468,9 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   }, 'Processing settlement job');
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    semaphoreToken = await acquireSemaphore(redis, merchantId);
+    semaphoreToken = await acquireSemaphore(redis, merchantId, {
+      maxConcurrent: env.MERCHANT_MAX_CONCURRENCY,
+    });
     if (semaphoreToken) break;
 
     if (attempt < maxRetries) {
