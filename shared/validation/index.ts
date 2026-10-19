@@ -27,6 +27,8 @@ export * from './route-audit.js';
 // import it via "@bettapay/validation" instead of relative paths that break
 // in the built output.
 export * from './merchant-cache.js';
+// FeeScheduleItem (schema + type) is re-exported via `./schemas.js` above so
+// settlement/FX consumers import it from the package barrel only (#820).
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -466,9 +468,9 @@ export const EnvSchema = z
     // Gross volume that batches an asset even when below BATCH_MIN_COUNT (0 disables).
     BATCH_VOLUME_THRESHOLD: z
       .string()
-      .transform((s) => Number(s))
+      .transform((s) => parseInt(s, 10))
       .default("0")
-      .refine((val) => Number.isFinite(val) && val >= 0, {
+      .refine((val) => Number.isFinite(val) && Number.isInteger(val) && val >= 0, {
         message: "BATCH_VOLUME_THRESHOLD must be >= 0",
       }),
     // Max settlements processed per batching run (0 = unlimited). Remaining
