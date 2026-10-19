@@ -153,16 +153,6 @@ import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
 import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
-// Issue #889 — HTTP request duration histogram for the gateway.
-// Registered at module scope so the same instance is used across calls to
-// buildApp (test isolation uses promClient.register.clear() when needed).
-const httpRequestDurationHistogram = new promClient.Histogram({
-  name: "http_request_duration_seconds",
-  help: "Duration of HTTP requests handled by the API gateway",
-  labelNames: ["method", "route", "status_code"] as const,
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
-});
-
 declare module "fastify" {
   export interface FastifyInstance {
     authenticate: (
