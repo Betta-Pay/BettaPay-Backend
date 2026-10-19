@@ -1,6 +1,23 @@
 # Production Deploy Checklist (Render)
 
-This guide covers hardening and deploying BettaPay Backend from `render.yaml`. Review every item before the first production Blueprint sync.
+This guide covers hardening and deploying BettaPay Backend from `render.yaml` and the GitHub Actions deployment workflow. Review every item before the first production Blueprint sync.
+
+## GitHub Actions deploy requirements
+
+The workflow in `.github/workflows/deploy.yml` deploys to the production Render environment. It is intentionally real and gated by the `production` GitHub environment.
+
+Required repository secrets:
+
+- `RENDER_API_KEY` — API token used to call the Render Deploy API.
+- `RENDER_SERVICE_ID` — the Render service ID that receives the production deploy.
+
+Required environment protections:
+
+- Set the GitHub environment to `production` and require at least one reviewer approval before a deployment runs.
+- Keep `DATABASE_URL`, `INTER_SERVICE_SECRET`, and other runtime secrets in the Render dashboard or a secure secret manager rather than in the repo.
+- Treat any deployment secret as sensitive; do not log or print values in workflow output.
+
+Manual deploys should only target the production service after the branch and environment checks are green and the release notes are reviewed.
 
 Related docs:
 

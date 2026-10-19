@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Prisma adapter helpers for the settlement engine (#543).
  *
@@ -20,6 +19,11 @@ import type { PrismaClient, Prisma, Settlement } from '@prisma/client';
 import { SETTLEMENT_QUERY_TIMEOUT_MS } from './settlement-properties.js';
 
 type PrismaLike = PrismaClient | Prisma.TransactionClient;
+
+interface DatabaseErrorLike {
+  code?: string;
+  message?: string;
+}
 
 export class VersionConflictError extends Error {
   constructor(
@@ -93,9 +97,10 @@ async function withQueryTimeout<T>(
     // Clear the timeout after successful query
     await prisma.$executeRawUnsafe(`SET LOCAL statement_timeout = 0`);
     return result;
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const error = err as DatabaseErrorLike;
     // PostgreSQL error code 57014 = query_canceled (statement timeout)
-    if (err?.code === '57014' || err?.message?.includes('statement timeout')) {
+    if (error?.code === '57014' || error?.message?.includes('statement timeout')) {
       throw new QueryTimeoutError(operation, timeoutMs, err);
     }
     throw err;
@@ -120,12 +125,14 @@ export async function createSettlementWithUniqueGuard(
   return withQueryTimeout(prisma, 'createSettlement', async () => {
     try {
       return await prisma.settlement.create({ data });
-    } catch (err: any) {
-      if (err?.code === 'P2002') {
+    } catch (err: unknown) {
+      const error = err as DatabaseErrorLike;
+      if (error?.code === 'P2002') {
         // A concurrent request won the race. Return the existing settlement
         // keyed by id or idempotencyKey, whichever is present in the payload.
-        const existingById = data.id
-          ? await prisma.settlement.findUnique({ where: { id: data.id as string } })
+        const id = typeof data.id === 'string' ? data.id : undefined;
+        const existingById = id
+          ? await prisma.settlement.findUnique({ where: { id } })
           : null;
         if (existingById) return existingById;
 

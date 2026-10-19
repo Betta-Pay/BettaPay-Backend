@@ -213,5 +213,23 @@ test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
   }
 });
 
+test('validateEnv accepts valid BULLMQ_WAITING_DEGRADED_THRESHOLD and defaults to 1000', () => {
+  const envDefault = validateEnv(validEnv());
+  assert.equal(envDefault.BULLMQ_WAITING_DEGRADED_THRESHOLD, 1000);
 
+  const envCustom = validateEnv(validEnv({ BULLMQ_WAITING_DEGRADED_THRESHOLD: '500' }));
+  assert.equal(envCustom.BULLMQ_WAITING_DEGRADED_THRESHOLD, 500);
+});
 
+test('validateEnv rejects non-positive or invalid BULLMQ_WAITING_DEGRADED_THRESHOLD', () => {
+  for (const value of ['0', '-1', '-100', 'abc']) {
+    assert.throws(
+      () => validateEnv(validEnv({ BULLMQ_WAITING_DEGRADED_THRESHOLD: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /BULLMQ_WAITING_DEGRADED_THRESHOLD/);
+        return true;
+      },
+    );
+  }
+});

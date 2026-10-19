@@ -36,9 +36,22 @@ Common workflow:
 
 The repository uses **GitHub Actions** to automatically validate every pull request and push to the default branch.
 
-- **Jobs executed**: lint, type‑check, test, migration rollback test, dependency audit, and PR title validation (Conventional Commits).
+- **Jobs executed**: lockfile integrity, lint, type‑check, test, migration rollback test, dependency audit, PR title validation (Conventional Commits), and a scheduled mutation run.
 - **Caching**: pnpm store is cached to speed up installations.
-- **Node.js version**: 20 (configured in the workflow).
+- **Node.js version**: 24 in CI.
+
+### Lockfile integrity
+
+Every dependency manifest change must be accompanied by the corresponding `pnpm-lock.yaml` update. The CI workflow runs a frozen install (`pnpm install --frozen-lockfile`) and fails fast if the lockfile is stale.
+
+Regenerate and commit the lockfile after editing `package.json` or workspace package manifests:
+
+```bash
+pnpm install
+git add pnpm-lock.yaml
+```
+
+Never merge a manifest change without the lockfile update.
 
 ### Running checks locally
 ```bash
@@ -71,7 +84,7 @@ Run mutation tests with Stryker using the workspace script:
 pnpm test:mutation
 ```
 
-Target mutation score is >= 80% for critical modules (`settlement-amounts.ts`, `shared/validation/schemas.ts`). Address surviving mutants by either strengthening tests or fixing the implementation.
+Baseline mutation score for the expanded critical scope is 80% (measured on the main branch and enforced via Stryker thresholds). Address surviving mutants by either strengthening tests or fixing the implementation.
 
 If any of these commands fail, fix the reported issues before pushing.
 

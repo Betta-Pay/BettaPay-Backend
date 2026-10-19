@@ -53,7 +53,7 @@ import {
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from '@bettapay/worker-shutdown';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 
 /**
@@ -79,6 +79,7 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
   return out as T;
 }
 import { startSettlementReaper } from './settlement-reaper.js';
+import { MerchantCache, getCachedMerchant } from '../../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
