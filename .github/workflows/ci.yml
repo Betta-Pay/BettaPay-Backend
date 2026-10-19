@@ -27,6 +27,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify no @ts-nocheck in service entrypoints (Ratchet)
+        run: |
+          if grep -rn "@ts-nocheck" services/api-gateway/src/index.ts services/settlement-engine/src/index.ts services/settlement-engine/src/superseded-cleanup.ts services/fx-engine/src/index.ts services/indexer/src/index.ts; then
+            echo "::error::@ts-nocheck is strictly prohibited in service entrypoints and critical modules."
+            exit 1
+          fi
+
       - name: Run lint
         # Only packages that define a lint script are run (--if-present).
         run: pnpm -r --if-present lint

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Settlement Engine — BettaPay Backend
  *
@@ -80,9 +79,7 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
 }
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';cache.js
-
-upstream/main
+import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
