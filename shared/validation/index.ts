@@ -259,6 +259,16 @@ export const EnvSchema = z
       .transform((s) => parseInt(s, 10))
       .default("3"),
 
+    // BullMQ degraded health threshold — waiting jobs strictly above this count
+    // flip service health to degraded (#896).
+    BULLMQ_WAITING_DEGRADED_THRESHOLD: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1000")
+      .refine((val) => Number.isFinite(val) && val > 0, {
+        message: "BULLMQ_WAITING_DEGRADED_THRESHOLD must be a positive integer",
+      }),
+
     // Per-merchant concurrent request limiting
     MERCHANT_MAX_CONCURRENCY: z
       .string()
