@@ -334,7 +334,7 @@ test('reconciliation report: handles empty result sets', (t) => {
 test('reconciliation report: combines multiple discrepancy types', (t) => {
   const localSettlements = [
     { id: '1', merchantId: 'M1', grossAmount: '100.00', feeAmount: '1.00', netAmount: '99.00', asset: 'USDC', status: 'completed' },
-    { id: '3', merchantId: 'M1', grossAmount: '300.00', feeAmount: '3.00', netAmount: '297.00', asset: 'USDC', status: 'completed' },
+    { id: '3', merchantId: 'M1', grossAmount: '200.00', feeAmount: '2.00', netAmount: '198.00', asset: 'USDC', status: 'completed' },
   ];
 
   const gatewaySettlements = [

@@ -1,8 +1,19 @@
 {
   "$schema": "https://stryker-mutator.io/schema/stryker-config.json",
   "mutate": [
-    "services/settlement-engine/src/settlement-amounts.ts",
-    "shared/validation/schemas.ts"
+    "services/settlement-engine/src/*.ts",
+    "services/fx-engine/src/*.ts",
+    "services/api-gateway/src/**/*.ts",
+    "shared/**/*.ts"
+  ],
+  "ignorePatterns": [
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/coverage/**",
+    "**/generated/**",
+    "**/migrations/**"
   ],
   "testRunner": "node",
   "commandRunner": {
@@ -11,5 +22,10 @@
   "reporters": ["html", "clear-text", "progress"],
   "coverageAnalysis": "perTest",
   "timeoutMS": 5000,
-  "concurrency": 4
+  "concurrency": 4,
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": 80
+  }
 }

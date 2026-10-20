@@ -25,6 +25,8 @@ services:
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter api-gateway start
     envVars:
+      - key: NODE_VERSION
+        value: 22
       - key: NODE_ENV
         value: production
       - key: PORT
@@ -93,6 +95,8 @@ services:
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter fx-engine start
     envVars:
+      - key: NODE_VERSION
+        value: 22
       - key: NODE_ENV
         value: production
       - key: PORT
@@ -125,6 +129,8 @@ services:
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter settlement-engine start
     envVars:
+      - key: NODE_VERSION
+        value: 22
       - key: NODE_ENV
         value: production
       - key: PORT
@@ -171,6 +177,8 @@ services:
     buildCommand: pnpm install --prod=false && pnpm exec prisma generate && pnpm build
     startCommand: pnpm --filter indexer start
     envVars:
+      - key: NODE_VERSION
+        value: 22
       - key: NODE_ENV
         value: production
       - key: PORT

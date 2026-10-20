@@ -70,6 +70,7 @@ import {
   installCrashHandlers,
   createErrorResponse,
   ErrorCodes,
+  validateWebhookTestTarget,
 } from "@bettapay/validation";
 import { buildPaginationMeta } from "@bettapay/shared-types";
 import type { EventType, CleanupDryRunResult } from "@bettapay/validation";
@@ -163,9 +164,11 @@ const pollCyclesCounter = new promClient.Counter({
 
 const metricsServer = startMetricsServer({
   appPort: PORT,
+  metricsPort: env.METRICS_PORT,
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
+  scrapeToken: env.METRICS_SCRAPE_TOKEN,
 });
 
 let latestLedgerCursor: number | undefined = undefined;
@@ -1449,6 +1452,22 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
     ) {
       return reply.code(403).send(
         createErrorResponse(ErrorCodes.FORBIDDEN, "Cannot test webhook subscription owned by another merchant"),
+      );
+    }
+
+    // Restrict webhook test endpoint to configured allowlist and block private/loopback ranges (#900)
+    const targetValidation = await validateWebhookTestTarget(
+      existing.url,
+      env.WEBHOOK_TEST_ALLOWED_HOSTS,
+    );
+    if (!targetValidation.allowed) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          targetValidation.reason ?? "Webhook test target URL is not allowed",
+          undefined,
+          request.id,
+        ),
       );
     }
 

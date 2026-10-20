@@ -33,8 +33,16 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import BigNumber from 'bignumber.js';
 import { createWebhookQueue, createWebhookWorker } from '@bettapay/webhook-delivery';
-import { computeSettlementAmounts, SettlementAmountError } from './settlement-amounts.js';
-import type { DiscountTier } from './settlement-amounts.js';
+import {
+  computeSettlementAmounts,
+  computeReconciliationDiff,
+  SettlementAmountError,
+} from './settlement-amounts.js';
+import type {
+  DiscountTier,
+  ReconcileDiffResult,
+  ReconcileRecordLike,
+} from './settlement-amounts.js';
 import { buildSettlementWebhookData } from './webhook-payload.js';
 import {
   createSettlementWithUniqueGuard,
@@ -52,8 +60,9 @@ import {
   startSemaphoreRenewal,
   getActiveCount,
 } from './redis-semaphore.js';
-import { closeWorkerWithTimeout, trackActiveJob } from '@bettapay/worker-shutdown';
+import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
+import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
 /**
  * Mask PII fields before writing to reconcile log lines (#905).
@@ -79,7 +88,6 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
 }
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
-import { MerchantCache, getCachedMerchant } from '../../shared/validation/merchant-cache.js';
 import {
   validateEnvOrExit,
   CreateSettlementBody,
@@ -111,8 +119,11 @@ import {
   propagateTracingHeaders,
   auditRouteAuthPolicy,
   installCrashHandlers,
+  MerchantCache,
+  getCachedMerchant,
 } from "@bettapay/validation";
-import type { PaginatedResponse, ApiResponse } from '@bettapay/shared-types';
+import type { FeeScheduleItem } from "@bettapay/validation";
+import type { PaginatedResponse, ApiResponse, Amount } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
 
 
@@ -343,9 +354,11 @@ const settlementQueueDepthGauge = new promClient.Gauge({
 // exposing it alongside application traffic.
 const metricsServer = startMetricsServer({
   appPort: PORT,
+  metricsPort: env.METRICS_PORT,
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
+  scrapeToken: env.METRICS_SCRAPE_TOKEN,
 });
 
 // ── Database & Redis Setup ───────────────────────────────────────────────────────
@@ -431,7 +444,7 @@ function withJobTimeout<T>(
   });
 }
 
-const baseSettlementProcessor = async (job: Job): Promise<void> => {
+export const baseSettlementProcessor = async (job: Job): Promise<void> => {
   const settlementId = job.data.id;
   const merchantId = job.data.merchantId;
   const traceId = job.data.traceId;
@@ -452,6 +465,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   // ── Per-merchant concurrency semaphore ──────────────────────────────────────
   const maxRetries = 3;
   const requeueDelayMs = 5000;
+  const merchantMaxConcurrency = getMerchantMaxConcurrency(env);
   // The member token this job holds; used to renew and to release exactly its
   // own slot (#487). null until acquired.
   let semaphoreToken: string | null = null;
@@ -465,7 +479,9 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   }, 'Processing settlement job');
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    semaphoreToken = await acquireSemaphore(redis, merchantId);
+    semaphoreToken = await acquireSemaphore(redis, merchantId, {
+      maxConcurrent: merchantMaxConcurrency,
+    });
     if (semaphoreToken) break;
 
     if (attempt < maxRetries) {
@@ -501,6 +517,7 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
   // concurrent job for the merchant slips through (#486).
   const renewal = semaphoreToken
     ? startSemaphoreRenewal(redis, merchantId, semaphoreToken, {
+        maxConcurrent: merchantMaxConcurrency,
         onLost: () =>
           log.warn({ merchantId, settlementId }, 'Settlement semaphore slot lost mid-job'),
         onError: (err) =>
@@ -528,7 +545,6 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
       await webhookQueue.add('deliver', {
         eventId,
         url: updatedSettlement.webhookUrl,
-        eventId: crypto.randomUUID(),
         event: { event: 'settlement.completed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
         traceId: job.data.traceId,
@@ -548,7 +564,6 @@ const baseSettlementProcessor = async (job: Job): Promise<void> => {
       await webhookQueue.add('deliver', {
         eventId,
         url: updatedSettlement.webhookUrl,
-        eventId: crypto.randomUUID(),
         traceId: job.data.traceId,
         event: { event: 'settlement.failed', data: buildSettlementWebhookData(updatedSettlement) },
         headers: extractWebhookHeaders({ webhookHeaders: updatedSettlement.webhookHeaders }),
@@ -634,7 +649,7 @@ async function getSettlementRetryCount(settlementId: string): Promise<number> {
 const getActiveSettlementJob = trackActiveJob(worker);
 
 // Start settlement reaper (#496) to recover stuck processing settlements
-stopReaper = startSettlementReaper(prisma, settlementQueue, fastify.log, 10_000);
+stopReaper = startSettlementReaper(prisma, settlementQueue, fastify.log);
 
 worker.on('failed', async (job, err) => {
   if (job) {
@@ -832,6 +847,23 @@ const COMPARE_FIELDS = [
   'merchantId',
 ] as const;
 
+// Signs a minimal HS256 JWT using Node's native crypto
+export function signHS256(payload: object, secret: string): string {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const base64UrlEncode = (obj: object) =>
+    Buffer.from(JSON.stringify(obj)).toString('base64url');
+
+  const tokenInput = `${base64UrlEncode(header)}.${base64UrlEncode(payload)}`;
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(tokenInput)
+    .digest('base64url');
+
+  return `${tokenInput}.${signature}`;
+}
+
+export { computeReconciliationDiff, type ReconcileDiffResult, type ReconcileRecordLike };
+
 /**
  * Local Consistency Check for Settlements
  *
@@ -1005,6 +1037,10 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       totalFee = totalFee.plus(fee);
       totalNet = totalNet.plus(net);
 
+      localGrossTotal = localGrossTotal.plus(gross);
+      localFeeTotal = localFeeTotal.plus(fee);
+      localNetTotal = localNetTotal.plus(net);
+
       statusCounts[settlement.status] = (statusCounts[settlement.status] || 0) + 1;
 
       // Check 1: Verify grossAmount - feeAmount = netAmount
@@ -1054,7 +1090,8 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
       }
     }
 
-    const matchedCount = matchedIds.size - mismatched.length;
+    const { matchedIds, mismatched } = computeReconciliationDiff(settlements, gatewayRecords);
+    const matchedCount = matchedIds.size;
     const hasDiscrepancies = missing.length > 0 || extra.length > 0 || mismatched.length > 0;
 
     // Emit metrics (#490)
@@ -1146,7 +1183,13 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
         inconsistent: inconsistencies.length,
         missingInEngine: missing.length,
         missingInGateway: extra.length,
+        matched: matchedIds.size,
+        mismatched: mismatched.length,
       },
+      matched: matchedIds.size,
+      mismatched: mismatched.length,
+      matchedIds: Array.from(matchedIds),
+      mismatches: mismatched,
       statusBreakdown: statusCounts,
       totals: {
         gross: totalGross.toString(),
@@ -1472,7 +1515,7 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     let computeResult;
     try {
       computeResult = computeSettlementAmounts(
-        d.amount,
+        d.amount as Amount,
         feeBps,
         monthlyVolume,
         discountTiers,
@@ -1699,7 +1742,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       let itemResult;
       try {
-        itemResult = computeSettlementAmounts(item.amount, feeBps, monthlyVolume, discountTiers);
+        itemResult = computeSettlementAmounts(item.amount as Amount, feeBps, monthlyVolume, discountTiers);
       } catch (error) {
         if (error instanceof SettlementAmountError) {
           errors.push({ index: i, reason: error.message });

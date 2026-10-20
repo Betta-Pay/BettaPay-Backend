@@ -304,4 +304,58 @@ test('validation: GET /api/settlements handles date ranges correctly when start 
   await app.close();
   t.end();
 });
+
+test('validation: POST /api/payments succeeds when authenticated ownerId matches merchant ownerId (#899)', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const token = generateTestJwt(app, {
+    merchantId: MOCK_MERCHANT_ACTIVE.id,
+    ownerId: MOCK_MERCHANT_ACTIVE.ownerId,
+  });
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${token}`, 'x-csrf-check': '1' },
+    payload: {
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
+      amount: '10.00',
+      asset: 'USDC',
+    },
+  });
+
+  t.equal(res.statusCode, 201, 'should accept payment creation when ownerId matches');
+  const body = JSON.parse(res.body);
+  t.ok(body.data?.id, 'should return created payment');
+  await app.close();
+  t.end();
+});
+
+test('validation: POST /api/payments rejects mismatched ownerId with typed error and does not leak merchant ID (#899)', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const token = generateTestJwt(app, {
+    merchantId: 'some-other-merchant-id',
+    ownerId: 'unauthorized-foreign-owner-id',
+  });
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: { authorization: `Bearer ${token}`, 'x-csrf-check': '1' },
+    payload: {
+      merchantId: MOCK_MERCHANT_ACTIVE.id,
+      amount: '10.00',
+      asset: 'USDC',
+    },
+  });
+
+  t.equal(res.statusCode, 403, 'should reject mismatched ownerId with 403 Forbidden');
+  const body = JSON.parse(res.body);
+  t.equal(body.error?.code, 'FORBIDDEN', 'should return typed FORBIDDEN error');
+  t.notOk(body.error?.message?.includes(MOCK_MERCHANT_ACTIVE.id), 'must not leak target merchant id');
+  t.notOk(body.error?.message?.includes(MOCK_MERCHANT_ACTIVE.ownerId), 'must not leak target owner id');
+  await app.close();
+  t.end();
+});
+
 export { VALID_STELLAR_KEY, INVALID_STELLAR_KEY };
+
