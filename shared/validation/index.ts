@@ -532,6 +532,15 @@ export const EnvSchema = z
       .string()
       .transform((s) => parseInt(s, 10))
       .default("1440"),
+    // Payment abandonment timeout (hours) — payments in 'initiated' state older
+    // than this are transitioned to 'cancelled' by the abandoned-payments cron.
+    // Sane bounds: 1 hour minimum to 168 hours (7 days) maximum. Default: 24 hours.
+    PAYMENT_ABANDONMENT_HOURS: z.coerce
+      .number()
+      .int()
+      .min(1, "PAYMENT_ABANDONMENT_HOURS must be at least 1")
+      .max(168, "PAYMENT_ABANDONMENT_HOURS cannot exceed 168 (7 days)")
+      .default(24),
     // How often the abandoned-payments cron runs (ms). Default matches the
     // cron's current inline `setInterval` value (api-gateway/src/abandoned-payments-cron.ts).
     ABANDONED_PAYMENTS_CRON_INTERVAL_MS: z

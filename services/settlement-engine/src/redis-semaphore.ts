@@ -80,8 +80,12 @@ const releaseScript = `
 `;
 
 function resolve(opts: SemaphoreOptions) {
+  const envVal = process.env.MERCHANT_MAX_CONCURRENCY;
+  const parsedEnv = envVal ? parseInt(envVal, 10) : NaN;
+  const defaultLimit = Number.isFinite(parsedEnv) && parsedEnv > 0 ? parsedEnv : DEFAULT_MAX_CONCURRENT;
+
   return {
-    maxConcurrent: opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
+    maxConcurrent: opts.maxConcurrent ?? defaultLimit,
     ttlSeconds: opts.ttlSeconds ?? DEFAULT_TTL_SECONDS,
     prefix: opts.prefix ?? 'semaphore:settlement',
   };

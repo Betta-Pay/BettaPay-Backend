@@ -4385,7 +4385,7 @@ const start = async () => {
       startAbandonedPaymentsCron(
         prisma,
         app.log,
-        (env as any).PAYMENT_ABANDONMENT_HOURS ?? 24,
+        env.PAYMENT_ABANDONMENT_HOURS,
         webhookQueue,
       );
       startIdempotencyKeyCleanupCron(prisma, app.log, { redis });

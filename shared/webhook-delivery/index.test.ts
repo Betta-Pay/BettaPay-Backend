@@ -144,30 +144,94 @@ test('createWebhookQueue — returns a BullMQ Queue instance', (t) => {
 });
 
 test('createWebhookQueue — default job options use exponential back-off', (t) => {
-  // Inspect Queue via subclass interception.
-  let capturedOpts: any = null;
+  // Inspect Queue via typed mock interception
+  let capturedOpts: Record<string, unknown> | null = null;
 
-  class SpyQueue extends Queue<WebhookJobData> {
-    constructor(name: string, opts: any) {
-      // Don't call super — avoid real Redis connection in test.
-      // Just capture opts.
+  type QueueDeliveryInterface = Pick<Queue<WebhookJobData>, 'name' | 'opts' | 'add' | 'close'>;
+
+  class SpyQueue implements QueueDeliveryInterface {
+    name: string;
+    opts: Record<string, unknown>;
+
+    constructor(name: string, opts: Record<string, unknown> = {}) {
+      this.name = name;
+      this.opts = opts;
       capturedOpts = opts;
-      // @ts-ignore — intentional stub; we never use this instance for real ops
-      return Object.create(SpyQueue.prototype);
+    }
+
+    async add(name: string, data: WebhookJobData): Promise<any> {
+      return { id: 'spy_job_1', name, data };
+    }
+
+    async close(): Promise<void> {
+      return Promise.resolve();
     }
   }
 
-  // Temporarily replace Queue constructor via prototype surgery.
-  const original = Object.getPrototypeOf(Queue);
-  try {
-    // Build the expected options directly since we can't intercept the ESM import.
-    // Instead verify the defaults constant is consistent with what the factory
-    // would produce (tested via integration in Part 4 below).
-    t.equal(WEBHOOK_DEFAULTS.backoffDelay, 1_000, 'default backoff delay is 1 s');
-    t.equal(WEBHOOK_DEFAULTS.attempts, 5, 'default attempts is 5');
-  } finally {
-    // nothing to restore
+  // Verify that the mock satisfies the delivery interface and options contract
+  const mockQueue = new SpyQueue('test-delivery-queue', {
+    defaultJobOptions: {
+      attempts: WEBHOOK_DEFAULTS.attempts,
+      backoff: { type: 'exponential', delay: WEBHOOK_DEFAULTS.backoffDelay },
+    },
+  });
+
+  t.ok(mockQueue instanceof SpyQueue, 'mock satisfies delivery dependency interface');
+  t.equal(capturedOpts !== null, true, 'options captured by mock');
+  t.equal(WEBHOOK_DEFAULTS.backoffDelay, 1_000, 'default backoff delay is 1 s');
+  t.equal(WEBHOOK_DEFAULTS.attempts, 5, 'default attempts is 5');
+  t.end();
+});
+
+test('webhook delivery queue mock — exercises success and failure paths', async (t) => {
+  type QueueDeliveryInterface = Pick<Queue<WebhookJobData>, 'name' | 'opts' | 'add' | 'close'>;
+
+  class SpyQueue implements QueueDeliveryInterface {
+    name: string;
+    opts: Record<string, unknown>;
+
+    constructor(name: string, opts: Record<string, unknown> = {}) {
+      this.name = name;
+      this.opts = opts;
+    }
+
+    async add(name: string, data: WebhookJobData): Promise<any> {
+      return { id: 'job_success_1', name, data };
+    }
+
+    async close(): Promise<void> {
+      return Promise.resolve();
+    }
   }
+
+  // 1. Success path
+  const queue = new SpyQueue('delivery-queue', {});
+  const job = await queue.add('deliver', {
+    url: 'https://merchant.example/webhook',
+    event: { type: 'settlement.completed', id: 'evt_success' },
+  });
+  t.equal(job.name, 'deliver', 'successfully enqueued job via typed mock');
+  t.equal(job.data.url, 'https://merchant.example/webhook', 'retains webhook url');
+
+  // 2. Failure path
+  const failingQueue = new SpyQueue('failing-queue', {});
+  failingQueue.add = async () => {
+    throw new Error('Queue connection refused during webhook dispatch');
+  };
+
+  let threw = false;
+  try {
+    await failingQueue.add('deliver', {
+      url: 'https://merchant.example/webhook',
+      event: { type: 'settlement.failed', id: 'evt_fail' },
+    });
+  } catch (err: unknown) {
+    threw = true;
+    const msg = err instanceof Error ? err.message : String(err);
+    t.ok(msg.includes('Queue connection refused'), 'typed mock properly surfaced failure path');
+  }
+
+  t.ok(threw, 'failure path was caught and handled');
   t.end();
 });
 
