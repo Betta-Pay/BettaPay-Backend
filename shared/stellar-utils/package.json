@@ -15,5 +15,7 @@
     "test": "cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm stellar-utils.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm memo.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm __tests__/address.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm memo-builder.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm horizon-url-builder.test.ts",
     "lint": "node ../../scripts/lint.mjs"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@stellar/stellar-sdk": "^16.0.1"
+  }
 }

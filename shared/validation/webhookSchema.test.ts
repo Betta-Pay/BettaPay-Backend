@@ -12,6 +12,9 @@ import {
   WEBHOOK_VALIDATE_RATE_LIMIT,
   WebhookPayloadSchema,
   WebhookHeadersSchema,
+  isPrivateOrRestrictedIp,
+  isHostAllowed,
+  validateWebhookTestTarget,
 } from './webhookSchema.js';
 
 test('createWebhookUrlSchema - format & length rules apply in every environment', async (t) => {
@@ -325,5 +328,61 @@ test('WebhookHeadersSchema', async (t) => {
   await t.test('rejects a header value exceeding 4096 characters', () => {
     const result = WebhookHeadersSchema.safeParse({ 'X-Long': 'a'.repeat(4097) });
     assert.strictEqual(result.success, false);
+  });
+});
+
+test('webhook test allowlist and SSRF protection (#900)', async (t) => {
+  await t.test('isPrivateOrRestrictedIp identifies IPv4 private and loopback ranges', () => {
+    assert.strictEqual(isPrivateOrRestrictedIp('127.0.0.1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('10.0.0.1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('192.168.1.1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('172.16.0.1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('172.31.255.255'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('169.254.169.254'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('0.0.0.0'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('93.184.216.34'), false);
+  });
+
+  await t.test('isPrivateOrRestrictedIp identifies IPv6 private and loopback ranges', () => {
+    assert.strictEqual(isPrivateOrRestrictedIp('::1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('fe80::1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('fc00::1'), true);
+    assert.strictEqual(isPrivateOrRestrictedIp('2606:4700:4700::1111'), false);
+  });
+
+  await t.test('isHostAllowed supports exact and wildcard domain matches', () => {
+    const allowed = ['example.com', '*.example.com', 'webhook.site'];
+    assert.strictEqual(isHostAllowed('example.com', allowed), true);
+    assert.strictEqual(isHostAllowed('api.example.com', allowed), true);
+    assert.strictEqual(isHostAllowed('sub.api.example.com', allowed), true);
+    assert.strictEqual(isHostAllowed('webhook.site', allowed), true);
+    assert.strictEqual(isHostAllowed('notexample.com', allowed), false);
+    assert.strictEqual(isHostAllowed('evil.com', allowed), false);
+    assert.strictEqual(isHostAllowed('127.0.0.1', allowed), false);
+  });
+
+  await t.test('validateWebhookTestTarget validates scheme, host, and IP resolution', async () => {
+    const allowed = ['example.com', '*.example.com', 'webhook.site'];
+
+    // Valid HTTPS public target
+    const mockPublicDns = async () => ['93.184.216.34'];
+    const validRes = await validateWebhookTestTarget('https://example.com/webhook', allowed, mockPublicDns);
+    assert.strictEqual(validRes.allowed, true);
+
+    // Invalid scheme (e.g. ftp, file, gopher)
+    const badSchemeRes = await validateWebhookTestTarget('ftp://example.com/file', allowed, mockPublicDns);
+    assert.strictEqual(badSchemeRes.allowed, false);
+    assert.ok(badSchemeRes.reason?.includes('scheme'));
+
+    // Disallowed host
+    const badHostRes = await validateWebhookTestTarget('https://attacker.com/webhook', allowed, mockPublicDns);
+    assert.strictEqual(badHostRes.allowed, false);
+    assert.ok(badHostRes.reason?.includes('allowlist'));
+
+    // Allowed host resolving to loopback / internal metadata IP (DNS rebinding / SSRF)
+    const mockInternalDns = async () => ['169.254.169.254'];
+    const ssrfRes = await validateWebhookTestTarget('https://example.com/webhook', allowed, mockInternalDns);
+    assert.strictEqual(ssrfRes.allowed, false);
+    assert.ok(ssrfRes.reason?.includes('private') || ssrfRes.reason?.includes('metadata'));
   });
 });

@@ -14,16 +14,12 @@ import test from 'tape';
 const { fastify, prisma, webhookQueue } = await import('./index.js');
 
 test('webhook test succeeds and stores result when mock server returns 200', async (t) => {
-  await fastify.ready();
-  webhookQueue.add = async () => ({
-    waitUntilFinished: async () => {},
-  } as any);
-  
   let payload: any;
-  const originalFetch = global.fetch;
-  global.fetch = async (_url, init) => {
-    payload = JSON.parse(String(init?.body));
-    return new Response('', { status: 200 });
+  webhookQueue.add = async (_name: string, data: any) => {
+    payload = data?.event;
+    return {
+      waitUntilFinished: async () => ({ statusCode: 200 }),
+    } as any;
   };
 
   const id = 'wh_success';
@@ -52,7 +48,6 @@ test('webhook test succeeds and stores result when mock server returns 200', asy
     t.equal(updatedData?.lastTestStatus, 'success', 'stores success status');
     t.equal(updatedData?.lastTestStatusCode, 200, 'stores success status code');
   } finally {
-    global.fetch = originalFetch;
     t.end();
   }
 });
@@ -212,6 +207,80 @@ test('webhook test returns 404 for non-existent subscription', async (t) => {
     });
 
     t.equal(res.statusCode, 404, 'missing subscription returns 404');
+  } finally {
+    t.end();
+  }
+});
+
+test('webhook test rejects unallowlisted URL scheme with 400 (#900)', async (t) => {
+  await fastify.ready();
+  const id = 'wh_bad_scheme';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'ftp://example.com/webhook',
+    signingSecret: null,
+  }) as any;
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+
+    t.equal(res.statusCode, 400, 'unsupported scheme returns 400');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
+    t.match(body.error?.message, /scheme/i, 'mentions scheme in error message');
+  } finally {
+    t.end();
+  }
+});
+
+test('webhook test rejects unallowlisted target host with 400 (#900)', async (t) => {
+  await fastify.ready();
+  const id = 'wh_bad_host';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'https://evil-unauthorized-target.com/hook',
+    signingSecret: null,
+  }) as any;
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+
+    t.equal(res.statusCode, 400, 'unauthorized host returns 400');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
+    t.match(body.error?.message, /allowlist/i, 'mentions allowlist in error message');
+  } finally {
+    t.end();
+  }
+});
+
+test('webhook test blocks loopback and metadata address ranges (#900)', async (t) => {
+  await fastify.ready();
+  const id = 'wh_ssrf_loopback';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'http://127.0.0.1:8080/admin',
+    signingSecret: null,
+  }) as any;
+
+  try {
+    const res = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+
+    t.equal(res.statusCode, 400, 'loopback target returns 400');
+    const body = JSON.parse(res.body);
+    t.equal(body.error?.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
   } finally {
     t.end();
   }

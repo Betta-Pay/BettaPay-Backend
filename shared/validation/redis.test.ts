@@ -7,6 +7,7 @@ import {
   createRedisClient,
   getSharedRedisClient,
   clearSharedRedisClients,
+  type RedisHealthState,
 } from './redis.js';
 
 const TEST_REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -110,7 +111,7 @@ test('connection reuse across BullMQ Queue, Worker, and direct Redis usage', asy
 
 test('createRedisClient exposes capped exponential retry backoff and health lifecycle state', () => {
   const created: FakeRedis[] = [];
-  const healthState = { connected: false, errors: 0, reconnects: 0 };
+  const healthState: RedisHealthState = { connected: false, errors: 0, reconnects: 0 };
   const events = { connect: 0, error: 0, close: 0, reconnect: 0 };
   createRedisClient({
     url: 'redis://fake',

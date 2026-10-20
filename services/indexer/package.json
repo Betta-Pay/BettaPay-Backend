@@ -21,7 +21,7 @@
     "@fastify/rate-limit": "^11.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "*",
-    "@stellar/stellar-sdk": "*",
+    "@stellar/stellar-sdk": "^16.0.1",
     "bullmq": "*",
     "fastify": "*",
     "@fastify/helmet": "*",

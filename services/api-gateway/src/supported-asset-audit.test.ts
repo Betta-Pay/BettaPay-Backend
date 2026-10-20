@@ -90,3 +90,39 @@ test('GET /api/admin/audit-log?entityType=SupportedAsset surfaces the toggle', a
   await app.close();
   t.end();
 });
+
+test('PATCH /api/admin/assets/:code is registered exactly once without duplicate route collision (#823)', async (t) => {
+  const { app } = await createTestApp(
+    {},
+    { supportedAssets: [{ code: 'XLM', name: 'Stellar Lumens', isActive: true, decimals: 7, contractId: 'CAS' }] },
+  );
+
+  // Fastify boots cleanly without duplicate route registration error
+  t.ok(app, 'Fastify boots cleanly without duplicate route collision');
+
+  // Assert single update execution path
+  const res = await app.inject({
+    method: 'PATCH',
+    url: '/api/admin/assets/XLM',
+    headers: { 'x-service-token': SECRET, 'x-csrf-check': '1' },
+    payload: { name: 'Updated XLM', isActive: false },
+  });
+
+  t.equal(res.statusCode, 200, 'returns 200 from the single registered handler');
+  const body = JSON.parse(res.body as string);
+  t.equal(body.data.code, 'XLM');
+  t.equal(body.data.name, 'Updated XLM');
+  t.equal(body.data.isActive, false);
+
+  // Assert 404 response path on unknown asset code
+  const notFoundRes = await app.inject({
+    method: 'PATCH',
+    url: '/api/admin/assets/UNKNOWN',
+    headers: { 'x-service-token': SECRET, 'x-csrf-check': '1' },
+    payload: { isActive: false },
+  });
+  t.equal(notFoundRes.statusCode, 404, 'returns 404 for unknown asset');
+
+  await app.close();
+  t.end();
+});
