@@ -59,6 +59,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check source integrity and conflict artifacts
+        run: node scripts/check-source-integrity.mjs
+
       - name: Run lint
         # Only packages that define a lint script are run (--if-present).
         run: pnpm -r --if-present lint

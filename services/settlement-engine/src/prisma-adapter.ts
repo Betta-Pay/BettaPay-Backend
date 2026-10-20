@@ -68,7 +68,7 @@ export class QueryTimeoutError extends Error {
   }
 }
 
-export type CreateSettlementInput = Prisma.SettlementCreateInput;
+export type CreateSettlementInput = Prisma.SettlementUncheckedCreateInput;
 
 /**
  * Wraps a Prisma operation with a statement timeout (#923).
@@ -92,10 +92,14 @@ async function withQueryTimeout<T>(
 ): Promise<T> {
   try {
     // Set statement timeout for this query
-    await prisma.$executeRawUnsafe(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
+    if (typeof (prisma as any).$executeRawUnsafe === 'function') {
+      await (prisma as any).$executeRawUnsafe(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
+    }
     const result = await fn();
     // Clear the timeout after successful query
-    await prisma.$executeRawUnsafe(`SET LOCAL statement_timeout = 0`);
+    if (typeof (prisma as any).$executeRawUnsafe === 'function') {
+      await (prisma as any).$executeRawUnsafe(`SET LOCAL statement_timeout = 0`);
+    }
     return result;
   } catch (err: unknown) {
     const error = err as DatabaseErrorLike;
@@ -167,7 +171,7 @@ export async function createSettlementWithUniqueGuard(
  * timeout to prevent slow queries from holding connection-pool slots.
  */
 export async function updateSettlementWithOptimisticLock<
-  T extends Prisma.SettlementUpdateInput,
+  T extends Prisma.SettlementUncheckedUpdateManyInput,
 >(
   prisma: PrismaLike,
   {
@@ -183,7 +187,7 @@ export async function updateSettlementWithOptimisticLock<
   return withQueryTimeout(prisma, 'updateSettlement', async () => {
     const result = await prisma.settlement.updateMany({
       where: { id, version: expectedVersion },
-      data: { ...data, version: { increment: 1 } },
+      data: { ...data, version: { increment: 1 } } as Prisma.SettlementUncheckedUpdateManyInput,
     });
 
     if (result.count === 0) {
