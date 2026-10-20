@@ -1713,6 +1713,7 @@ const metricsServer = startMetricsServer({
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
+  scrapeToken: env.METRICS_SCRAPE_TOKEN,
 });
 
 const start = async () => {

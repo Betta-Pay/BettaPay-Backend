@@ -4418,6 +4418,7 @@ if (isDirectRun) {
     contentType: promClient.register.contentType,
     getMetrics: () => promClient.register.metrics(),
     log: mainApp.log,
+    scrapeToken: env.METRICS_SCRAPE_TOKEN,
   });
 
   logFeatureFlags(mainApp.log);

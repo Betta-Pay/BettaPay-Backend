@@ -13,11 +13,12 @@
     "lint": "node ../../scripts/lint.mjs"
   },
   "dependencies": {
-    "@bettapay/webhook-delivery": "workspace:*",
-    "@bettapay/worker-shutdown": "workspace:*",
-    "@bettapay/validation": "workspace:*",
+    "@bettapay/webhook-delivery": "workspace:^",
+    "@bettapay/worker-shutdown": "workspace:^",
+    "@bettapay/validation": "workspace:^",
     "@bettapay/shared-types": "workspace:^",
-    "@fastify/cors": "*",
+    "@fastify/cors": "^11.3.1",
+    "@fastify/helmet": "^12.0.1",
     "@fastify/rate-limit": "^11.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "*",
