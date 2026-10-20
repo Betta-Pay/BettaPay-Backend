@@ -10,6 +10,12 @@ import {
   createErrorResponse,
   ErrorCodes,
 } from '@bettapay/validation';
+import {
+  isRequestHttps,
+  getAuthCookieOptions,
+  buildCsrfCookieHeader,
+  setCsrfCookie,
+} from './auth-hardening.js';
 
 interface MerchantRecord {
   id: string;
@@ -445,3 +451,120 @@ test('wallet verification rejects reused nonces and accepts different nonces', a
     t.end();
   }
 });
+
+test('isRequestHttps: correctly detects HTTPS transport from protocol or x-forwarded-proto (#901)', (t) => {
+  // Direct protocol checks
+  t.equal(isRequestHttps({ protocol: 'https' }), true, 'protocol=https returns true');
+  t.equal(isRequestHttps({ protocol: 'http' }), false, 'protocol=http returns false');
+  t.equal(isRequestHttps({ protocol: undefined }), false, 'undefined protocol defaults to false');
+
+  // Forwarded protocol header checks (e.g. behind reverse proxies)
+  t.equal(
+    isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': 'https' } }),
+    true,
+    'x-forwarded-proto=https overrides http protocol',
+  );
+  t.equal(
+    isRequestHttps({ protocol: 'https', headers: { 'x-forwarded-proto': 'http' } }),
+    false,
+    'x-forwarded-proto=http overrides https protocol',
+  );
+  t.equal(
+    isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': ['https', 'http'] } }),
+    true,
+    'array x-forwarded-proto uses first entry',
+  );
+  t.equal(
+    isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': 'HTTPS' } }),
+    true,
+    'case-insensitive header handling',
+  );
+
+  t.end();
+});
+
+test('getAuthCookieOptions: computes secure flag based on HTTPS transport, not NODE_ENV (#901)', (t) => {
+  const origEnv = process.env.NODE_ENV;
+
+  try {
+    // 1. In 'production' over plain HTTP -> secure must be false (keep local/test HTTP functional)
+    process.env.NODE_ENV = 'production';
+    const httpOptsProd = getAuthCookieOptions({ protocol: 'http' });
+    t.equal(httpOptsProd.secure, false, 'HTTP in production sets secure: false');
+    t.equal(httpOptsProd.httpOnly, true, 'preserves HttpOnly: true');
+    t.equal(httpOptsProd.sameSite, 'Strict', 'preserves SameSite: Strict');
+    t.equal(httpOptsProd.path, '/', 'preserves Path: /');
+
+    // 2. In 'development' over HTTPS -> secure must be true (protect HTTPS in any environment)
+    process.env.NODE_ENV = 'development';
+    const httpsOptsDev = getAuthCookieOptions({ protocol: 'https' });
+    t.equal(httpsOptsDev.secure, true, 'HTTPS in development sets secure: true');
+    t.equal(httpsOptsDev.httpOnly, true, 'preserves HttpOnly: true');
+    t.equal(httpsOptsDev.sameSite, 'Strict', 'preserves SameSite: Strict');
+
+    // 3. In 'test' over HTTPS -> secure must be true
+    process.env.NODE_ENV = 'test';
+    const httpsOptsTest = getAuthCookieOptions({
+      protocol: 'http',
+      headers: { 'x-forwarded-proto': 'https' },
+    });
+    t.equal(httpsOptsTest.secure, true, 'proxied HTTPS in test sets secure: true');
+
+    // 4. Overrides are respected
+    const customOpts = getAuthCookieOptions({ protocol: 'https' }, { sameSite: 'Lax', maxAge: 3600 });
+    t.equal(customOpts.secure, true);
+    t.equal(customOpts.sameSite, 'Lax');
+    t.equal(customOpts.maxAge, 3600);
+  } finally {
+    process.env.NODE_ENV = origEnv;
+    t.end();
+  }
+});
+
+test('buildCsrfCookieHeader: sets Secure attribute only when served over HTTPS (#901)', (t) => {
+  // HTTPS request: Secure flag must be present
+  const httpsCookie = buildCsrfCookieHeader('csrf_token', 'test-value-123', {
+    protocol: 'https',
+  });
+  t.ok(httpsCookie.includes('Secure'), 'HTTPS cookie includes Secure flag');
+  t.ok(httpsCookie.includes('csrf_token=test-value-123'), 'includes cookie name and value');
+  t.ok(httpsCookie.includes('Path=/'), 'includes Path=/');
+  t.ok(httpsCookie.includes('SameSite=Strict'), 'includes SameSite=Strict');
+  t.ok(httpsCookie.includes('HttpOnly'), 'includes HttpOnly');
+
+  // Plain HTTP request: Secure flag must be omitted
+  const httpCookie = buildCsrfCookieHeader('csrf_token', 'test-value-123', {
+    protocol: 'http',
+  });
+  t.notOk(httpCookie.includes('Secure'), 'HTTP cookie omits Secure flag');
+  t.ok(httpCookie.includes('csrf_token=test-value-123'), 'includes cookie name and value');
+  t.ok(httpCookie.includes('HttpOnly'), 'includes HttpOnly');
+  t.ok(httpCookie.includes('SameSite=Strict'), 'includes SameSite=Strict');
+
+  t.end();
+});
+
+test('setCsrfCookie: writes correct Set-Cookie header on reply (#901)', (t) => {
+  let headerName = '';
+  let headerValue = '';
+  const fakeReply = {
+    header: (name: string, value: string) => {
+      headerName = name;
+      headerValue = value;
+    },
+  } as any;
+
+  const fakeRequest = {
+    protocol: 'https',
+    headers: {},
+  } as any;
+
+  setCsrfCookie(fakeReply, 'bp_csrf', 'token_xyz', fakeRequest);
+  t.equal(headerName, 'Set-Cookie', 'sets Set-Cookie header name');
+  t.ok(headerValue.includes('bp_csrf=token_xyz'), 'sets token value');
+  t.ok(headerValue.includes('Secure'), 'includes Secure attribute');
+  t.ok(headerValue.includes('HttpOnly'), 'includes HttpOnly attribute');
+
+  t.end();
+});
+

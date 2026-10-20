@@ -82,8 +82,8 @@ importers:
         specifier: workspace:*
         version: link:../../shared/webhook-delivery
       '@fastify/compress':
-        specifier: ^7.0.0
-        version: 7.0.3
+        specifier: ^8.3.1
+        version: 8.3.1
       '@fastify/helmet':
         specifier: ^12.0.0
         version: 12.0.1
