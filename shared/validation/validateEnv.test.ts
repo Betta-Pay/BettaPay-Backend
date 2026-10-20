@@ -185,6 +185,27 @@ test('validateEnv accepts default settlement batching env values', () => {
   const env = validateEnv(validEnv());
   assert.equal(env.BATCH_INTERVAL_SECONDS, 300);
   assert.equal(env.BATCH_MIN_COUNT, 2);
+  // #819 — unset BATCH_VOLUME_THRESHOLD yields the documented default (0).
+  assert.equal(env.BATCH_VOLUME_THRESHOLD, 0);
+});
+
+test('validateEnv coerces BATCH_VOLUME_THRESHOLD to a non-negative integer', () => {
+  const env = validateEnv(validEnv({ BATCH_VOLUME_THRESHOLD: '2500' }));
+  assert.equal(env.BATCH_VOLUME_THRESHOLD, 2500);
+  assert.equal(typeof env.BATCH_VOLUME_THRESHOLD, 'number');
+});
+
+test('validateEnv rejects invalid BATCH_VOLUME_THRESHOLD values', () => {
+  for (const value of ['-1', 'abc', '']) {
+    assert.throws(
+      () => validateEnv(validEnv({ BATCH_VOLUME_THRESHOLD: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /BATCH_VOLUME_THRESHOLD/);
+        return true;
+      },
+    );
+  }
 });
 
 test('validateEnv rejects BATCH_INTERVAL_SECONDS out of range', () => {

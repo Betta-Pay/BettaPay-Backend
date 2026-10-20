@@ -118,10 +118,10 @@ import {
   propagateTracingHeaders,
   auditRouteAuthPolicy,
   installCrashHandlers,
-  FeeScheduleItem,
   MerchantCache,
   getCachedMerchant,
 } from "@bettapay/validation";
+import type { FeeScheduleItem } from "@bettapay/validation";
 import type { PaginatedResponse, ApiResponse, Amount } from '@bettapay/shared-types';
 import { buildPaginationMeta } from '@bettapay/shared-types';
 
