@@ -7,6 +7,7 @@ import {
   CreatePaymentBody,
   CreateSettlementBody,
   DateRangeQuery,
+  FeeScheduleItem,
   IdempotencyKeySchema,
   PaginationQuery,
   PositiveAmountString,
@@ -20,6 +21,9 @@ import {
   isValidTransition,
 } from './schemas.js';
 import { CurrencyCode, validateAmountPrecision, ASSET_DECIMALS } from './currency.js';
+// Barrel import — consumers must resolve FeeScheduleItem from the package
+// surface, not a deep relative path (#820).
+import { FeeScheduleItem as FeeScheduleItemFromBarrel } from './index.js';
 
 const VALID_STELLAR_PUBLIC_KEY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const INVALID_STELLAR_PUBLIC_KEY = 'merchant-1';
@@ -569,4 +573,14 @@ test('validateAmountPrecision', async (t) => {
   await t.test('rejects unknown asset', () => {
     assert.strictEqual(validateAmountPrecision('1.00', 'UNKNOWN'), false);
   });
+});
+
+test('FeeScheduleItem is exported from the validation barrel (#820)', () => {
+  assert.strictEqual(FeeScheduleItemFromBarrel, FeeScheduleItem);
+
+  const parsed = FeeScheduleItemFromBarrel.safeParse({ asset: 'USDC', bps: 100 });
+  assert.strictEqual(parsed.success, true);
+
+  const rejected = FeeScheduleItemFromBarrel.safeParse({ asset: 'USDC', bps: 10001 });
+  assert.strictEqual(rejected.success, false);
 });

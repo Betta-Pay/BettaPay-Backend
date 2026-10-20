@@ -58,9 +58,13 @@ export class MerchantCache<T = Record<string, unknown>> {
  * Read-through helper: returns the cached merchant or fetches it via the
  * supplied `loader` function, caches the result, and returns it.
  *
+ * Argument order is always `id`, then `cache`, then `loader` (#822).
+ *
  * ```ts
- * const merchant = await getCachedMerchant(merchantId, (id) =>
- *   prisma.merchant.findUnique({ where: { id } }),
+ * const merchant = await getCachedMerchant(
+ *   merchantId,
+ *   merchantCache,
+ *   (id) => prisma.merchant.findUnique({ where: { id } }),
  * );
  * ```
  */

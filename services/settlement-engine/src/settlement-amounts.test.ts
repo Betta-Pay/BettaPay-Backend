@@ -169,6 +169,7 @@ test('runtime invariant: inconsistent settlement math throws', (t) => {
   t.throws(() => {
     assertSettlementInvariants({
       grossAmount: '100.00',
+      // 10.01 + 90.00 = 100.01 ≠ 100.00 — deliberately inconsistent
       feeAmount: '10.01',
       netAmount: '90.00',
       feeBps: 100,
