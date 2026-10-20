@@ -56,14 +56,19 @@ Never merge a manifest change without the lockfile update.
 ### Running checks locally
 ```bash
 pnpm install
-pnpm lint               # Lint all packages
-pnpm type-check         # Run TypeScript type checking
+pnpm lint               # Run workspace syntax and pattern linter across all packages (node scripts/lint.mjs)
+pnpm type-check         # Run TypeScript type checking across all workspace packages (pnpm -r type-check)
 pnpm build              # Build the workspace packages
 pnpm test               # Execute the test suite
 pnpm test:load          # Run k6 load tests (requires k6 installed)
 pnpm test:mutation      # Run mutation tests (Stryker)
 pnpm audit --audit-level=high   # Security audit (fails on high/critical)
 ```
+
+### Environment Variables & Ports
+- `PORT`: Service application listener port (e.g. 3000 for api-gateway, 3001 for settlement-engine, 3002 for fx-engine, 3003 for indexer).
+- `METRICS_PORT`: Dedicated Prometheus `/metrics` listener port. Optional; defaults to `PORT + 1000` when unset. Validated as an integer in [0, 65535] (port 0 enables ephemeral port assignment for testing).
+
 
 ## Load testing
 

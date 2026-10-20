@@ -4414,6 +4414,7 @@ if (isDirectRun) {
   promClient.collectDefaultMetrics();
   metricsServer = startMetricsServer({
     appPort: PORT,
+    metricsPort: env.METRICS_PORT,
     contentType: promClient.register.contentType,
     getMetrics: () => promClient.register.metrics(),
     log: mainApp.log,

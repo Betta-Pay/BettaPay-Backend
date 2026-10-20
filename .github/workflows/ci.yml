@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
           cache: 'pnpm'
 
       - name: Ensure lockfile is in sync with workspace manifests
@@ -63,8 +63,7 @@ jobs:
         run: node scripts/check-source-integrity.mjs
 
       - name: Run lint
-        # Only packages that define a lint script are run (--if-present).
-        run: pnpm -r --if-present lint
+        run: pnpm lint
 
   type-check:
     runs-on: ubuntu-latest
@@ -104,10 +103,10 @@ jobs:
         run: pnpm exec prisma migrate diff --from-empty --to-schema prisma/schema.prisma
 
       - name: Build packages
-        run: pnpm -r --if-present build
+        run: pnpm build
 
       - name: Run type checking
-        run: pnpm -r --if-present type-check
+        run: pnpm type-check
 
   test:
     runs-on: ubuntu-latest

@@ -353,6 +353,7 @@ const settlementQueueDepthGauge = new promClient.Gauge({
 // exposing it alongside application traffic.
 const metricsServer = startMetricsServer({
   appPort: PORT,
+  metricsPort: env.METRICS_PORT,
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
