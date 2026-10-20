@@ -36,21 +36,39 @@ Common workflow:
 
 The repository uses **GitHub Actions** to automatically validate every pull request and push to the default branch.
 
-- **Jobs executed**: lint, type‑check, test, migration rollback test, dependency audit, and PR title validation (Conventional Commits).
+- **Jobs executed**: lockfile integrity, lint, type‑check, test, migration rollback test, dependency audit, PR title validation (Conventional Commits), and a scheduled mutation run.
 - **Caching**: pnpm store is cached to speed up installations.
-- **Node.js version**: 20 (configured in the workflow).
+- **Node.js version**: 24 in CI.
+
+### Lockfile integrity
+
+Every dependency manifest change must be accompanied by the corresponding `pnpm-lock.yaml` update. The CI workflow runs a frozen install (`pnpm install --frozen-lockfile`) and fails fast if the lockfile is stale.
+
+Regenerate and commit the lockfile after editing `package.json` or workspace package manifests:
+
+```bash
+pnpm install
+git add pnpm-lock.yaml
+```
+
+Never merge a manifest change without the lockfile update.
 
 ### Running checks locally
 ```bash
 pnpm install
-pnpm lint               # Lint all packages
-pnpm type-check         # Run TypeScript type checking
+pnpm lint               # Run workspace syntax and pattern linter across all packages (node scripts/lint.mjs)
+pnpm type-check         # Run TypeScript type checking across all workspace packages (pnpm -r type-check)
 pnpm build              # Build the workspace packages
 pnpm test               # Execute the test suite
 pnpm test:load          # Run k6 load tests (requires k6 installed)
 pnpm test:mutation      # Run mutation tests (Stryker)
 pnpm audit --audit-level=high   # Security audit (fails on high/critical)
 ```
+
+### Environment Variables & Ports
+- `PORT`: Service application listener port (e.g. 3000 for api-gateway, 3001 for settlement-engine, 3002 for fx-engine, 3003 for indexer).
+- `METRICS_PORT`: Dedicated Prometheus `/metrics` listener port. Optional; defaults to `PORT + 1000` when unset. Validated as an integer in [0, 65535] (port 0 enables ephemeral port assignment for testing).
+
 
 ## Load testing
 
@@ -71,7 +89,7 @@ Run mutation tests with Stryker using the workspace script:
 pnpm test:mutation
 ```
 
-Target mutation score is >= 80% for critical modules (`settlement-amounts.ts`, `shared/validation/schemas.ts`). Address surviving mutants by either strengthening tests or fixing the implementation.
+Baseline mutation score for the expanded critical scope is 80% (measured on the main branch and enforced via Stryker thresholds). Address surviving mutants by either strengthening tests or fixing the implementation.
 
 If any of these commands fail, fix the reported issues before pushing.
 

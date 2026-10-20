@@ -70,30 +70,26 @@ function createLogSpy() {
   };
 }
 
-test('resolveMetricsPort: defaults to appPort + 1000 when METRICS_PORT is unset', () => {
-  delete process.env.METRICS_PORT;
+test('resolveMetricsPort: defaults to appPort + 1000 when metricsPort is unset', () => {
   assert.equal(resolveMetricsPort(3000), 4000);
   assert.equal(resolveMetricsPort(3002), 4002);
 });
 
-test('resolveMetricsPort: honors METRICS_PORT override when set to a valid number', () => {
-  process.env.METRICS_PORT = '9100';
-  assert.equal(resolveMetricsPort(3000), 9100);
-  delete process.env.METRICS_PORT;
+test('resolveMetricsPort: honors metricsPort override when set to a valid number', () => {
+  assert.equal(resolveMetricsPort(3000, 9100), 9100);
+  assert.equal(resolveMetricsPort(3000, 0), 0);
 });
 
-test('resolveMetricsPort: falls back to the default for an invalid METRICS_PORT', () => {
-  process.env.METRICS_PORT = 'not-a-number';
-  assert.equal(resolveMetricsPort(3001), 4001);
-  delete process.env.METRICS_PORT;
+test('resolveMetricsPort: falls back to the default when metricsPort is undefined', () => {
+  assert.equal(resolveMetricsPort(3001, undefined), 4001);
 });
 
 test('startMetricsServer: serves metrics on GET /metrics with the given content type', async () => {
-  process.env.METRICS_PORT = '0'; // ephemeral port, avoids clashing with a real service
   const log = createLogSpy();
   const metricsBody = '# HELP test_metric\ntest_metric 1\n';
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain; version=0.0.4',
     getMetrics: () => metricsBody,
     log,
@@ -110,16 +106,15 @@ test('startMetricsServer: serves metrics on GET /metrics with the given content 
     assert.equal(log.infoCalls.length, 1, 'logs the listening address once');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: non-GET request or path other than /metrics yields HTTP 404 before auth evaluation', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   let getMetricsCalls = 0;
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => {
       getMetricsCalls++;
@@ -154,15 +149,14 @@ test('startMetricsServer: non-GET request or path other than /metrics yields HTT
     assert.equal(getMetricsCalls, 0, 'getMetrics must not be called on 404');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: responds 500 and logs when getMetrics rejects', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => Promise.reject(new Error('boom')),
     log,
@@ -177,14 +171,12 @@ test('startMetricsServer: responds 500 and logs when getMetrics rejects', async 
     assert.equal(log.errorCalls.length, 1);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 // ── Auth tests (#528 & #864) ──────────────────────────────────────────────────
 
 test('startMetricsServer: scrapeToken auth branch with valid Bearer token yields HTTP 200 and exact payload', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   const metricsBody = '# HELP http_requests_total\nhttp_requests_total 42\n';
   const scrapeToken = 'valid-super-secret-token';
@@ -192,6 +184,7 @@ test('startMetricsServer: scrapeToken auth branch with valid Bearer token yields
 
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain; version=0.0.4',
     getMetrics: () => {
       getMetricsCalls++;
@@ -212,17 +205,16 @@ test('startMetricsServer: scrapeToken auth branch with valid Bearer token yields
     assert.equal(getMetricsCalls, 1, 'getMetrics was invoked once for authenticated request');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: scrapeToken set and missing Authorization header yields HTTP 401 without calling getMetrics', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   let getMetricsCalls = 0;
 
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => {
       getMetricsCalls++;
@@ -247,17 +239,16 @@ test('startMetricsServer: scrapeToken set and missing Authorization header yield
     );
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: scrapeToken set and wrong or malformed token yields HTTP 401 with WWW-Authenticate header and no getMetrics call', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   let getMetricsCalls = 0;
 
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => {
       getMetricsCalls++;
@@ -297,18 +288,17 @@ test('startMetricsServer: scrapeToken set and wrong or malformed token yields HT
     assert.equal(getMetricsCalls, 0, 'spy asserts getMetrics was never called for any unauthorized request');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: with scrapeToken omitted, unauthenticated GET /metrics yields HTTP 200', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
   const metricsBody = 'test_metric 2\n';
   let getMetricsCalls = 0;
 
   const server = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => {
       getMetricsCalls++;
@@ -328,16 +318,15 @@ test('startMetricsServer: with scrapeToken omitted, unauthenticated GET /metrics
     assert.equal(getMetricsCalls, 1, 'getMetrics called for unauthenticated request');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });
 
 test('startMetricsServer: logs auth status on startup', async () => {
-  process.env.METRICS_PORT = '0';
   const log = createLogSpy();
 
   const serverWithAuth = startMetricsServer({
     appPort: 3000,
+    metricsPort: 0,
     contentType: 'text/plain',
     getMetrics: () => 'ok',
     scrapeToken: 'my-token',
@@ -352,6 +341,5 @@ test('startMetricsServer: logs auth status on startup', async () => {
     assert.ok(infoCall.msg?.includes('auth required'), 'log message should mention auth required');
   } finally {
     await new Promise<void>((resolve) => serverWithAuth.close(() => resolve()));
-    delete process.env.METRICS_PORT;
   }
 });

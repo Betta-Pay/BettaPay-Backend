@@ -106,6 +106,36 @@ export async function checkPostgresql(
   };
 }
 
+export async function checkPostgresqlReplica(
+  queryFn: () => Promise<unknown>,
+  timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
+): Promise<DependencyHealth & { healthy: boolean; serverVersion: string | null }> {
+  const result = await withLatency(queryFn, timeoutMs);
+  const serverVersion = result.ok ? extractPostgresqlServerVersion(result.value) : null;
+
+  if (result.ok) {
+    return {
+      name: 'postgresql-replica',
+      status: 'connected',
+      latencyMs: result.latencyMs,
+      healthy: true,
+      serverVersion,
+      details: serverVersion ? { serverVersion } : undefined,
+    };
+  }
+
+  return {
+    name: 'postgresql-replica',
+    status: 'disconnected',
+    latencyMs: result.latencyMs,
+    healthy: false,
+    serverVersion: null,
+    details: {
+      error: result.error instanceof Error ? result.error.message : String(result.error),
+    },
+  };
+}
+
 export async function checkRedisPing(
   pingFn: () => Promise<string>,
   timeoutMs = HEALTH_CHECK_TIMEOUT_MS,
@@ -142,6 +172,17 @@ export async function checkRedisPing(
 }
 
 export const BULLMQ_WAITING_DEGRADED_THRESHOLD = 1000;
+
+export function getBullmqWaitingThreshold(): number {
+  const envVal = process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD;
+  if (envVal !== undefined && envVal !== '') {
+    const parsed = parseInt(envVal, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return BULLMQ_WAITING_DEGRADED_THRESHOLD;
+}
 
 export async function checkBullMQ(
   getJobCounts: () => Promise<Record<string, number>>,
@@ -274,11 +315,27 @@ export function buildHealthResponse(params: {
   dependencies: DependencyHealth[];
   upstream?: DependencyHealth[];
   criticalDependencyNames?: string[];
+  replica?: DependencyHealth;
+  waitingJobs?: number;
+  waitingThreshold?: number;
 }): HealthResponse {
   const combined = [...params.dependencies, ...(params.upstream ?? [])];
+
+  // Replica is non-critical so its outage degrades rather than downs the service (#895)
+  const defaultCritical = params.dependencies
+    .map((dep) => dep.name)
+    .filter((name) => name !== 'postgresql-replica' && name !== 'replica');
+  const criticalNames = params.criticalDependencyNames ?? defaultCritical;
+
   let status = computeOverallStatus(combined, {
-    criticalNames: params.criticalDependencyNames ?? params.dependencies.map((dep) => dep.name),
+    criticalNames,
   });
+
+  // Issue #895: Read-replica health detail
+  const replica = params.replica ?? params.dependencies.find((dep) => dep.name === 'postgresql-replica');
+  if (replica && replica.status === 'disconnected' && status === 'healthy') {
+    status = 'degraded';
+  }
 
   const postgresLatencyExceeded = combined.some((dep) =>
     dep.name === 'postgresql' &&
@@ -291,6 +348,17 @@ export function buildHealthResponse(params: {
     status = 'degraded';
   }
 
+  // Issue #896: BullMQ waiting job degradation threshold
+  const waitingFromDeps = params.dependencies.find(
+    (d) => d.details && typeof (d.details as Record<string, unknown>).waiting === 'number',
+  )?.details as { waiting?: number } | undefined;
+  const observedWaiting = params.waitingJobs ?? waitingFromDeps?.waiting;
+  const waitingThreshold = params.waitingThreshold ?? getBullmqWaitingThreshold();
+
+  if (typeof observedWaiting === 'number' && observedWaiting > waitingThreshold && status === 'healthy') {
+    status = 'degraded';
+  }
+
   return {
     status,
     service: params.service,
@@ -299,6 +367,8 @@ export function buildHealthResponse(params: {
     lastDependencyCheck: new Date().toISOString(),
     dependencies: params.dependencies,
     ...(params.upstream?.length ? { upstream: params.upstream } : {}),
+    ...(replica ? { replica } : {}),
+    ...(typeof observedWaiting === 'number' ? { waitingJobs: observedWaiting } : {}),
   };
 }
 
@@ -430,6 +500,7 @@ export async function buildFxEngineHealthResponse(options: {
 
 export async function buildSettlementEngineHealthResponse(options: {
   queryDatabase: () => Promise<unknown>;
+  queryReplicaDatabase?: () => Promise<unknown>;
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
   getQueueIsPaused?: () => Promise<boolean>;
@@ -437,33 +508,50 @@ export async function buildSettlementEngineHealthResponse(options: {
   startTime: number;
   service: string;
   version: string;
+  waitingThreshold?: number;
 }): Promise<HealthResponse> {
-  const { queryDatabase, pingRedis, getQueueJobCounts, getQueueIsPaused, redisHealthState, startTime, service, version } = options;
+  const {
+    queryDatabase,
+    queryReplicaDatabase,
+    pingRedis,
+    getQueueJobCounts,
+    getQueueIsPaused,
+    redisHealthState,
+    startTime,
+    service,
+    version,
+    waitingThreshold,
+  } = options;
 
-  const [postgresql, redisDep, bullmq] = await Promise.all([
+  const [postgresql, replicaDep, redisDep, bullmq] = await Promise.all([
     checkPostgresql(queryDatabase),
+    queryReplicaDatabase ? checkPostgresqlReplica(queryReplicaDatabase) : Promise.resolve(undefined),
     checkRedisPing(pingRedis, HEALTH_CHECK_TIMEOUT_MS, redisHealthState),
     checkBullMQ(getQueueJobCounts, 'bullmq-settlement', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
   ]);
 
-  const health = buildHealthResponse({
+  const dependencies: DependencyHealth[] = [postgresql, redisDep, bullmq];
+  if (replicaDep) {
+    dependencies.push(replicaDep);
+  }
+
+  const waiting = bullmq.details?.waiting;
+
+  return buildHealthResponse({
     service,
     version,
     startTime,
-    dependencies: [postgresql, redisDep, bullmq],
+    dependencies,
     criticalDependencyNames: ['postgresql', 'redis', 'bullmq-settlement'],
+    replica: replicaDep,
+    waitingJobs: typeof waiting === 'number' ? waiting : undefined,
+    waitingThreshold,
   });
-
-  const waiting = bullmq.details?.waiting;
-  if (typeof waiting === 'number' && waiting > BULLMQ_WAITING_DEGRADED_THRESHOLD && health.status === 'healthy') {
-    health.status = 'degraded';
-  }
-
-  return health;
 }
 
 export async function buildIndexerHealthResponse(options: {
   queryDatabase: () => Promise<unknown>;
+  queryReplicaDatabase?: () => Promise<unknown>;
   pingRedis: () => Promise<string>;
   getQueueJobCounts: () => Promise<Record<string, number>>;
   getQueueIsPaused?: () => Promise<boolean>;
@@ -475,9 +563,11 @@ export async function buildIndexerHealthResponse(options: {
   startTime: number;
   service: string;
   version: string;
+  waitingThreshold?: number;
 }): Promise<HealthResponse> {
   const {
     queryDatabase,
+    queryReplicaDatabase,
     pingRedis,
     getQueueJobCounts,
     getQueueIsPaused,
@@ -489,10 +579,12 @@ export async function buildIndexerHealthResponse(options: {
     startTime,
     service,
     version,
+    waitingThreshold,
   } = options;
 
-  const [postgresql, redisDep, bullmq, stellarRpc] = await Promise.all([
+  const [postgresql, replicaDep, redisDep, bullmq, stellarRpc] = await Promise.all([
     checkPostgresql(queryDatabase),
+    queryReplicaDatabase ? checkPostgresqlReplica(queryReplicaDatabase) : Promise.resolve(undefined),
     checkRedisPing(pingRedis, HEALTH_CHECK_TIMEOUT_MS, redisHealthState),
     checkBullMQ(getQueueJobCounts, 'bullmq-webhooks', HEALTH_CHECK_TIMEOUT_MS, getQueueIsPaused),
     checkStellarRpc(getLatestLedger),
@@ -503,12 +595,22 @@ export async function buildIndexerHealthResponse(options: {
       ? latestLedgerSequence - latestLedgerCursor
       : undefined;
 
+  const dependencies: DependencyHealth[] = [postgresql, redisDep, bullmq, stellarRpc];
+  if (replicaDep) {
+    dependencies.push(replicaDep);
+  }
+
+  const waiting = bullmq.details?.waiting;
+
   const health = buildHealthResponse({
     service,
     version,
     startTime,
-    dependencies: [postgresql, redisDep, bullmq, stellarRpc],
+    dependencies,
     criticalDependencyNames: ['postgresql', 'redis', 'bullmq-webhooks', 'stellar-rpc'],
+    replica: replicaDep,
+    waitingJobs: typeof waiting === 'number' ? waiting : undefined,
+    waitingThreshold,
   });
 
   if (lag !== undefined) {
@@ -532,10 +634,6 @@ export async function buildIndexerHealthResponse(options: {
     }
   }
 
-  const waiting = bullmq.details?.waiting;
-  if (typeof waiting === 'number' && waiting > BULLMQ_WAITING_DEGRADED_THRESHOLD && health.status === 'healthy') {
-    health.status = 'degraded';
-  }
-
   return health;
 }
+

@@ -1,4 +1,4 @@
-name: Backend Deploy
+name: Production Deploy
 
 on:
   push:
@@ -10,45 +10,34 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy
+    name: Deploy to Render production
     runs-on: ubuntu-latest
+    environment:
+      name: production
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.8.0
-
-      - name: Get pnpm Store Directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Cache pnpm Modules
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-
-
-      - name: Install Dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Generate Prisma Client
-        run: pnpm prisma generate
-
-      - name: Apply Database Migrations
-        run: pnpm prisma migrate deploy
+      - name: Validate Render deployment secrets
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$RENDER_SERVICE_ID" ]; then
+            echo "::error::Missing RENDER_API_KEY or RENDER_SERVICE_ID secrets for the production Render deployment."
+            exit 1
+          fi
 
-      - name: Build Backend Services
-        run: pnpm build
+      - name: Trigger Render deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          curl --fail --silent --show-error \
+            -X POST "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys" \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache": false}'
+
+      - name: Confirm deployment request accepted
+        run: echo "Render deployment request submitted for the production environment."

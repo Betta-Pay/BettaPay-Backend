@@ -190,3 +190,105 @@ test('updatePrismaPoolMetrics: no alert warning when pool is in healthy range', 
 test('POOL_ALERT_THRESHOLD_RATIO: exported constant is 0.8 (80%)', () => {
   assert.equal(POOL_ALERT_THRESHOLD_RATIO, 0.8);
 });
+
+// ── Issue #898: Prisma pool saturation tests ──────────────────────────────────
+
+test('Issue #898: saturation boundary tests just below (79%), at (80%), and above (81%) threshold', () => {
+  const registry = createMockRegistry();
+  const warnings: Array<{ obj: any; msg?: string }> = [];
+  const logger = {
+    warn: (obj: object, msg?: string) => warnings.push({ obj, msg }),
+  };
+
+  const totalCount = 100;
+
+  // 1. Just below threshold: 79 active / 100 total (79% utilisation, 21 idle, 3 waiting)
+  const belowUsage = { totalCount, idleCount: 21, waitingCount: 3, activeCount: 79 };
+  updatePrismaPoolMetrics(belowUsage, registry, logger);
+
+  // Assert gauge values reflect injected pool usage
+  assert.equal(registry.metricsStore['prisma_pool_used'].getVal(), 79);
+  assert.equal(registry.metricsStore['prisma_pool_idle'].getVal(), 21);
+  assert.equal(registry.metricsStore['prisma_pool_waiting'].getVal(), 3);
+  // Assert normal usage emits no alert
+  assert.equal(warnings.length, 0, 'saturation at 79% (just below 80%) must not trigger alert');
+
+  // 2. Exactly at threshold: 80 active / 100 total (80% utilisation, 20 idle, 5 waiting)
+  const atUsage = { totalCount, idleCount: 20, waitingCount: 5, activeCount: 80 };
+  updatePrismaPoolMetrics(atUsage, registry, logger);
+
+  // Assert gauge values reflect injected pool usage
+  assert.equal(registry.metricsStore['prisma_pool_used'].getVal(), 80);
+  assert.equal(registry.metricsStore['prisma_pool_idle'].getVal(), 20);
+  assert.equal(registry.metricsStore['prisma_pool_waiting'].getVal(), 5);
+  // Assert crossing/reaching threshold emits expected signal
+  assert.equal(warnings.length, 1, 'saturation at 80% (boundary) must trigger alert');
+  assert.equal(warnings[0].msg, 'Prisma pool utilisation above alert threshold — DB latency may increase');
+  assert.equal(warnings[0].obj.activeCount, 80);
+  assert.equal(warnings[0].obj.totalCount, 100);
+  assert.equal(warnings[0].obj.utilisationPct, 80);
+  assert.equal(warnings[0].obj.thresholdPct, 80);
+
+  // 3. Just above threshold: 81 active / 100 total (81% utilisation, 19 idle, 8 waiting)
+  const aboveUsage = { totalCount, idleCount: 19, waitingCount: 8, activeCount: 81 };
+  updatePrismaPoolMetrics(aboveUsage, registry, logger);
+
+  // Assert gauge values reflect injected pool usage
+  assert.equal(registry.metricsStore['prisma_pool_used'].getVal(), 81);
+  assert.equal(registry.metricsStore['prisma_pool_idle'].getVal(), 19);
+  assert.equal(registry.metricsStore['prisma_pool_waiting'].getVal(), 8);
+  // Assert alert signal emitted
+  assert.equal(warnings.length, 2, 'saturation at 81% (above threshold) must trigger alert');
+  assert.equal(warnings[1].obj.activeCount, 81);
+  assert.equal(warnings[1].obj.utilisationPct, 81);
+});
+
+test('Issue #898: steady-state normal usage emits no alerts over repeated updates', () => {
+  const registry = createMockRegistry();
+  const warnings: Array<{ obj: any; msg?: string }> = [];
+  const logger = {
+    warn: (obj: object, msg?: string) => warnings.push({ obj, msg }),
+  };
+
+  const normalStates = [
+    { totalCount: 20, idleCount: 18, waitingCount: 0, activeCount: 2 },  // 10%
+    { totalCount: 20, idleCount: 14, waitingCount: 0, activeCount: 6 },  // 30%
+    { totalCount: 20, idleCount: 10, waitingCount: 0, activeCount: 10 }, // 50%
+    { totalCount: 20, idleCount: 6, waitingCount: 1, activeCount: 14 },  // 70%
+  ];
+
+  for (const state of normalStates) {
+    updatePrismaPoolMetrics(state, registry, logger);
+    assert.equal(registry.metricsStore['prisma_pool_used'].getVal(), state.activeCount);
+    assert.equal(registry.metricsStore['prisma_pool_idle'].getVal(), state.idleCount);
+    assert.equal(registry.metricsStore['prisma_pool_waiting'].getVal(), state.waitingCount);
+  }
+
+  assert.equal(warnings.length, 0, 'steady-state normal usage below threshold must emit 0 alerts');
+});
+
+test('Issue #898: custom saturation threshold ratio asserts alert fires only when ratio is crossed', () => {
+  const warnings: Array<{ obj: any; msg?: string }> = [];
+  const logger = {
+    warn: (obj: object, msg?: string) => warnings.push({ obj, msg }),
+  };
+
+  // Custom 60% threshold
+  const customThreshold = 0.6;
+
+  // Below custom threshold: 59% (59/100)
+  checkPoolAlertThreshold(59, 100, logger, customThreshold);
+  assert.equal(warnings.length, 0);
+
+  // At custom threshold: 60% (60/100)
+  checkPoolAlertThreshold(60, 100, logger, customThreshold);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].obj.utilisationPct, 60);
+  assert.equal(warnings[0].obj.thresholdPct, 60);
+
+  // Above custom threshold: 61% (61/100)
+  checkPoolAlertThreshold(61, 100, logger, customThreshold);
+  assert.equal(warnings.length, 2);
+  assert.equal(warnings[1].obj.utilisationPct, 61);
+});
+

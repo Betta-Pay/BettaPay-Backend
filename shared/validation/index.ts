@@ -23,6 +23,12 @@ export * from './feature-flags.js';
 export * from './startup-checks.js';
 export * from './encryption.js';
 export * from './route-audit.js';
+// Expose the merchant cache through the package entry point so services can
+// import it via "@bettapay/validation" instead of relative paths that break
+// in the built output.
+export * from './merchant-cache.js';
+// FeeScheduleItem (schema + type) is re-exported via `./schemas.js` above so
+// settlement/FX consumers import it from the package barrel only (#820).
 import "dotenv/config";
 
 export function genReqId(req: FastifyRequest | IncomingMessage): string {
@@ -62,6 +68,7 @@ export const ErrorCodes = {
   MERCHANT_STATE_CONFLICT: "MERCHANT_STATE_CONFLICT",
   QUOTE_TOO_YOUNG: "QUOTE_TOO_YOUNG",
   QUOTE_TOO_OLD: "QUOTE_TOO_OLD",
+  WALLET_AUTH_LOCKOUT: "WALLET_AUTH_LOCKOUT",
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -102,6 +109,23 @@ export const EnvSchema = z
       .string()
       .transform((s) => parseInt(s, 10))
       .default("3000"),
+
+    // Metrics server port (#835) — when set, overrides the default derived port
+    // (appPort + 1000). Validated as an integer in the valid TCP port range [0, 65535].
+    // Port 0 is allowed for ephemeral port assignment in tests and dynamic deployments.
+    METRICS_PORT: z
+      .string()
+      .optional()
+      .transform((s) => {
+        if (!s || s.trim() === "") return undefined;
+        return Number(s);
+      })
+      .refine(
+        (val) => val === undefined || (Number.isInteger(val) && val >= 0 && val <= 65535),
+        {
+          message: "METRICS_PORT must be an integer between 0 and 65535",
+        },
+      ),
 
     // Feature flags — comma-separated list of enabled flag names, e.g.
     // "new_settlement_flow,enhanced_fx_quotes". An absent or empty value means
@@ -265,6 +289,16 @@ export const EnvSchema = z
       .string()
       .transform((s) => parseInt(s, 10))
       .default("3"),
+
+    // BullMQ degraded health threshold — waiting jobs strictly above this count
+    // flip service health to degraded (#896).
+    BULLMQ_WAITING_DEGRADED_THRESHOLD: z
+      .string()
+      .transform((s) => parseInt(s, 10))
+      .default("1000")
+      .refine((val) => Number.isFinite(val) && val > 0, {
+        message: "BULLMQ_WAITING_DEGRADED_THRESHOLD must be a positive integer",
+      }),
 
     // Per-merchant concurrent request limiting
     MERCHANT_MAX_CONCURRENCY: z
@@ -458,9 +492,9 @@ export const EnvSchema = z
     // Gross volume that batches an asset even when below BATCH_MIN_COUNT (0 disables).
     BATCH_VOLUME_THRESHOLD: z
       .string()
-      .transform((s) => Number(s))
+      .transform((s) => parseInt(s, 10))
       .default("0")
-      .refine((val) => Number.isFinite(val) && val >= 0, {
+      .refine((val) => Number.isFinite(val) && Number.isInteger(val) && val >= 0, {
         message: "BATCH_VOLUME_THRESHOLD must be >= 0",
       }),
     // Max settlements processed per batching run (0 = unlimited). Remaining
@@ -516,6 +550,9 @@ export const EnvSchema = z
     // the gateway's own disable check (api-gateway/src/index.ts) only matches
     // exactly 'false' or '0' and is left untouched.
     RATE_LIMIT_ENABLED: z.enum(["true", "false", "1", "0"]).default("true"),
+
+    // Webhook test URL allowlist for SSRF prevention (#900).
+    WEBHOOK_TEST_ALLOWED_HOSTS: z.string().default("example.com,*.example.com,webhook.site"),
   })
   .superRefine((data, ctx) => {
     if (data.QUOTE_MIN_AGE_MS >= data.QUOTE_MAX_LIFETIME_MS) {
@@ -602,12 +639,13 @@ export const EnvSchema = z
 
 export type Env = Omit<
   z.infer<typeof EnvSchema>,
-  "ALLOWED_ORIGINS" | "CONTRACT_IDS" | "FEATURE_FLAGS" | "ALLOWED_EMAIL_DOMAINS"
+  "ALLOWED_ORIGINS" | "CONTRACT_IDS" | "FEATURE_FLAGS" | "ALLOWED_EMAIL_DOMAINS" | "WEBHOOK_TEST_ALLOWED_HOSTS"
 > & {
   ALLOWED_ORIGINS: string[];
   CONTRACT_IDS: string[];
   ALLOWED_EMAIL_DOMAINS: string[];
   FEATURE_FLAGS: string[];
+  WEBHOOK_TEST_ALLOWED_HOSTS: string[];
 };
 
 // For string length issues, appends the received length (e.g. "(got 8)") rather
@@ -673,6 +711,11 @@ export function validateEnv(env: Record<string, unknown>): Env {
             .map((f) => f.trim().toLowerCase())
             .filter(Boolean)
         : [],
+      WEBHOOK_TEST_ALLOWED_HOSTS: parsed.WEBHOOK_TEST_ALLOWED_HOSTS
+        ? parsed.WEBHOOK_TEST_ALLOWED_HOSTS.split(",")
+            .map((h) => h.trim().toLowerCase())
+            .filter(Boolean)
+        : ["example.com", "*.example.com", "webhook.site"],
     };
   } catch (error) {
     if (error instanceof z.ZodError) {

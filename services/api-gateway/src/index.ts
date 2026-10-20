@@ -153,16 +153,6 @@ import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
 import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
 
-// Issue #889 — HTTP request duration histogram for the gateway.
-// Registered at module scope so the same instance is used across calls to
-// buildApp (test isolation uses promClient.register.clear() when needed).
-const httpRequestDurationHistogram = new promClient.Histogram({
-  name: "http_request_duration_seconds",
-  help: "Duration of HTTP requests handled by the API gateway",
-  labelNames: ["method", "route", "status_code"] as const,
-  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
-});
-
 declare module "fastify" {
   export interface FastifyInstance {
     authenticate: (
@@ -1832,6 +1822,13 @@ export function buildApp(opts: AppOptions = {}) {
   });
 });
 
+  // Wallet auth challenges are stored in Redis under a TTL (#554), so they
+  // expire on their own, are visible to every gateway instance, and are
+  // consumed by the first verification attempt.
+  const walletChallenges = new WalletChallengeStore(redis, {
+    ttlMs: WALLET_CHALLENGE_TTL_MS,
+  });
+
 fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verify', {
   preHandler: [enforceAuthIpReputation],
   config: { rateLimit: { max: 30, timeWindow: '1 minute' } }
@@ -1844,12 +1841,25 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     throw err;
   }
 
+  // ── Lockout backoff check (#902) ──────────────────────────────────────────
+  if (await walletChallenges.isLockedOut(d.address)) {
+    reply.header("Retry-After", "900");
+    return reply
+      .code(429)
+      .send(
+        createErrorResponse(
+          ErrorCodes.WALLET_AUTH_LOCKOUT,
+          "Too many failed wallet authentication attempts. Address is temporarily locked out.",
+        ),
+      );
+  }
+
   // Atomically claim the server-issued challenge for this address. This is the
   // replay control: a captured, already-verified signed challenge finds
   // nothing here on a second attempt (#469).
-  let stored;
+  let consumed;
   try {
-    stored = await consumeWalletChallenge(redis, d.address);
+    consumed = await walletChallenges.consume(d.address);
   } catch (err) {
     request.log.error({ err }, 'Failed to read wallet challenge from Redis');
     return reply
@@ -1862,8 +1872,9 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
       );
   }
 
-  if (!stored) {
+  if (consumed.status === "not_found") {
     await recordAuthIpFailure(request);
+    await walletChallenges.recordFailure(d.address);
     return reply
       .code(409)
       .send(
@@ -1871,15 +1882,19 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
       );
   }
 
-  if (Date.now() > stored.expiresAt) {
+  if (consumed.status === "expired") {
     await recordAuthIpFailure(request);
+    await walletChallenges.recordFailure(d.address);
     return reply
       .code(400)
       .send(createErrorResponse("CHALLENGE_EXPIRED", 'Challenge expired'));
   }
 
+  const stored = consumed.challenge;
+
   if (stored.address !== d.address) {
     await recordAuthIpFailure(request);
+    await walletChallenges.recordFailure(d.address);
     return reply
       .code(400)
       .send(
@@ -1890,6 +1905,7 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   // If the client echoed a challenge, it must be the one we issued.
   if (d.challenge && d.challenge !== stored.challenge) {
     await recordAuthIpFailure(request);
+    await walletChallenges.recordFailure(d.address);
     return reply
       .code(409)
       .send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Challenge does not match the one issued'));
@@ -1898,9 +1914,13 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   // Verify against the *stored* challenge string, never the client-supplied one.
   if (!verifyWalletSignature(d.address, stored.challenge, d.signature)) {
     await recordAuthIpFailure(request);
+    await walletChallenges.recordFailure(d.address);
     markAuthRejected(request);
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Invalid wallet signature'));
   }
+
+  // Reset lockout failure count on successful authentication (#902)
+  await walletChallenges.resetFailures(d.address);
 
   // Defence in depth: also burn the raw nonce (challenge consume already made
   // replay impossible, but a used-nonce record survives a challenge-store flush).
@@ -1938,13 +1958,6 @@ fastify.get('/api/admin/auth/ip-score', {
   const { ip } = AuthIpScoreQuery.parse(request.query ?? {});
   return { ip, score: await getAuthIpScore(ip) };
 });
-
-  // Wallet auth challenges are stored in Redis under a TTL (#554), so they
-  // expire on their own, are visible to every gateway instance, and are
-  // consumed by the first verification attempt.
-  const walletChallenges = new WalletChallengeStore(redis, {
-    ttlMs: WALLET_CHALLENGE_TTL_MS,
-  });
 
   interface WalletChallengeRouteBody {
     address?: unknown;
@@ -1999,6 +2012,34 @@ fastify.get('/api/admin/auth/ip-score', {
     async (request, reply) => {
       const d = LegacyWalletVerifyBody.parse(request.body);
 
+      // ── Check lockout backoff (#902) ──────────────────────────────────────────
+      try {
+        if (await walletChallenges.isLockedOut(d.address)) {
+          reply.header("Retry-After", "900");
+          return reply
+            .code(429)
+            .send(
+              createErrorResponse(
+                ErrorCodes.WALLET_AUTH_LOCKOUT,
+                "Too many failed wallet authentication attempts. Address is temporarily locked out.",
+              ),
+            );
+        }
+      } catch (err) {
+        request.log.error(
+          { err, address: d.address },
+          "[Auth] Unable to check wallet lockout",
+        );
+        return reply
+          .code(503)
+          .send(
+            createErrorResponse(
+              ErrorCodes.INTERNAL_ERROR,
+              "Authentication service unavailable",
+            ),
+          );
+      }
+
       // Consuming is atomic: the challenge is gone whatever happens next, so
       // it is single-use and a signature cannot be guessed at repeatedly
       // against one outstanding challenge (#554).
@@ -2021,6 +2062,7 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       if (consumed.status === "not_found") {
+        await walletChallenges.recordFailure(d.address);
         return reply
           .code(400)
           .send(
@@ -2032,6 +2074,7 @@ fastify.get('/api/admin/auth/ip-score', {
       }
 
       if (consumed.status === "expired") {
+        await walletChallenges.recordFailure(d.address);
         return reply
           .code(400)
           .send(
@@ -2051,6 +2094,7 @@ fastify.get('/api/admin/auth/ip-score', {
           Buffer.from(d.signature, "hex"),
         );
         if (!isValid) {
+          await walletChallenges.recordFailure(d.address);
           return reply
             .code(401)
             .send(
@@ -2058,12 +2102,16 @@ fastify.get('/api/admin/auth/ip-score', {
             );
         }
       } catch (err) {
+        await walletChallenges.recordFailure(d.address);
         return reply
           .code(401)
           .send(
             createErrorResponse(ErrorCodes.UNAUTHORIZED, "Invalid signature"),
           );
       }
+
+      // Reset lockout failure count on successful authentication (#902)
+      await walletChallenges.resetFailures(d.address);
 
       let merchant;
       try {
@@ -2877,6 +2925,22 @@ fastify.get('/api/admin/auth/ip-score', {
             createErrorResponse(
               ErrorCodes.MERCHANT_SUSPENDED,
               "Merchant is suspended",
+            ),
+          );
+      }
+
+      // ── 1c. Authenticated merchant must own the supplied payer context (#899) ──
+      const callerOwnerId = (request.user as MerchantJwtPayload | undefined)?.ownerId;
+      const callerMerchantId = (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isAdmin && (!callerOwnerId || callerOwnerId !== merchant.ownerId)) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "Authenticated merchant does not own the supplied payer context",
             ),
           );
       }
@@ -4350,6 +4414,7 @@ if (isDirectRun) {
   promClient.collectDefaultMetrics();
   metricsServer = startMetricsServer({
     appPort: PORT,
+    metricsPort: env.METRICS_PORT,
     contentType: promClient.register.contentType,
     getMetrics: () => promClient.register.metrics(),
     log: mainApp.log,
