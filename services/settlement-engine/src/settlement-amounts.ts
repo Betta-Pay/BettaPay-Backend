@@ -214,8 +214,8 @@ export function computeSettlementAmounts(
 
   const result: SettlementAmounts = {
     grossAmount: grossAmountStr, // exact original — zero rounding
-    feeAmount: feeStr,
-    netAmount: netStr,
+    feeAmount: feeStr as Amount,
+    netAmount: netStr as Amount,
     feeSnapshot,
   };
 
@@ -269,3 +269,103 @@ export function computeSettlementAmountsWithSchedule(
   const feeBps = resolveFeeBpsForAsset(asset, feeSchedules, defaultBps);
   return computeSettlementAmounts(grossAmountStr, feeBps, 0, [], asset);
 }
+
+export interface ReconcileRecordLike {
+  id: string;
+  grossAmount?: unknown;
+  totalAmount?: unknown;
+  feeAmount?: unknown;
+  netAmount?: unknown;
+  [key: string]: unknown;
+}
+
+export interface ReconcileDiffResult {
+  matchedIds: Set<string>;
+  mismatched: Array<{
+    id: string;
+    ledger: {
+      grossAmount?: unknown;
+      feeAmount?: unknown;
+      netAmount?: unknown;
+    };
+    expected: {
+      grossAmount?: unknown;
+      feeAmount?: unknown;
+      netAmount?: unknown;
+    };
+    diffs: string[];
+  }>;
+}
+
+/**
+ * Reconciles local ledger settlements against expected gateway records.
+ * Derives matchedIds from reconciliation rows whose ledger and expected amounts agree.
+ * Derives mismatched from rows whose ledger and expected amounts differ.
+ */
+export function computeReconciliationDiff(
+  localRecords: ReconcileRecordLike[],
+  gatewayRecords: ReconcileRecordLike[],
+): ReconcileDiffResult {
+  const localMap = new Map<string, ReconcileRecordLike>();
+  for (const r of localRecords) {
+    localMap.set(r.id, r);
+  }
+
+  const gatewayMap = new Map<string, ReconcileRecordLike>();
+  for (const r of gatewayRecords) {
+    gatewayMap.set(r.id, r);
+  }
+
+  const parseBN = (val: unknown): BigNumber => {
+    const bn = new BigNumber((val as string) ?? 0);
+    return bn.isFinite() ? bn : new BigNumber(0);
+  };
+
+  const matchedIds = new Set<string>();
+  const mismatched: ReconcileDiffResult['mismatched'] = [];
+
+  for (const [id, localRec] of localMap) {
+    const gatewayRec = gatewayMap.get(id);
+    if (!gatewayRec) continue;
+
+    const ledgerGross = parseBN(localRec.grossAmount ?? localRec.totalAmount);
+    const ledgerFee = parseBN(localRec.feeAmount);
+    const ledgerNet = parseBN(localRec.netAmount);
+
+    const expectedGross = parseBN(gatewayRec.grossAmount ?? gatewayRec.totalAmount);
+    const expectedFee = parseBN(gatewayRec.feeAmount);
+    const expectedNet = parseBN(gatewayRec.netAmount);
+
+    const amountsAgree =
+      ledgerGross.isEqualTo(expectedGross) &&
+      ledgerFee.isEqualTo(expectedFee) &&
+      ledgerNet.isEqualTo(expectedNet);
+
+    if (amountsAgree) {
+      matchedIds.add(id);
+    } else {
+      const diffs: string[] = [];
+      if (!ledgerGross.isEqualTo(expectedGross)) diffs.push('grossAmount');
+      if (!ledgerFee.isEqualTo(expectedFee)) diffs.push('feeAmount');
+      if (!ledgerNet.isEqualTo(expectedNet)) diffs.push('netAmount');
+
+      mismatched.push({
+        id,
+        ledger: {
+          grossAmount: localRec.grossAmount ?? localRec.totalAmount,
+          feeAmount: localRec.feeAmount,
+          netAmount: localRec.netAmount,
+        },
+        expected: {
+          grossAmount: gatewayRec.grossAmount ?? gatewayRec.totalAmount,
+          feeAmount: gatewayRec.feeAmount,
+          netAmount: gatewayRec.netAmount,
+        },
+        diffs,
+      });
+    }
+  }
+
+  return { matchedIds, mismatched };
+}
+

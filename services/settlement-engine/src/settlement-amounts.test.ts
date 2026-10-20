@@ -170,7 +170,7 @@ test('runtime invariant: inconsistent settlement math throws', (t) => {
     assertSettlementInvariants({
       grossAmount: '100.00',
       feeAmount: '10.01',
-      netAmount: '89.99',
+      netAmount: '90.00',
       feeBps: 100,
     });
   }, /feeAmount \+ netAmount === grossAmount/i, 'invalid settlement math is rejected at runtime');
