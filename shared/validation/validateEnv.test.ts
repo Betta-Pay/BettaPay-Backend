@@ -185,6 +185,27 @@ test('validateEnv accepts default settlement batching env values', () => {
   const env = validateEnv(validEnv());
   assert.equal(env.BATCH_INTERVAL_SECONDS, 300);
   assert.equal(env.BATCH_MIN_COUNT, 2);
+  // #819 — unset BATCH_VOLUME_THRESHOLD yields the documented default (0).
+  assert.equal(env.BATCH_VOLUME_THRESHOLD, 0);
+});
+
+test('validateEnv coerces BATCH_VOLUME_THRESHOLD to a non-negative integer', () => {
+  const env = validateEnv(validEnv({ BATCH_VOLUME_THRESHOLD: '2500' }));
+  assert.equal(env.BATCH_VOLUME_THRESHOLD, 2500);
+  assert.equal(typeof env.BATCH_VOLUME_THRESHOLD, 'number');
+});
+
+test('validateEnv rejects invalid BATCH_VOLUME_THRESHOLD values', () => {
+  for (const value of ['-1', 'abc', '']) {
+    assert.throws(
+      () => validateEnv(validEnv({ BATCH_VOLUME_THRESHOLD: value })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /BATCH_VOLUME_THRESHOLD/);
+        return true;
+      },
+    );
+  }
 });
 
 test('validateEnv rejects BATCH_INTERVAL_SECONDS out of range', () => {
@@ -213,29 +234,23 @@ test('validateEnv rejects BATCH_MIN_COUNT out of range', () => {
   }
 });
 
-test('validateEnv accepts default PAYMENT_ABANDONMENT_HOURS of 24', () => {
-  const env = validateEnv(validEnv());
-  assert.equal(env.PAYMENT_ABANDONMENT_HOURS, 24);
+test('validateEnv accepts valid BULLMQ_WAITING_DEGRADED_THRESHOLD and defaults to 1000', () => {
+  const envDefault = validateEnv(validEnv());
+  assert.equal(envDefault.BULLMQ_WAITING_DEGRADED_THRESHOLD, 1000);
+
+  const envCustom = validateEnv(validEnv({ BULLMQ_WAITING_DEGRADED_THRESHOLD: '500' }));
+  assert.equal(envCustom.BULLMQ_WAITING_DEGRADED_THRESHOLD, 500);
 });
 
-test('validateEnv parses valid PAYMENT_ABANDONMENT_HOURS', () => {
-  const env = validateEnv(validEnv({ PAYMENT_ABANDONMENT_HOURS: '48' }));
-  assert.equal(env.PAYMENT_ABANDONMENT_HOURS, 48);
-});
-
-test('validateEnv rejects PAYMENT_ABANDONMENT_HOURS out of range or malformed', () => {
-  for (const value of ['0', '-1', '169', 'abc', '24.5']) {
+test('validateEnv rejects non-positive or invalid BULLMQ_WAITING_DEGRADED_THRESHOLD', () => {
+  for (const value of ['0', '-1', '-100', 'abc']) {
     assert.throws(
-      () => validateEnv(validEnv({ PAYMENT_ABANDONMENT_HOURS: value })),
+      () => validateEnv(validEnv({ BULLMQ_WAITING_DEGRADED_THRESHOLD: value })),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /PAYMENT_ABANDONMENT_HOURS/);
+        assert.match(error.message, /BULLMQ_WAITING_DEGRADED_THRESHOLD/);
         return true;
       },
     );
   }
 });
-
-
-
-

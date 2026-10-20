@@ -298,11 +298,12 @@ test('serviceAuth rejection log includes route, caller hint, and reason (#893)',
     error: () => {},
     debug: () => {},
     trace: () => {},
+    fatal: () => {},
     child: () => capturingLogger,
     level: 'warn',
   };
 
-  const app = Fastify({ logger: capturingLogger as any });
+  const app = Fastify({ loggerInstance: capturingLogger as any });
   registerServiceAuth(app, 'correct-secret');
   app.get('/internal', { preValidation: [app.serviceAuth] }, async () => ({ ok: true }));
 

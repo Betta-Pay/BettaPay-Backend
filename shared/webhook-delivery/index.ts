@@ -66,6 +66,22 @@
 
 import { Queue, Worker, type ConnectionOptions, type WorkerOptions, type QueueOptions } from 'bullmq';
 import crypto from 'crypto';
+import { performance } from 'node:perf_hooks';
+import client from 'prom-client';
+
+/**
+ * Prometheus histogram recording webhook delivery duration in seconds (#897).
+ * Labels series to distinguish successful from failed deliveries and attempts.
+ * Buckets cover the expected retry and timeout window (0.05 s to 10 s).
+ */
+export const webhookDeliveryDurationSeconds: client.Histogram<string> =
+  (client.register.getSingleMetric('webhook_delivery_duration_seconds') as client.Histogram<string>) ??
+  new client.Histogram({
+    name: 'webhook_delivery_duration_seconds',
+    help: 'Webhook delivery duration in seconds partitioned by status and attempt',
+    labelNames: ['status', 'attempt'],
+    buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
+  });
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -430,6 +446,8 @@ export function createWebhookWorker(
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const start = performance.now();
+      let observed = false;
 
       try {
         const response = await fetchImpl(url, {
@@ -439,15 +457,35 @@ export function createWebhookWorker(
           signal: controller.signal,
         });
 
+        const durationSeconds = (performance.now() - start) / 1000;
+
         if (!response.ok) {
+          webhookDeliveryDurationSeconds.observe(
+            { status: 'failed', attempt: String(attempt) },
+            durationSeconds,
+          );
+          observed = true;
           // Throw so BullMQ marks this attempt failed and schedules a retry.
           throw new Error(
             `[webhook-delivery] HTTP ${response.status} from ${url} — job ${job.id} attempt ${attempt}`,
           );
         }
 
+        webhookDeliveryDurationSeconds.observe(
+          { status: 'success', attempt: String(attempt) },
+          durationSeconds,
+        );
+        observed = true;
+
         logger?.info({ url, jobId: job.id, attempt, status: response.status, eventId, traceId: job.data.traceId }, '[webhook-delivery] Webhook delivered');
       } catch (err) {
+        if (!observed) {
+          const durationSeconds = (performance.now() - start) / 1000;
+          webhookDeliveryDurationSeconds.observe(
+            { status: 'failed', attempt: String(attempt) },
+            durationSeconds,
+          );
+        }
         logger?.warn(
           { url, jobId: job.id, attempt, eventId, traceId: job.data.traceId, err: err instanceof Error ? err.message : String(err) },
           '[webhook-delivery] Delivery attempt failed — BullMQ will retry',

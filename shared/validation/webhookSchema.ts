@@ -1,7 +1,186 @@
 import { z } from 'zod';
 import { Redis } from 'ioredis';
 import dns from 'node:dns';
+import net from 'node:net';
 import { createValidationContext } from './envAwareSchema.js';
+
+/**
+ * Checks whether an IP address belongs to private, loopback, link-local,
+ * multicast, reserved, or cloud metadata address ranges.
+ */
+export function isPrivateOrRestrictedIp(ip: string): boolean {
+  const family = net.isIP(ip);
+  if (!family) return false;
+
+  if (family === 4) {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
+      return true;
+    }
+    const [b0, b1] = parts;
+    // 0.0.0.0/8 (current network)
+    if (b0 === 0) return true;
+    // 10.0.0.0/8 (private)
+    if (b0 === 10) return true;
+    // 100.64.0.0/10 (carrier-grade NAT)
+    if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
+    // 127.0.0.0/8 (loopback)
+    if (b0 === 127) return true;
+    // 169.254.0.0/16 (link-local / cloud metadata e.g. 169.254.169.254)
+    if (b0 === 169 && b1 === 254) return true;
+    // 172.16.0.0/12 (private 172.16.0.0 - 172.31.255.255)
+    if (b0 === 172 && b1 >= 16 && b1 <= 31) return true;
+    // 192.0.0.0/24, 192.0.2.0/24 (TEST-NET-1)
+    if (b0 === 192 && b1 === 0) return true;
+    // 192.168.0.0/16 (private)
+    if (b0 === 192 && b1 === 168) return true;
+    // 198.18.0.0/15 (benchmarking)
+    if (b0 === 198 && (b1 === 18 || b1 === 19)) return true;
+    // 198.51.100.0/24 (TEST-NET-2)
+    if (b0 === 198 && b1 === 51) return true;
+    // 203.0.113.0/24 (TEST-NET-3)
+    if (b0 === 203 && b1 === 0) return true;
+    // 224.0.0.0/4 (multicast)
+    if (b0 >= 224 && b0 <= 239) return true;
+    // 240.0.0.0/4 (reserved)
+    if (b0 >= 240) return true;
+    return false;
+  }
+
+  if (family === 6) {
+    const lower = ip.toLowerCase();
+    // Unspecified / loopback
+    if (lower === '::' || lower === '::1' || lower === '0:0:0:0:0:0:0:1' || lower === '0:0:0:0:0:0:0:0') {
+      return true;
+    }
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1)
+    if (lower.startsWith('::ffff:')) {
+      const v4Part = lower.slice(7);
+      if (net.isIPv4(v4Part)) {
+        return isPrivateOrRestrictedIp(v4Part);
+      }
+    }
+    // Unique local (fc00::/7)
+    if (/^f[cd][0-9a-f]{2}:/i.test(lower) || lower.startsWith('fc') || lower.startsWith('fd')) {
+      return true;
+    }
+    // Link-local (fe80::/10)
+    if (/^fe[89ab][0-9a-f]:/i.test(lower)) {
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Checks whether a hostname matches the configurable host allowlist.
+ * Supports exact hostname matches and wildcards (*.example.com or *).
+ */
+export function isHostAllowed(host: string, allowedHosts: string[]): boolean {
+  if (!allowedHosts || allowedHosts.length === 0) return false;
+  const normalizedHost = host.toLowerCase().trim();
+  for (const pattern of allowedHosts) {
+    const p = pattern.toLowerCase().trim();
+    if (p === '*') return true;
+    if (p.startsWith('*.')) {
+      const suffix = p.slice(1);
+      if (normalizedHost.endsWith(suffix) || normalizedHost === p.slice(2)) {
+        return true;
+      }
+    } else if (normalizedHost === p) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export interface WebhookTestTargetValidation {
+  allowed: boolean;
+  reason?: string;
+}
+
+/**
+ * Validates a target URL for the indexer webhook test endpoint (#900).
+ * Enforces scheme allowlist (http/https), host allowlist, and blocks
+ * private, loopback, link-local, and metadata IP addresses.
+ */
+export async function validateWebhookTestTarget(
+  urlString: string,
+  allowedHosts: string[],
+  dnsResolver?: (hostname: string) => Promise<string[]>,
+): Promise<WebhookTestTargetValidation> {
+  let url: URL;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return { allowed: false, reason: 'Invalid target URL format' };
+  }
+
+  // 1. Validate scheme against http and https
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return {
+      allowed: false,
+      reason: `Invalid URL scheme "${url.protocol}". Only http and https are allowed.`,
+    };
+  }
+
+  const hostname = url.hostname;
+
+  // 2. Validate host against configurable host allowlist
+  if (!isHostAllowed(hostname, allowedHosts)) {
+    return {
+      allowed: false,
+      reason: `Host "${hostname}" is not in the webhook test allowlist.`,
+    };
+  }
+
+  // If hostname is directly an IP, verify it is not private/restricted
+  if (net.isIP(hostname)) {
+    if (isPrivateOrRestrictedIp(hostname)) {
+      return {
+        allowed: false,
+        reason: `IP address "${hostname}" is in a private, loopback, or metadata range.`,
+      };
+    }
+    return { allowed: true };
+  }
+
+  // 3. DNS resolution & blocking private/loopback/metadata ranges
+  try {
+    const resolve =
+      dnsResolver ??
+      (async (host: string) => {
+        const results = await dns.promises.lookup(host, { all: true });
+        return results.map((r) => r.address);
+      });
+
+    const addresses = await resolve(hostname);
+    if (!addresses || addresses.length === 0) {
+      return {
+        allowed: false,
+        reason: `Could not resolve hostname "${hostname}".`,
+      };
+    }
+
+    for (const ip of addresses) {
+      if (isPrivateOrRestrictedIp(ip)) {
+        return {
+          allowed: false,
+          reason: `Resolved IP "${ip}" for host "${hostname}" is in a private, loopback, or metadata range.`,
+        };
+      }
+    }
+  } catch (err: any) {
+    return {
+      allowed: false,
+      reason: `DNS resolution failed for host "${hostname}": ${err?.message || String(err)}`,
+    };
+  }
+
+  return { allowed: true };
+}
 
 const PRIVATE_HOST_PATTERN =
   /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|::1|\[::1\]|0\.0\.0\.0)$/i;

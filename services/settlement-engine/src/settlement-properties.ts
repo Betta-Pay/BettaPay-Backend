@@ -139,20 +139,18 @@ export function validateQueryTimeout(): void {
   }
 }
 
-export const DEFAULT_MERCHANT_MAX_CONCURRENCY = 10;
-
 /**
- * Resolves the maximum concurrent settlement batch jobs allowed per merchant.
- * Reads MERCHANT_MAX_CONCURRENCY from environment or falls back to default.
+ * Settlement Engine merchant max concurrency (#839).
+ * Resolves MERCHANT_MAX_CONCURRENCY from validated environment or defaults to 10.
  */
-export function getMerchantMaxConcurrency(envVal?: string): number {
-  const val = envVal ?? process.env.MERCHANT_MAX_CONCURRENCY;
-  if (val) {
-    const parsed = parseInt(val, 10);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return parsed;
+export function getMerchantMaxConcurrency(env?: { MERCHANT_MAX_CONCURRENCY?: number | string }): number {
+  const raw = env?.MERCHANT_MAX_CONCURRENCY ?? process.env.MERCHANT_MAX_CONCURRENCY;
+  if (raw !== undefined && raw !== null && raw !== '') {
+    const val = Number(raw);
+    if (Number.isFinite(val) && val > 0) {
+      return Math.floor(val);
     }
   }
-  return DEFAULT_MERCHANT_MAX_CONCURRENCY;
+  return 10;
 }
 

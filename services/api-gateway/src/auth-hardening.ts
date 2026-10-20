@@ -33,6 +33,90 @@ export interface WalletChallengeInput {
   nonce?: string;
 }
 
+export interface CookieFlagOptions {
+  path?: string;
+  sameSite?: "Strict" | "Lax" | "None" | "strict" | "lax" | "none";
+  httpOnly?: boolean;
+  maxAge?: number;
+}
+
+/**
+ * Detects whether an incoming request was served over HTTPS, checking
+ * the request protocol and trusted `x-forwarded-proto` header (#901).
+ */
+export function isRequestHttps(request: {
+  protocol?: string;
+  headers?: Record<string, string | string[] | undefined>;
+}): boolean {
+  const forwardedProto = Array.isArray(request.headers?.["x-forwarded-proto"])
+    ? request.headers!["x-forwarded-proto"][0]
+    : request.headers?.["x-forwarded-proto"];
+  const proto = forwardedProto || request.protocol || "http";
+  return proto.toLowerCase() === "https";
+}
+
+/**
+ * Centralized auth cookie option generator (#901).
+ * Computes the `secure` attribute based on transport scheme (HTTPS vs HTTP),
+ * preserving existing SameSite and HttpOnly defaults.
+ */
+export function getAuthCookieOptions(
+  request: {
+    protocol?: string;
+    headers?: Record<string, string | string[] | undefined>;
+  },
+  overrides?: CookieFlagOptions,
+) {
+  const isHttps = isRequestHttps(request);
+  return {
+    path: overrides?.path ?? "/",
+    sameSite: overrides?.sameSite ?? "Strict",
+    httpOnly: overrides?.httpOnly ?? true,
+    secure: isHttps,
+    ...(overrides?.maxAge !== undefined ? { maxAge: overrides.maxAge } : {}),
+  };
+}
+
+/**
+ * Builds a Set-Cookie header string for a CSRF cookie with transport-aware
+ * Secure flag (#901). Keeps SameSite=Strict and HttpOnly intact.
+ */
+export function buildCsrfCookieHeader(
+  name: string,
+  value: string,
+  request: {
+    protocol?: string;
+    headers?: Record<string, string | string[] | undefined>;
+  },
+  options?: CookieFlagOptions,
+): string {
+  const opts = getAuthCookieOptions(request, options);
+  const parts = [`${name}=${value}`, `Path=${opts.path}`, `SameSite=${opts.sameSite}`];
+  if (opts.httpOnly) {
+    parts.push("HttpOnly");
+  }
+  if (opts.secure) {
+    parts.push("Secure");
+  }
+  if (opts.maxAge !== undefined) {
+    parts.push(`Max-Age=${opts.maxAge}`);
+  }
+  return parts.join("; ");
+}
+
+/**
+ * Sets a CSRF cookie on the reply using transport-aware Secure flag (#901).
+ */
+export function setCsrfCookie(
+  reply: FastifyReply,
+  name: string,
+  value: string,
+  request: FastifyRequest,
+  options?: CookieFlagOptions,
+): void {
+  reply.header("Set-Cookie", buildCsrfCookieHeader(name, value, request, options));
+}
+
 export interface MerchantAuthHelpers {
   signMerchantJwt: (merchantId: string, ownerId: string) => string;
   getAuthIpScore: (ip: string) => Promise<number>;
@@ -53,6 +137,40 @@ export interface MerchantAuthHelpers {
     challenge: string,
     signature: string,
   ) => boolean;
+  isRequestHttps: (request: {
+    protocol?: string;
+    headers?: Record<string, string | string[] | undefined>;
+  }) => boolean;
+  getAuthCookieOptions: (
+    request: {
+      protocol?: string;
+      headers?: Record<string, string | string[] | undefined>;
+    },
+    overrides?: CookieFlagOptions,
+  ) => ReturnType<typeof getAuthCookieOptions>;
+  buildCsrfCookieHeader: (
+    name: string,
+    value: string,
+    request: {
+      protocol?: string;
+      headers?: Record<string, string | string[] | undefined>;
+    },
+    options?: CookieFlagOptions,
+  ) => string;
+  setCsrfCookie: (
+    reply: FastifyReply,
+    name: string,
+    value: string,
+    request: FastifyRequest,
+    options?: CookieFlagOptions,
+  ) => void;
+  recordWalletAuthFailure: (
+    address: string,
+    ttlSeconds?: number,
+  ) => Promise<number>;
+  resetWalletAuthFailures: (address: string) => Promise<void>;
+  isWalletLockedOut: (address: string, threshold?: number) => Promise<boolean>;
+  getWalletFailureCount: (address: string) => Promise<number>;
 }
 
 export function createAuthHardening(
@@ -163,6 +281,45 @@ export function createAuthHardening(
     }
   }
 
+  const WALLET_AUTH_LOCKOUT_KEY_PREFIX = "wallet_fail:";
+  const DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC = 15 * 60;
+  const DEFAULT_WALLET_AUTH_MAX_FAILURES = 5;
+
+  function walletAuthFailKey(address: string): string {
+    return `${WALLET_AUTH_LOCKOUT_KEY_PREFIX}${address}`;
+  }
+
+  async function getWalletFailureCount(address: string): Promise<number> {
+    const key = walletAuthFailKey(address);
+    const val = await redis.get(key);
+    return val ? parseInt(val, 10) : 0;
+  }
+
+  async function recordWalletAuthFailure(
+    address: string,
+    ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
+  ): Promise<number> {
+    const key = walletAuthFailKey(address);
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, ttlSeconds);
+    }
+    return count;
+  }
+
+  async function resetWalletAuthFailures(address: string): Promise<void> {
+    const key = walletAuthFailKey(address);
+    await redis.del(key);
+  }
+
+  async function isWalletLockedOut(
+    address: string,
+    threshold: number = DEFAULT_WALLET_AUTH_MAX_FAILURES,
+  ): Promise<boolean> {
+    const count = await getWalletFailureCount(address);
+    return count >= threshold;
+  }
+
   return {
     signMerchantJwt,
     getAuthIpScore,
@@ -176,5 +333,13 @@ export function createAuthHardening(
     markNonceUsed,
     walletChallenge,
     verifyWalletSignature,
+    isRequestHttps,
+    getAuthCookieOptions,
+    buildCsrfCookieHeader,
+    setCsrfCookie,
+    recordWalletAuthFailure,
+    resetWalletAuthFailures,
+    isWalletLockedOut,
+    getWalletFailureCount,
   };
 }

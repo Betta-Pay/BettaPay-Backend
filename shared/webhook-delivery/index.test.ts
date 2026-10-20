@@ -28,12 +28,14 @@ import {
   verifySignature,
   canonicalize,
   resolveWebhookConcurrency,
+  webhookDeliveryDurationSeconds,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
   type DedupRedis,
 } from './index.js';
 import { Queue, Worker } from 'bullmq';
+import client from 'prom-client';
 
 // ── Minimal BullMQ stubs ──────────────────────────────────────────────────────
 //
@@ -1364,3 +1366,122 @@ test('createWebhookWorker — routes exhausted failed jobs to deadLetterQueue', 
   }
   t.end();
 });
+
+// ── Part 9: Webhook delivery latency histogram (#897) ─────────────────────────
+
+test('webhookDeliveryDurationSeconds — histogram configuration', (t) => {
+  t.ok(webhookDeliveryDurationSeconds, 'histogram is defined');
+  t.equal((webhookDeliveryDurationSeconds as any).name, 'webhook_delivery_duration_seconds', 'correct metric name');
+  t.deepEqual(
+    (webhookDeliveryDurationSeconds as any).labelNames,
+    ['status', 'attempt'],
+    'labels distinguish status and attempt',
+  );
+
+  const registeredMetric = client.register.getSingleMetric('webhook_delivery_duration_seconds');
+  t.ok(registeredMetric, 'histogram is registered in Prometheus default registry for scrape endpoint');
+  t.end();
+});
+
+test('webhookDeliveryDurationSeconds — observes duration on successful delivery with status="success"', async (t) => {
+  const mockFetch = (async () => ({
+    ok: true,
+    status: 200,
+  })) as unknown as typeof fetch;
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker processor could not be extracted (skipped)');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'payment.completed' },
+  }, 0);
+
+  await processor(job);
+
+  const metricsOutput = await client.register.metrics();
+  t.ok(metricsOutput.includes('webhook_delivery_duration_seconds_bucket'), 'metrics output has duration buckets');
+  t.ok(
+    metricsOutput.includes('status="success"'),
+    'metrics output contains status="success" label series',
+  );
+  t.ok(
+    metricsOutput.includes('attempt="1"'),
+    'metrics output contains attempt="1" label',
+  );
+  t.end();
+});
+
+test('webhookDeliveryDurationSeconds — observes duration on failed delivery with status="failed"', async (t) => {
+  const mockFetchFail = (async () => ({
+    ok: false,
+    status: 502,
+  })) as unknown as typeof fetch;
+
+  const processor = extractProcessor(mockFetchFail);
+  if (!processor) {
+    t.pass('Worker processor could not be extracted (skipped)');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'payment.completed' },
+  }, 1); // 2nd attempt
+
+  try {
+    await processor(job);
+    t.fail('processor should throw on non-2xx');
+  } catch {
+    t.pass('processor threw on non-2xx');
+  }
+
+  const metricsOutput = await client.register.metrics();
+  t.ok(
+    metricsOutput.includes('status="failed"'),
+    'metrics output contains status="failed" label series',
+  );
+  t.ok(
+    metricsOutput.includes('attempt="2"'),
+    'metrics output contains attempt="2" label',
+  );
+  t.end();
+});
+
+test('webhookDeliveryDurationSeconds — observes duration when fetch throws network error', async (t) => {
+  const mockFetchThrow = (async () => {
+    throw new Error('ETIMEDOUT');
+  }) as unknown as typeof fetch;
+
+  const processor = extractProcessor(mockFetchThrow);
+  if (!processor) {
+    t.pass('Worker processor could not be extracted (skipped)');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({
+    url: 'https://merchant.example/hook',
+    event: { type: 'payment.completed' },
+  }, 2); // 3rd attempt
+
+  try {
+    await processor(job);
+    t.fail('processor should throw on network error');
+  } catch {
+    t.pass('processor threw on network error');
+  }
+
+  const metricsOutput = await client.register.metrics();
+  t.ok(
+    metricsOutput.includes('status="failed"') && metricsOutput.includes('attempt="3"'),
+    'network exception records failed attempt in histogram',
+  );
+  t.end();
+});
+

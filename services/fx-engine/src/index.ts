@@ -1709,9 +1709,11 @@ const fxQuoteCacheMissesTotal = new promClient.Counter({
 // exposing it alongside application traffic.
 const metricsServer = startMetricsServer({
   appPort: PORT,
+  metricsPort: env.METRICS_PORT,
   contentType: promClient.register.contentType,
   getMetrics: () => promClient.register.metrics(),
   log: fastify.log,
+  scrapeToken: env.METRICS_SCRAPE_TOKEN,
 });
 
 const start = async () => {

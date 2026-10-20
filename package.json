@@ -5,7 +5,7 @@
   "description": "BettaPay backend services — API gateway, FX engine, settlement engine, indexer",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0 <23.0.0"
   },
   "packageManager": "pnpm@11.8.0",
   "workspaces": [
@@ -16,13 +16,13 @@
     "dev": "pnpm --parallel --filter './services/*' dev",
     "build": "pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
     "type-check": "pnpm -r type-check",
-    "lint": "node -e \"console.log('No package-level linters configured; CI uses pnpm -r --if-present lint')\"",
+    "lint": "node scripts/check-source-integrity.mjs && pnpm -r --if-present lint",
     "gateway:dev": "pnpm --filter api-gateway dev",
     "fx:dev": "pnpm --filter fx-engine dev",
     "settlement:dev": "pnpm --filter settlement-engine dev",
     "indexer:dev": "pnpm --filter indexer dev",
     "clean": "pnpm -r clean && rm -rf node_modules",
-    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter @bettapay/stellar-utils test && pnpm --filter api-gateway test && pnpm --filter fx-engine test && pnpm --filter settlement-engine test && pnpm --filter indexer test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts",
+    "test": "pnpm --filter @bettapay/validation test && pnpm --filter @bettapay/webhook-delivery test && pnpm --filter api-gateway test && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/env-template-parity.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/migration-timestamps.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/source-integrity.test.ts && cross-env TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm test/seed-idempotency.test.ts",
     "test:load": "k6 run test/load/gateway-scenarios.js",
     "test:mutation": "pnpm -w dlx stryker run"
   },
@@ -43,7 +43,7 @@
     "@fastify/jwt": "^10.1.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
-    "@stellar/stellar-sdk": "^15.1.0",
+    "@stellar/stellar-sdk": "^16.0.1",
     "bullmq": "^5.78.0",
     "fastify": "^5.8.5",
     "ioredis": "^5.11.1",

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import type { PrismaClient } from '@prisma/client';
 
 /**
@@ -11,8 +10,14 @@ import type { PrismaClient } from '@prisma/client';
  * - The chain is older than SUPERSEDED_RETENTION_DAYS
  */
 
-const SUPERSEDED_RETENTION_DAYS = 7;
-const SUPERSEDED_BATCH_SIZE = 100;
+export const SUPERSEDED_RETENTION_DAYS = 7;
+export const SUPERSEDED_BATCH_SIZE = 100;
+
+export interface CleanupLogger {
+  info: (obj: Record<string, unknown>, msg?: string) => void;
+  warn?: (obj: Record<string, unknown>, msg?: string) => void;
+  error?: (obj: Record<string, unknown>, msg?: string) => void;
+}
 
 /**
  * Mark superseded settlement chains as archived.
@@ -20,21 +25,24 @@ const SUPERSEDED_BATCH_SIZE = 100;
  * 1. The root settlement (first in chain) is older than retention period
  * 2. The current settlement (last in chain) is in a terminal state
  */
-export async function archiveSupersededChains(prisma: PrismaClient, log: any): Promise<number> {
+export async function archiveSupersededChains(
+  prisma: PrismaClient,
+  log?: CleanupLogger | null
+): Promise<number> {
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - SUPERSEDED_RETENTION_DAYS);
 
   // Find root settlements that are old enough and have completed chains
   const rootsToArchive = await prisma.settlement.findMany({
     where: {
-      // Only settlements with no supersedingParent (they are roots)
-      supersededBy: { none: {} },
       // Settlement itself is old
       initiatedAt: { lte: cutoffDate },
-      // And has actually been superseded (has a parent)
+      // And has actually been superseded (has a next settlement)
       supersededById: { not: null },
-      // And the final settlement is complete
-      supersededBy: { some: { status: { in: ['completed', 'failed'] } } },
+      // And the superseding settlement is complete/failed
+      supersededBy: {
+        status: { in: ['completed', 'failed'] },
+      },
     },
     select: { id: true },
     take: SUPERSEDED_BATCH_SIZE,
@@ -44,10 +52,9 @@ export async function archiveSupersededChains(prisma: PrismaClient, log: any): P
     return 0;
   }
 
-  const rootIds = rootsToArchive.map(r => r.id);
+  const rootIds: string[] = rootsToArchive.map((r: { id: string }) => r.id);
 
   // Mark all settlements in these chains as archived (soft-delete marker)
-  // We use a metadata field to track this without adding a new column
   const archived = await prisma.settlement.updateMany({
     where: {
       OR: [
@@ -57,17 +64,19 @@ export async function archiveSupersededChains(prisma: PrismaClient, log: any): P
       ],
     },
     data: {
-      // Mark with a completion timestamp if not already completed
-      completedAt: { not: null }, // Only update if not already set
+      completedAt: cutoffDate,
     },
   });
 
   if (log) {
-    log.info({
-      archivedCount: archived.count,
-      cutoffDate: cutoffDate.toISOString(),
-      retentionDays: SUPERSEDED_RETENTION_DAYS,
-    }, 'Archived old superseded settlement chains');
+    log.info(
+      {
+        archivedCount: archived.count,
+        cutoffDate: cutoffDate.toISOString(),
+        retentionDays: SUPERSEDED_RETENTION_DAYS,
+      },
+      'Archived old superseded settlement chains'
+    );
   }
 
   return archived.count;
@@ -80,9 +89,9 @@ export async function archiveSupersededChains(prisma: PrismaClient, log: any): P
  */
 export async function countRetryChainDepth(
   prisma: PrismaClient,
-  settlementId: string,
+  settlementId: string
 ): Promise<number> {
-  let current = await prisma.settlement.findUnique({
+  let current: { supersededById: string | null } | null = await prisma.settlement.findUnique({
     where: { id: settlementId },
     select: { supersededById: true },
   });
@@ -90,8 +99,8 @@ export async function countRetryChainDepth(
   let depth = 0;
   const visited = new Set<string>();
 
-  while (current?.supersededById && !visited.has(settlementId)) {
-    visited.add(settlementId);
+  while (current?.supersededById && !visited.has(current.supersededById)) {
+    visited.add(current.supersededById);
     depth++;
 
     current = await prisma.settlement.findUnique({

@@ -32,6 +32,9 @@ import crypto from "crypto";
 export const WALLET_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 
 export const WALLET_CHALLENGE_KEY_PREFIX = "wallet_challenge:";
+export const WALLET_AUTH_LOCKOUT_KEY_PREFIX = "wallet_fail:";
+export const DEFAULT_WALLET_AUTH_MAX_FAILURES = 5;
+export const DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC = 15 * 60;
 
 export interface StoredWalletChallenge {
   /** The exact string the wallet is expected to sign. */
@@ -63,6 +66,9 @@ export interface WalletChallengeRedis {
   ): Promise<unknown>;
   eval(script: string, numKeys: number, ...args: Array<string>): Promise<any>;
   del(key: string): Promise<unknown>;
+  get?(key: string): Promise<string | null>;
+  incr?(key: string): Promise<number>;
+  expire?(key: string, seconds: number): Promise<unknown>;
 }
 
 export interface WalletChallengeStoreOptions {
@@ -73,6 +79,10 @@ export interface WalletChallengeStoreOptions {
 
 export function walletChallengeKey(address: string): string {
   return `${WALLET_CHALLENGE_KEY_PREFIX}${address}`;
+}
+
+export function walletAuthFailKey(address: string): string {
+  return `${WALLET_AUTH_LOCKOUT_KEY_PREFIX}${address}`;
 }
 
 /**
@@ -170,6 +180,61 @@ export class WalletChallengeStore {
   /** Drop an address's outstanding challenge without consuming it. */
   async discard(address: string): Promise<void> {
     await this.redis.del(walletChallengeKey(address));
+  }
+
+  /**
+   * Retrieves the current number of recorded failed authentication attempts
+   * for the given wallet address (#902).
+   */
+  async getFailureCount(address: string): Promise<number> {
+    const key = walletAuthFailKey(address);
+    if (typeof this.redis.get === "function") {
+      const val = await this.redis.get(key);
+      return val ? parseInt(val, 10) : 0;
+    }
+    return 0;
+  }
+
+  /**
+   * Increments the failed authentication attempt counter for the given address (#902).
+   * Sets or renews the TTL so lockouts are time-bounded.
+   */
+  async recordFailure(
+    address: string,
+    ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
+  ): Promise<number> {
+    const key = walletAuthFailKey(address);
+    if (typeof this.redis.incr === "function") {
+      const count = await this.redis.incr(key);
+      if (count === 1 && typeof this.redis.expire === "function") {
+        await this.redis.expire(key, ttlSeconds);
+      }
+      return count;
+    }
+    const current = await this.getFailureCount(address);
+    const next = current + 1;
+    await this.redis.set(key, String(next), "PX", ttlSeconds * 1000);
+    return next;
+  }
+
+  /**
+   * Clears the failed authentication attempt counter for the given address (#902).
+   * Called upon successful wallet authentication to restore clean state.
+   */
+  async resetFailures(address: string): Promise<void> {
+    const key = walletAuthFailKey(address);
+    await this.redis.del(key);
+  }
+
+  /**
+   * Checks whether the address has reached or exceeded the failed attempt threshold (#902).
+   */
+  async isLockedOut(
+    address: string,
+    threshold: number = DEFAULT_WALLET_AUTH_MAX_FAILURES,
+  ): Promise<boolean> {
+    const count = await this.getFailureCount(address);
+    return count >= threshold;
   }
 }
 
