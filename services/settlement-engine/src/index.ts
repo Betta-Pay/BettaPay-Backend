@@ -44,6 +44,7 @@ import type {
   ReconcileRecordLike,
 } from './settlement-amounts.js';
 import { buildSettlementWebhookData } from './webhook-payload.js';
+import { signHS256 } from './reconcile-signing.js';
 import {
   createSettlementWithUniqueGuard,
   updateSettlementWithOptimisticLock,
@@ -129,6 +130,9 @@ import { buildPaginationMeta } from '@bettapay/shared-types';
 
 
 const env = validateEnvOrExit(process.env);
+// The reconcile report signs its api-gateway request with the same configured
+// JWT secret the gateway verifies, so the signing path has a single source.
+const RECONCILE_SIGNING_SECRET = env.JWT_SECRET;
 const PORT = Number(process.env.PORT ?? '3001');
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
@@ -847,20 +851,7 @@ const COMPARE_FIELDS = [
   'merchantId',
 ] as const;
 
-// Signs a minimal HS256 JWT using Node's native crypto
-export function signHS256(payload: object, secret: string): string {
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const base64UrlEncode = (obj: object) =>
-    Buffer.from(JSON.stringify(obj)).toString('base64url');
-
-  const tokenInput = `${base64UrlEncode(header)}.${base64UrlEncode(payload)}`;
-  const signature = crypto
-    .createHmac('sha256', secret)
-    .update(tokenInput)
-    .digest('base64url');
-
-  return `${tokenInput}.${signature}`;
-}
+export { signHS256 };
 
 export { computeReconciliationDiff, type ReconcileDiffResult, type ReconcileRecordLike };
 
@@ -1277,7 +1268,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
       iat: Math.floor(Date.now() / 1000),
       exp: Math.floor(Date.now() / 1000) + 60,
     };
-    const token = signHS256(jwtPayload, env.JWT_SECRET);
+    const token = signHS256(jwtPayload, RECONCILE_SIGNING_SECRET);
 
     let gatewayRecords: any[] = [];
     try {

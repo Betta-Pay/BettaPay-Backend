@@ -2,7 +2,7 @@
   "name": "bettapay-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "BettaPay backend services — API gateway, FX engine, settlement engine, indexer",
+  "description": "BettaPay backend services \u2014 API gateway, FX engine, settlement engine, indexer",
   "type": "module",
   "engines": {
     "node": ">=22.0.0 <23.0.0"
@@ -13,8 +13,8 @@
     "shared/*"
   ],
   "scripts": {
-    "dev": "pnpm --parallel --filter './services/*' dev",
-    "build": "pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
+    "dev": "node api.js && pnpm --parallel --filter './services/*' dev",
+    "build": "node api.js && pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
     "type-check": "pnpm -r type-check",
     "lint": "node scripts/check-source-integrity.mjs && pnpm -r --if-present lint",
     "gateway:dev": "pnpm --filter api-gateway dev",

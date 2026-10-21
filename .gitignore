@@ -28,6 +28,7 @@ yarn-error.log*
 # Turbo / pnpm cache
 .turbo/
 .pnpm-store/
+temp_auto_push.bat
 
 # Runtime
 pids/
@@ -40,7 +41,6 @@ coverage/
 .nyc_output/
 
 # Editor
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -59,4 +59,5 @@ pgsql/
 # local artifacts
 build-output.txt
 *.tsbuildinfo
-fix.md
+fix.md.gitignore
+branch_structure.json
