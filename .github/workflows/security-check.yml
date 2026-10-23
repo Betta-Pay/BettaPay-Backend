@@ -1,0 +1,13 @@
+name: Security Check
+on: [pull_request]
+jobs:
+  check-vscode-tasks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Check for dangerous auto-tasks in .vscode/settings.json
+        run: |
+          if grep -q '"runOn".*"folderOpen"' .vscode/settings.json; then
+            echo "ERROR: Automatic task execution on folder open is not allowed for security reasons."
+            exit 1
+          fi
