@@ -38,7 +38,7 @@ BettaPay-Backend/
 
 ```bash
 # 1. Install deps
-pnpm install        # or: npm install
+pnpm install
 
 # 2. Set env
 cp .env.example .env

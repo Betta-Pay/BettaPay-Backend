@@ -8,10 +8,6 @@
     "node": ">=22.0.0 <23.0.0"
   },
   "packageManager": "pnpm@11.8.0",
-  "workspaces": [
-    "services/*",
-    "shared/*"
-  ],
   "scripts": {
     "dev": "pnpm --parallel --filter './services/*' dev",
     "build": "pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
