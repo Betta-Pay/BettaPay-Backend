@@ -76,7 +76,7 @@ Run the k6 settlement-creation load test to ramp from 1 to 50 VUs over 60s:
 
 ```bash
 # install k6 (macOS/Homebrew or apt/choco) and then:
-k6 run tests/load/settlement-creation.js --env GATEWAY_URL=http://localhost:3000 --env MERCHANT_ID=test-merchant
+k6 run test/load/settlement-creation.js --env GATEWAY_URL=http://localhost:3000 --env MERCHANT_ID=test-merchant
 ```
 
 Check p50/p95/p99 and error rate in k6 output. To capture BullMQ queue depth, query Redis `llen` for `bull:settlements:wait` during the test.
