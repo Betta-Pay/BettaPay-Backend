@@ -22,11 +22,15 @@ BettaPay-Backend/
 │       └── src/index.ts
 │
 └── shared/
-    ├── types/                    # Shared TypeScript types (collapsed from packages/shared-types)
+    ├── types/                    # Shared TypeScript types
     │   └── index.ts
     ├── validation/               # Zod schemas + env validation
     │   └── index.ts
-    └── stellar-utils/            # Stellar address / stroop utilities
+    ├── stellar-utils/            # Stellar address / stroop utilities
+    │   └── index.ts
+    ├── webhook-delivery/         # Outbound webhook signing + delivery
+    │   └── index.ts
+    └── worker-shutdown/          # Graceful shutdown helper for workers
         └── index.ts
 ```
 
