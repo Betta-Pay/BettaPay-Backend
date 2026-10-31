@@ -150,7 +150,7 @@ import {
 import { Queue } from "bullmq";
 import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
-import { MerchantCache, getCachedMerchant } from "../../../shared/validation/merchant-cache.js";
+import { MerchantCache, getCachedMerchant } from "@bettapay/validation";
 
 declare module "fastify" {
   export interface FastifyInstance {
@@ -527,6 +527,16 @@ const updateMerchantSettingsBody = createUpdateMerchantSettingsBody(env.NODE_ENV
 const PORT = Number(process.env.PORT ?? "3000");
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
+
+// #889 — HTTP request duration histogram. Every response (including aborted
+// and rejected ones) is observed once with method, route, and status_code
+// labels so latency percentiles are available in Prometheus.
+const httpRequestDurationHistogram = new promClient.Histogram({
+  name: "http_request_duration_seconds",
+  help: "HTTP request duration in seconds, labelled by method, route, and status code.",
+  labelNames: ["method", "route", "status_code"],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
 
 // --- Request lifecycle timeouts ---------------------------------------------
 
@@ -960,7 +970,6 @@ export function buildApp(opts: AppOptions = {}) {
   fastify.register(rateLimit, {
     max: GLOBAL_RATE_LIMIT_MAX,
     timeWindow: "1 minute",
-    skip: () => isRateLimitDisabled(),
     keyGenerator: merchantKeyGenerator,
     errorResponseBuilder: (_request: any, context: { after: string }) =>
       ({
@@ -3120,11 +3129,6 @@ fastify.get('/api/admin/auth/ip-score', {
       // The OpenAPI schema below is also used by Fastify for validation; keep
       // the Zod parser as the single source of the error envelope.
       attachValidation: true,
-      schema: {
-        summary: "List payments",
-        description: PAYMENT_LIST_OPENAPI_PATH.get.description,
-        querystring: PAYMENT_LIST_QUERY_SCHEMA,
-      },
       config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
       schema: paymentsListRouteSchema,
     },
