@@ -92,7 +92,7 @@ jobs:
           # "vulnerable". Legacy advisory debt is guarded elsewhere.
           fail-on-severity: moderate
           # no summary comment: avoids needing pull-requests: write
-          comment-summary-in-pr: off
+          comment-summary-in-pr: never
 
   codeql:
     name: CodeQL
