@@ -1,0 +1,108 @@
+# Supply Chain Security — hard gate.
+#
+# Blocks at merge time:
+#   1. Leaked secrets (gitleaks scans the FULL git history on push, the PR diff on PRs).
+#   2. Malicious / discontinued packages (OSV database "MAL" entries in the lockfile).
+#   3. NEW dependencies with known vulnerabilities (dependency-review, moderate+).
+#   4. Code-level security issues incl. supply-chain-style injection (CodeQL,
+#      security-extended + security-malicious-code query packs).
+#
+# Known advisory debt in the legacy lockfile (historical vulnerabilities that
+# pre-date this gate) keeps filing dependabot alerts and remains intentionally
+# report-only until the dependency-upgrade sprint lands. Do NOT weaken the
+# gitleaks or OSV-MAL jobs to make a scan green: those findings are always blockers.
+
+name: Supply Chain Security
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly rescan of main — catches newly published malware in pinned installs.
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  malware-deps:
+    name: osv-malware-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan lockfile for malicious packages (OSV database)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            ghcr.io/google/osv-scanner:v2.7.0 \
+            scan source --format json -L pnpm-lock.yaml \
+            > "${RUNNER_TEMP}/osv.json" || true
+
+          ADV=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' "${RUNNER_TEMP}/osv.json")
+          MAL=$(jq '[.results[]?.packages[]?.vulnerabilities[]? | select(.id | startswith("MAL"))] | length' "${RUNNER_TEMP}/osv.json")
+          {
+            echo "### OSV scan"
+            echo "- known advisories (baseline debt, tracked in dependabot): ${ADV}"
+            echo "- malicious/discontinued packages: ${MAL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$MAL" -gt 0 ]; then
+            echo "::error::Malicious package(s) detected in pnpm-lock.yaml:"
+            jq -r '.results[]?.packages[]?.vulnerabilities[]? | select(.id | startswith("MAL")) | "- \(.id): \(.summary // "no summary")"' \
+              "${RUNNER_TEMP}/osv.json" || true
+            exit 1
+          fi
+
+  new-dep-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Review PR dependency changes against OSV advisories
+        uses: actions/dependency-review-action@v4
+        with:
+          # A PR may not introduce a NEW dependency whose *only* fact is
+          # "vulnerable". Legacy advisory debt is guarded elsewhere.
+          fail-on-severity: moderate
+          # no summary comment: avoids needing pull-requests: write
+          comment-summary-in-pr: off
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended,security-malicious-code
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

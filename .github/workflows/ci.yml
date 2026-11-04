@@ -342,6 +342,13 @@ jobs:
 
   mutation:
     runs-on: ubuntu-latest
+    # TODO(summit): make `mutation` a required merge gate once the Stryker
+    # sandbox resolves workspace packages. Currently `pnpm -w dlx stryker run`
+    # copies sources into `.stryker-tmp/sandbox*/` where `shared/validation/`
+    # imports (e.g. `zod`) can no longer be resolved, so the initial test run
+    # dies before any mutants execute. Root cause is in pnpm's
+    # isolated-dependencies layout inside the sandbox, not in the tests.
+    continue-on-error: true
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     timeout-minutes: 20
     steps:

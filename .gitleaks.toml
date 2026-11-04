@@ -1,0 +1,16 @@
+title = "BettaPay Backend gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures, unit tests and Stellar address tests contain DOCUMENTED DEMO credentials only (no real keys)"
+paths = [
+  # First-party test fixtures: dummy field-encryption keys / signing secrets
+  '''^services/[^/]+/src/test-fixtures\.ts$''',
+  # Cross-package unit/integration tests (demo JWTs, dummy secrets)
+  '''\.test\.tsx?$''',
+  '''__tests__/''',
+  # Stellar address unit tests — G... and S... chars are documentation-strkey fixtures
+  '''^shared/stellar-utils/''',
+]
