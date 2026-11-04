@@ -320,7 +320,11 @@ export function createMockPrisma(initialData: MockData = {}) {
     update: async ({ where, data }: { where: { code: string }; data: any }) => {
       const index = store.supportedAssets.findIndex((a) => a.code === where.code);
       if (index === -1) {
-        throw new Error(`Record to update not found: supportedAsset ${where.code}`);
+        // Mirror Prisma's P2025 so handlers can map it to 404.
+        throw Object.assign(
+          new Error(`Record to update not found: supportedAsset ${where.code}`),
+          { code: 'P2025' },
+        );
       }
       const updated = { ...store.supportedAssets[index], ...data };
       store.supportedAssets[index] = updated;
@@ -329,7 +333,11 @@ export function createMockPrisma(initialData: MockData = {}) {
     delete: async ({ where }: { where: { code: string } }) => {
       const index = store.supportedAssets.findIndex((a) => a.code === where.code);
       if (index === -1) {
-        throw new Error(`Record to delete not found: supportedAsset ${where.code}`);
+        // Mirror Prisma's P2025 so handlers can map it to 404.
+        throw Object.assign(
+          new Error(`Record to delete not found: supportedAsset ${where.code}`),
+          { code: 'P2025' },
+        );
       }
       const [deleted] = store.supportedAssets.splice(index, 1);
       return deleted;
