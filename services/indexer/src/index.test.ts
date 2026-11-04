@@ -148,7 +148,7 @@ test('POST /api/events/replay/contract/:contractId - rejects requests without se
   try {
     const res = await fastify.inject({
       method: 'POST',
-      url: '/api/events/replay/contract/CA_TEST',
+      url: '/api/events/replay/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       payload: { startLedger: 100, endLedger: 200 },
     });
     t.equal(res.statusCode, 401, 'should return 401 without x-service-token');

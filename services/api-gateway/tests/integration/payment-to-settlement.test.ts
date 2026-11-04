@@ -16,7 +16,7 @@ process.env.GOOGLE_CLIENT_ID ||= 'local-dev-google-client';
 process.env.INTER_SERVICE_SECRET ||= 'dev-inter-service-secret';
 process.env.DATABASE_URL ||= process.env.DATABASE_URL_TEST || 'postgresql://postgres:postgres@localhost:5432/bettapay_test?schema=public';
 process.env.REDIS_URL ||= 'redis://localhost:6379';
-process.env.SETTLEMENT_CONTRACT_ID ||= 'CA_TEST';
+process.env.SETTLEMENT_CONTRACT_ID ||= 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 process.env.GOVERNANCE_CONTRACT_ID ||= 'GA_TEST';
 process.env.ADMIN_ADDRESS ||= 'GA_TEST';
 process.env.ADMIN_SECRET ||= 'test-secret';
