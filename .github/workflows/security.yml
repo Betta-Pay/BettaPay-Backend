@@ -3,7 +3,9 @@
 # Blocks at merge time:
 #   1. Leaked secrets (gitleaks scans the FULL git history on push, the PR diff on PRs).
 #   2. Malicious / discontinued packages (OSV database "MAL" entries in the lockfile).
-#   3. NEW dependencies with known vulnerabilities (dependency-review, moderate+).
+#   3. NEW dependencies with known vulnerabilities (PR-only OSV diff: the
+#      merge-target branch's lockfile is re-scanned and any advisory that did
+#      not exist there is a hard fail — no Dependency graph needed).
 #   4. Code-level security issues incl. supply-chain-style injection (CodeQL,
 #      security-extended + security-malicious-code query packs).
 #
@@ -55,44 +57,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Scan lockfile for malicious packages (OSV database)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src \
-            ghcr.io/google/osv-scanner:v2.7.0 \
-            scan source --format json -L pnpm-lock.yaml \
-            > "${RUNNER_TEMP}/osv.json" || true
+          LOCK=pnpm-lock.yaml
 
-          ADV=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' "${RUNNER_TEMP}/osv.json")
-          MAL=$(jq '[.results[]?.packages[]?.vulnerabilities[]? | select(.id | startswith("MAL"))] | length' "${RUNNER_TEMP}/osv.json")
+          scan() {
+            docker run --rm -v "$1:/src" -w /src \
+              ghcr.io/google/osv-scanner:v2.7.0 \
+              scan source --format json -L "$2" > "$3" || true
+          }
+
+          scan "$PWD" "$LOCK" "${RUNNER_TEMP}/head.json"
+          MAL=$(jq '[.results[]?.packages[]?.vulnerabilities[]? | select(.id | startswith("MAL"))] | length' "${RUNNER_TEMP}/head.json")
+          ADV=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' "${RUNNER_TEMP}/head.json")
           {
-            echo "### OSV scan"
-            echo "- known advisories (baseline debt, tracked in dependabot): ${ADV}"
+            echo "### OSV scan ($LOCK, PR head)"
+            echo "- known advisories on root: ${ADV}"
             echo "- malicious/discontinued packages: ${MAL}"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$MAL" -gt 0 ]; then
-            echo "::error::Malicious package(s) detected in pnpm-lock.yaml:"
+            echo "::error::Malicious package(s) detected in $LOCK:"
             jq -r '.results[]?.packages[]?.vulnerabilities[]? | select(.id | startswith("MAL")) | "- \(.id): \(.summary // "no summary")"' \
-              "${RUNNER_TEMP}/osv.json" || true
+              "${RUNNER_TEMP}/head.json" || true
             exit 1
           fi
 
-  new-dep-review:
-    name: dependency-review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          # PR diff gate (no dependency graph needed): re-scan the BASE branch
+          # lockfile and fail on ANY advisory that is new relative to it —
+          # malware, or a newly introduced vulnerable dependency.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            mkdir -p "${RUNNER_TEMP}/base"
+            git show "origin/${{ github.event.pull_request.base.ref }}:$LOCK" \
+              > "${RUNNER_TEMP}/base/$LOCK"
+            scan "${RUNNER_TEMP}/base" "$LOCK" "${RUNNER_TEMP}/base.json"
 
-      - name: Review PR dependency changes against OSV advisories
-        uses: actions/dependency-review-action@v4
-        with:
-          # A PR may not introduce a NEW dependency whose *only* fact is
-          # "vulnerable". Legacy advisory debt is guarded elsewhere.
-          fail-on-severity: moderate
-          # no summary comment: avoids needing pull-requests: write
-          comment-summary-in-pr: never
+            jq -r '[.results[]?.packages[]?.vulnerabilities[]?.id] | unique | .[]' \
+              "${RUNNER_TEMP}/head.json" | sort > "${RUNNER_TEMP}/head.ids"
+            jq -r '[.results[]?.packages[]?.vulnerabilities[]?.id] | unique | .[]' \
+              "${RUNNER_TEMP}/base.json" | sort > "${RUNNER_TEMP}/base.ids"
+
+            NEW_IDS=$(comm -23 "${RUNNER_TEMP}/head.ids" "${RUNNER_TEMP}/base.ids")
+            if [ -n "$NEW_IDS" ]; then
+              echo "### OSV diff vs base (NEW advisories introduced by this PR)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::This PR introduces new vulnerability advisories (blocked):"
+              for id in $NEW_IDS; do
+                echo "- $id" >> "$GITHUB_STEP_SUMMARY"
+                echo "::error::  $id"
+              done
+              exit 1
+            fi
+            echo "### OSV diff vs base: no new advisories introduced by this PR" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   codeql:
     name: CodeQL
