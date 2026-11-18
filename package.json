@@ -12,7 +12,7 @@
     "dev": "pnpm --parallel --filter './services/*' dev",
     "build": "pnpm --filter './shared/*' build && pnpm --filter './services/*' build",
     "type-check": "pnpm -r type-check",
-    "lint": "node scripts/check-source-integrity.mjs && pnpm -r --if-present lint",
+    "lint": "node scripts/check-source-integrity.mjs && node scripts/lint.mjs scripts && pnpm -r --if-present lint",
     "gateway:dev": "pnpm --filter api-gateway dev",
     "fx:dev": "pnpm --filter fx-engine dev",
     "settlement:dev": "pnpm --filter settlement-engine dev",
