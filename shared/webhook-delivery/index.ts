@@ -144,6 +144,8 @@ export interface WebhookQueueOptions {
 /** Minimal Redis client interface for webhook deduplication. */
 export interface DedupRedis {
   set(key: string, value: string, mode: string, duration: string, flag: string): Promise<'OK' | null>;
+  get(key: string): Promise<string | null>;
+  del(key: string): Promise<number>;
 }
 
 /** Options accepted by createWebhookWorker. */
@@ -161,8 +163,11 @@ export interface WebhookWorkerOptions {
   /** Injectable fetch implementation — used by tests to avoid real HTTP. */
   fetchImpl?: typeof fetch;
   /** Optional Redis client for webhook deduplication.  When set together with
-   *  an eventId on the job, the worker performs a SET NX with 1-hour TTL
-   *  before dispatch.  If the key already exists the delivery is skipped. */
+   *  an eventId on the job, the worker takes a short-lived in-flight lock
+   *  (`webhook_inflight:{eventId}`) before dispatch and skips the delivery if
+   *  the lock is held or `webhook_sent:{eventId}` already exists.  The
+   *  `webhook_sent` marker (1-hour TTL) is only written after the merchant
+   *  endpoint returns 2xx, so failed attempts remain retryable (#1092). */
   redis?: DedupRedis;
   /** Optional dead-letter queue or archive queue to route permanently failed jobs. */
   deadLetterQueue?: Queue<WebhookJobData> | { add: (name: string, data: WebhookJobData) => Promise<unknown> };
@@ -179,6 +184,7 @@ export const WEBHOOK_DEFAULTS = {
   timeoutMs: 5_000,
   removeOnCompleteCount: 100,
   removeOnFailCount: 500,
+  sentTtlMs: 3_600_000,
 } as const;
 
 /**
@@ -370,6 +376,27 @@ export function createWebhookQueue(
 // ── Factory: Worker ───────────────────────────────────────────────────────────
 
 /**
+ * True for redirect responses.  With `redirect: 'manual'` Node's fetch
+ * surfaces the raw 3xx, while spec-compliant browser-style implementations
+ * return an opaque `opaqueredirect` response with status 0.
+ */
+function isRedirect(response: Response): boolean {
+  return (response.status >= 300 && response.status < 400) || response.type === 'opaqueredirect';
+}
+
+/** Best-effort release of the in-flight lock; it expires on its own if this fails. */
+async function releaseInflightLock(redis: DedupRedis, key: string, logger?: WebhookLogger): Promise<void> {
+  try {
+    await redis.del(key);
+  } catch (err) {
+    logger?.warn(
+      { key, err: err instanceof Error ? err.message : String(err) },
+      '[webhook-delivery] Failed to release in-flight lock — it will expire via TTL',
+    );
+  }
+}
+
+/**
  * Creates a BullMQ Worker that processes webhook delivery jobs.
  *
  * Each job attempt POSTs `event` as JSON to `url` with a bounded timeout.
@@ -402,14 +429,36 @@ export function createWebhookWorker(
       const attempt = job.attemptsMade + 1; // attemptsMade is 0-indexed
 
       // ── Deduplication check ─────────────────────────────────────────────
-      if (redisClient && eventId) {
+      // The `webhook_sent` marker is only written once the merchant endpoint
+      // has acknowledged the delivery with a 2xx (#1092).  Writing it before
+      // the HTTP call left a false "sent" state behind whenever the request
+      // failed, so every BullMQ retry was silently skipped as a duplicate.
+      //
+      // Concurrent duplicates are still prevented by a short-lived in-flight
+      // lock taken *before* reading the sent marker: whichever worker holds the
+      // lock either finishes (and marks sent before releasing) or fails (and
+      // releases without marking), so a second worker can never slip in
+      // between the delivery and the marker write.
+      const dedupKeys = redisClient && eventId
+        ? { sent: `webhook_sent:${eventId}`, inflight: `webhook_inflight:${eventId}` }
+        : null;
+
+      if (redisClient && dedupKeys) {
         try {
-          const dedupKey = `webhook_sent:${eventId}`;
-          const claimed = await redisClient.set(dedupKey, '1', 'PX', '3600000', 'NX');
-          if (claimed === null) {
+          // Lock TTL outlives one attempt so a crashed worker can't wedge the event.
+          const locked = await redisClient.set(dedupKeys.inflight, '1', 'PX', String(timeoutMs + 1_000), 'NX');
+          if (locked === null) {
             logger?.warn(
               { url, jobId: job.id, eventId, traceId: job.data.traceId },
-              '[webhook-delivery] Duplicate webhook detected — skipping delivery',
+              '[webhook-delivery] Duplicate webhook detected (delivery in flight) — skipping delivery',
+            );
+            return;
+          }
+          if ((await redisClient.get(dedupKeys.sent)) !== null) {
+            await releaseInflightLock(redisClient, dedupKeys.inflight, logger);
+            logger?.warn(
+              { url, jobId: job.id, eventId, traceId: job.data.traceId },
+              '[webhook-delivery] Duplicate webhook detected (already sent) — skipping delivery',
             );
             return;
           }
@@ -455,9 +504,23 @@ export function createWebhookWorker(
           headers,
           body,
           signal: controller.signal,
+          // Never follow redirects: a merchant URL that passed SSRF validation
+          // could otherwise 3xx the worker onto an internal endpoint (#1092).
+          redirect: 'manual',
         });
 
         const durationSeconds = (performance.now() - start) / 1000;
+
+        if (isRedirect(response)) {
+          webhookDeliveryDurationSeconds.observe(
+            { status: 'failed', attempt: String(attempt) },
+            durationSeconds,
+          );
+          observed = true;
+          throw new Error(
+            `[webhook-delivery] Redirect (HTTP ${response.status}) from ${url} refused — job ${job.id} attempt ${attempt}`,
+          );
+        }
 
         if (!response.ok) {
           webhookDeliveryDurationSeconds.observe(
@@ -478,6 +541,19 @@ export function createWebhookWorker(
         observed = true;
 
         logger?.info({ url, jobId: job.id, attempt, status: response.status, eventId, traceId: job.data.traceId }, '[webhook-delivery] Webhook delivered');
+
+        if (redisClient && dedupKeys) {
+          try {
+            await redisClient.set(dedupKeys.sent, '1', 'PX', String(WEBHOOK_DEFAULTS.sentTtlMs), 'NX');
+          } catch (err) {
+            // The merchant already has the webhook — throwing here would make
+            // BullMQ redeliver it, so log and accept the success.
+            logger?.error(
+              { url, jobId: job.id, eventId, traceId: job.data.traceId, err: err instanceof Error ? err.message : String(err) },
+              '[webhook-delivery] Delivered but failed to record webhook_sent marker',
+            );
+          }
+        }
       } catch (err) {
         if (!observed) {
           const durationSeconds = (performance.now() - start) / 1000;
@@ -498,6 +574,9 @@ export function createWebhookWorker(
         // Abort if still pending (e.g., on error path before response completes)
         if (!controller.signal.aborted) {
           controller.abort();
+        }
+        if (redisClient && dedupKeys) {
+          await releaseInflightLock(redisClient, dedupKeys.inflight, logger);
         }
       }
     },

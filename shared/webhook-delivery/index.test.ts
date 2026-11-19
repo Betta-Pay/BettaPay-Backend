@@ -1192,27 +1192,34 @@ test('worker processor — no custom headers means only the defaults are sent', 
 
 // ── Part 7: Webhook deduplication (Redis SET NX) ──────────────────────────
 
-test('worker processor — deliver webhook records eventId in Redis', async (t) => {
-  let redisKey = '';
-  let redisValue = '';
-  let redisMode = '';
-  let redisDuration = '';
-  let redisFlag = '';
-
-  const mockRedis: DedupRedis = {
+/** In-memory DedupRedis that records every command for ordering assertions. */
+function makeFakeDedupRedis(initial: Record<string, string> = {}) {
+  const store = new Map(Object.entries(initial));
+  const calls: string[] = [];
+  const redis: DedupRedis = {
     set: async (key, value, mode, duration, flag) => {
-      redisKey = key;
-      redisValue = value;
-      redisMode = mode;
-      redisDuration = duration;
-      redisFlag = flag;
+      calls.push(`set ${key} ${value} ${mode} ${duration} ${flag}`);
+      if (flag === 'NX' && store.has(key)) return null;
+      store.set(key, value);
       return 'OK';
     },
+    get: async (key) => {
+      calls.push(`get ${key}`);
+      return store.get(key) ?? null;
+    },
+    del: async (key) => {
+      calls.push(`del ${key}`);
+      return store.delete(key) ? 1 : 0;
+    },
   };
+  return { redis, store, calls };
+}
 
+test('worker processor — deliver webhook records eventId in Redis', async (t) => {
+  const { redis, store, calls } = makeFakeDedupRedis();
   const mockFetch: typeof fetch = async () => ({ ok: true, status: 200 } as Response);
 
-  const processor = extractProcessor(mockFetch, undefined, mockRedis);
+  const processor = extractProcessor(mockFetch, undefined, redis);
   if (!processor) {
     t.pass('Worker constructor unavailable (no Redis) — dedup test skipped');
     t.end();
@@ -1227,11 +1234,89 @@ test('worker processor — deliver webhook records eventId in Redis', async (t) 
 
   await processor(job as any);
 
-  t.equal(redisKey, 'webhook_sent:evt_123', 'uses webhook_sent:{eventId} key');
-  t.equal(redisValue, '1', 'sets value to 1');
-  t.equal(redisMode, 'PX', 'uses PX mode');
-  t.equal(redisDuration, '3600000', 'TTL is 3600000 ms (1 hour)');
-  t.equal(redisFlag, 'NX', 'uses NX flag');
+  t.ok(
+    calls.includes('set webhook_sent:evt_123 1 PX 3600000 NX'),
+    'uses webhook_sent:{eventId} key, value 1, 1-hour PX TTL, NX flag',
+  );
+  t.equal(store.get('webhook_sent:evt_123'), '1', 'sent marker persisted');
+  t.notOk(store.has('webhook_inflight:evt_123'), 'in-flight lock released after delivery');
+  t.end();
+});
+
+test('worker processor — webhook_sent is marked only after fetch succeeds (#1092)', async (t) => {
+  const { redis, calls } = makeFakeDedupRedis();
+  const mockFetch: typeof fetch = async () => {
+    calls.push('fetch');
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch, undefined, redis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — ordering test skipped');
+    t.end();
+    return;
+  }
+
+  await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {}, eventId: 'evt_order' }) as any);
+
+  const fetchIdx = calls.indexOf('fetch');
+  const sentIdx = calls.findIndex((c) => c.startsWith('set webhook_sent:evt_order'));
+  t.ok(fetchIdx >= 0 && sentIdx >= 0, 'both fetch and sent marker happened');
+  t.ok(sentIdx > fetchIdx, 'webhook_sent written after fetchImpl resolved');
+  t.end();
+});
+
+test('worker processor — failed fetch does not mark webhook_sent and retry still delivers (#1092)', async (t) => {
+  const { redis, store } = makeFakeDedupRedis();
+  let calls = 0;
+  const mockFetch: typeof fetch = async () => {
+    calls++;
+    if (calls === 1) throw new Error('ECONNRESET');
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch, undefined, redis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — failed fetch test skipped');
+    t.end();
+    return;
+  }
+
+  const job = makeFakeJob({ url: 'https://merchant.example/hook', event: {}, eventId: 'evt_retry' });
+
+  let threw = false;
+  try {
+    await processor(job as any);
+  } catch {
+    threw = true;
+  }
+  t.ok(threw, 'first attempt throws so BullMQ retries');
+  t.notOk(store.has('webhook_sent:evt_retry'), 'failed attempt did not mark webhook_sent');
+  t.notOk(store.has('webhook_inflight:evt_retry'), 'in-flight lock released after failure');
+
+  await processor({ ...job, attemptsMade: 1 } as any);
+  t.equal(calls, 2, 'retry was not skipped as a duplicate');
+  t.equal(store.get('webhook_sent:evt_retry'), '1', 'successful retry marks webhook_sent');
+  t.end();
+});
+
+test('worker processor — non-2xx response does not mark webhook_sent (#1092)', async (t) => {
+  const { redis, store } = makeFakeDedupRedis();
+  const mockFetch: typeof fetch = async () => ({ ok: false, status: 503 } as Response);
+
+  const processor = extractProcessor(mockFetch, undefined, redis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — non-2xx test skipped');
+    t.end();
+    return;
+  }
+
+  try {
+    await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {}, eventId: 'evt_503' }) as any);
+  } catch {
+    // expected
+  }
+  t.notOk(store.has('webhook_sent:evt_503'), '5xx did not mark webhook_sent');
   t.end();
 });
 
@@ -1243,19 +1328,13 @@ test('worker processor — duplicate eventId is skipped and warning logged', asy
     error: (obj, msg) => logs.push({ level: 'error', obj, msg }),
   };
 
-  let callCount = 0;
-  const mockRedis: DedupRedis = {
-    set: async () => {
-      callCount++;
-      return null; // NX fails — key already exists
-    },
-  };
+  const { redis, store } = makeFakeDedupRedis({ 'webhook_sent:evt_dup': '1' });
 
   const mockFetch: typeof fetch = async () => {
     throw new Error('should not be called');
   };
 
-  const processor = extractProcessor(mockFetch, logger, mockRedis);
+  const processor = extractProcessor(mockFetch, logger, redis);
   if (!processor) {
     t.pass('Worker constructor unavailable (no Redis) — dedup skip test skipped');
     t.end();
@@ -1270,10 +1349,30 @@ test('worker processor — duplicate eventId is skipped and warning logged', asy
 
   await processor(job as any);
 
-  t.equal(callCount, 1, 'Redis set was called once');
   const warnLogs = logs.filter((l) => l.level === 'warn');
   t.ok(warnLogs.length >= 1, 'warning log emitted');
   t.ok(warnLogs.some((l) => l.msg.includes('Duplicate')), 'warning mentions duplicate');
+  t.notOk(store.has('webhook_inflight:evt_dup'), 'in-flight lock released when skipping');
+  t.end();
+});
+
+test('worker processor — concurrent delivery in flight is skipped', async (t) => {
+  const { redis } = makeFakeDedupRedis({ 'webhook_inflight:evt_busy': '1' });
+  let delivered = false;
+  const mockFetch: typeof fetch = async () => {
+    delivered = true;
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch, undefined, redis);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — in-flight test skipped');
+    t.end();
+    return;
+  }
+
+  await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {}, eventId: 'evt_busy' }) as any);
+  t.false(delivered, 'second worker did not deliver while another holds the lock');
   t.end();
 });
 
@@ -1281,6 +1380,8 @@ test('worker processor — Redis unavailable fails closed (throws without delive
   let delivered = false;
   const mockRedis: DedupRedis = {
     set: async () => { throw new Error('ECONNREFUSED'); },
+    get: async () => { throw new Error('ECONNREFUSED'); },
+    del: async () => { throw new Error('ECONNREFUSED'); },
   };
 
   const mockFetch: typeof fetch = async () => {
@@ -1311,6 +1412,81 @@ test('worker processor — Redis unavailable fails closed (throws without delive
 
   t.true(threw, 'processor throws when Redis dedup check fails (fail-closed)');
   t.false(delivered, 'webhook was NOT delivered when Redis dedup failed');
+  t.end();
+});
+
+// ── Part 7b: Redirects are never followed (#1092) ────────────────────────────
+
+test('worker processor — passes redirect: "manual" to fetchImpl', async (t) => {
+  let redirectMode: RequestRedirect | undefined;
+  const mockFetch: typeof fetch = async (_input, init) => {
+    redirectMode = init?.redirect;
+    return { ok: true, status: 200 } as Response;
+  };
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — redirect mode test skipped');
+    t.end();
+    return;
+  }
+
+  await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {} }) as any);
+  t.equal(redirectMode, 'manual', 'fetch is told not to follow redirects');
+  t.end();
+});
+
+test('worker processor — 3xx redirect is rejected as a delivery failure', async (t) => {
+  for (const status of [301, 302, 307, 308]) {
+    const { redis, store } = makeFakeDedupRedis();
+    const fetchedUrls: string[] = [];
+    const mockFetch: typeof fetch = async (input) => {
+      fetchedUrls.push(String(input));
+      return {
+        ok: false,
+        status,
+        headers: new Headers({ location: 'http://169.254.169.254/latest/meta-data/' }),
+      } as Response;
+    };
+
+    const processor = extractProcessor(mockFetch, undefined, redis);
+    if (!processor) {
+      t.pass('Worker constructor unavailable (no Redis) — redirect rejection test skipped');
+      t.end();
+      return;
+    }
+
+    let error: Error | null = null;
+    try {
+      await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {}, eventId: `evt_${status}` }) as any);
+    } catch (err) {
+      error = err as Error;
+    }
+
+    t.ok(error?.message.includes('Redirect'), `HTTP ${status} throws a redirect delivery failure`);
+    t.same(fetchedUrls, ['https://merchant.example/hook'], `HTTP ${status} Location was not followed`);
+    t.notOk(store.has(`webhook_sent:evt_${status}`), `HTTP ${status} did not mark webhook_sent`);
+  }
+  t.end();
+});
+
+test('worker processor — opaqueredirect response is rejected', async (t) => {
+  const mockFetch: typeof fetch = async () => ({ ok: false, status: 0, type: 'opaqueredirect' } as Response);
+
+  const processor = extractProcessor(mockFetch);
+  if (!processor) {
+    t.pass('Worker constructor unavailable (no Redis) — opaqueredirect test skipped');
+    t.end();
+    return;
+  }
+
+  let threw = false;
+  try {
+    await processor(makeFakeJob({ url: 'https://merchant.example/hook', event: {} }) as any);
+  } catch (err) {
+    threw = (err as Error).message.includes('Redirect');
+  }
+  t.ok(threw, 'opaqueredirect treated as a redirect failure');
   t.end();
 });
 
