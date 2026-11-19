@@ -1725,32 +1725,163 @@ fastify.post<{ Params: { id: string } }>(
   },
 );
 
-// ── Stellar RPC polling loop ──────────────────────────────────────────────────
+// ── Stellar RPC polling loop (#1057) ─────────────────────────────────────────
 
-async function pollEvents() {
+export const POLL_LEADER_LOCK_KEY = "lock:indexer:poll-events";
+const POLL_LEADER_LOCK_TTL_MS = Math.max(env.POLL_TIMEOUT_MS * 2, 30_000);
+const RELEASE_POLL_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+export interface PollLeaderLockClient {
+  set(
+    key: string,
+    value: string,
+    millisecondsToken: "PX",
+    milliseconds: number,
+    nx: "NX",
+  ): Promise<"OK" | string | null>;
+  eval(
+    script: string,
+    numkeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
+}
+
+export interface PollCycleDependencies {
+  redis?: PollLeaderLockClient;
+  rpcServer?: Pick<typeof server, "getLatestLedger" | "getEvents">;
+  flushEvents?: typeof flushIndexedEvents;
+  dispatchWebhooks?: typeof dispatchPendingWebhookDeliveries;
+  getCursor?: () => number | null | undefined;
+  setCursor?: (cursor: number | undefined) => void;
+  getLatestSequence?: () => number | undefined;
+  setLatestSequence?: (seq: number | undefined) => void;
+  getIndexFromLedger?: () => string | undefined;
+}
+
+/** @internal exported for testing */
+export function getLatestLedgerCursor(): number | undefined {
+  return latestLedgerCursor;
+}
+
+/** @internal exported for testing */
+export function setLatestLedgerCursor(cursor: number | undefined): void {
+  latestLedgerCursor = cursor;
+}
+
+function resolveConfiguredStartLedger(
+  indexFromLedger: string | undefined,
+): number | undefined {
+  if (!indexFromLedger) return undefined;
+  const parsed = parseInt(indexFromLedger, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : undefined;
+}
+
+/**
+ * Executes a single poll cycle under a Redis distributed leader lock (#1057).
+ *
+ * Guarantees:
+ *   1. Only one replica polls at a time (Redis SET NX PX + atomic Lua release).
+ *   2. Never falls back to startLedger: 0 when latestLedgerCursor is null/undefined;
+ *      uses configured INDEX_FROM_LEDGER or the latest ledger sequence from RPC.
+ *   3. Only advances latestLedgerCursor after flushIndexedEvents commits.
+ *
+ * @internal exported for testing
+ */
+export async function runPollCycle(
+  deps: PollCycleDependencies = {},
+): Promise<number> {
+  const redisClient = deps.redis ?? sharedRedis;
+  const rpcServer = deps.rpcServer ?? server;
+  const flushEvents = deps.flushEvents ?? flushIndexedEvents;
+  const dispatchWebhooks =
+    deps.dispatchWebhooks ?? dispatchPendingWebhookDeliveries;
+  const getCursor = deps.getCursor ?? (() => latestLedgerCursor);
+  const setCursor =
+    deps.setCursor ??
+    ((next: number | undefined) => {
+      latestLedgerCursor = next;
+    });
+  const getLatestSequence =
+    deps.getLatestSequence ?? (() => latestLedgerSequence);
+  const setLatestSequence =
+    deps.setLatestSequence ??
+    ((seq: number | undefined) => {
+      latestLedgerSequence = seq;
+    });
+  const getIndexFromLedger =
+    deps.getIndexFromLedger ?? (() => env.INDEX_FROM_LEDGER);
+
   const pollStart = Date.now();
   let aborted = false;
 
-  // On each poll, fetch the latest Stellar ledger to track lag
+  // 1. Acquire Redis distributed leader lock so only one replica polls at a time (#1057)
+  let lockAcquired = false;
+  const lockToken = crypto.randomUUID();
   try {
-    const latest = await server.getLatestLedger();
-    latestLedgerSequence = latest.sequence;
-  } catch {
-    // Cannot reach the network; keep the previous sequence for lag computation
+    const res = await redisClient.set(
+      POLL_LEADER_LOCK_KEY,
+      lockToken,
+      "PX",
+      POLL_LEADER_LOCK_TTL_MS,
+      "NX",
+    );
+    lockAcquired = res === "OK";
+  } catch (lockErr) {
+    fastify.log.warn(
+      { err: lockErr },
+      "[Indexer] Failed to acquire poll leader lock — skipping cycle",
+    );
+    pollCyclesCounter.inc({ status: "lock_error" });
+    return currentBackoff;
+  }
+
+  if (!lockAcquired) {
+    fastify.log.debug(
+      "[Indexer] Poll leader lock held by another replica — skipping cycle",
+    );
+    pollCyclesCounter.inc({ status: "skipped_not_leader" });
+    return currentBackoff;
   }
 
   try {
-    let cursor = latestLedgerCursor;
-    if (cursor === undefined) {
-      cursor = latestLedgerSequence;
+    // On each poll, fetch the latest Stellar ledger to track lag and provide a
+    // fallback starting ledger when latestLedgerCursor is not yet initialized.
+    try {
+      const latest = await rpcServer.getLatestLedger();
+      setLatestSequence(latest.sequence);
+    } catch {
+      // Cannot reach the network; keep the previous sequence for lag computation
     }
 
-    if (cursor === undefined) {
+    const currentCursor = getCursor();
+    const configuredStartLedger = resolveConfiguredStartLedger(
+      getIndexFromLedger(),
+    );
+    const currentTip = getLatestSequence();
+
+    // Never fall back to ledger 0 (#1057): require an existing valid cursor, a
+    // configured INDEX_FROM_LEDGER (>= 1), or a fetched network tip (>= 1).
+    const startLedger =
+      currentCursor !== undefined &&
+      currentCursor !== null &&
+      currentCursor >= 1
+        ? currentCursor
+        : (configuredStartLedger ??
+          (currentTip !== undefined && currentTip >= 1
+            ? currentTip
+            : undefined));
+
+    if (startLedger === undefined) {
       currentBackoff = BASE_BACKOFF;
       pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
       pollCyclesCounter.inc({ status: "success" });
-      setTimeout(pollEvents, currentBackoff);
-      return;
+      return currentBackoff;
     }
 
     const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
@@ -1759,8 +1890,8 @@ async function pollEvents() {
     let response: Awaited<ReturnType<typeof server.getEvents>>;
     try {
       response = await Promise.race([
-        server.getEvents({
-          startLedger: latestLedgerCursor ?? 0,
+        rpcServer.getEvents({
+          startLedger,
           filters: CONTRACT_IDS.map((contractId) => ({
             type: "contract" as const,
             contractIds: [contractId],
@@ -1769,7 +1900,10 @@ async function pollEvents() {
           limit: 100,
         }),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("PER_LEDGER_TIMEOUT")), perLedgerTimeoutMs),
+          setTimeout(
+            () => reject(new Error("PER_LEDGER_TIMEOUT")),
+            perLedgerTimeoutMs,
+          ),
         ),
       ]);
       consecutiveSkips = 0;
@@ -1792,8 +1926,7 @@ async function pollEvents() {
         indexerLedgerSkipsCounter.inc();
         pollCyclesCounter.inc({ status: "timeout" });
         pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
-        setTimeout(pollEvents, currentBackoff);
-        return;
+        return currentBackoff;
       }
       throw err;
     }
@@ -1870,34 +2003,47 @@ async function pollEvents() {
       }
 
       if (pendingEvents.length > 0) {
-        const { maxInsertedLedger } = await flushIndexedEvents(pendingEvents);
-        if (latestLedgerCursor !== undefined && maxInsertedLedger !== null) {
-          latestLedgerCursor = Math.max(
-            latestLedgerCursor,
-            maxInsertedLedger + 1,
-          );
+        // Advance latestLedgerCursor ONLY after flushEvents commits (#1057).
+        // If flushEvents throws, we jump to catch without mutating the cursor.
+        const { maxInsertedLedger } = await flushEvents(pendingEvents);
+        const maxPendingLedger = pendingEvents.reduce<number | null>(
+          (max, evt) => (max === null ? evt.ledger : Math.max(max, evt.ledger)),
+          null,
+        );
+        const committedLedger = maxInsertedLedger ?? maxPendingLedger;
+        if (committedLedger !== null) {
+          setCursor(Math.max(startLedger, committedLedger + 1));
+        }
+      } else if (!aborted) {
+        const maxSkippedLedger = response.events.reduce<number | null>(
+          (max, evt) => (max === null ? evt.ledger : Math.max(max, evt.ledger)),
+          null,
+        );
+        if (maxSkippedLedger !== null) {
+          setCursor(Math.max(startLedger, maxSkippedLedger + 1));
         }
       }
 
       // #712 — one dispatch pass per poll cycle, after all writes for the cycle
       // have landed. Aborted cycles leave deliveries pending for the next pass.
       if (!aborted) {
-        await dispatchPendingWebhookDeliveries();
+        await dispatchWebhooks();
       }
-    } else if (
-      latestLedgerSequence !== undefined &&
-      latestLedgerCursor !== undefined
-    ) {
-      latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
+    } else if (!aborted) {
+      const tip = getLatestSequence();
+      if (tip !== undefined && tip >= 1) {
+        setCursor(Math.max(startLedger, tip));
+      } else if (currentCursor === undefined || currentCursor === null) {
+        setCursor(startLedger);
+      }
     }
 
-    if (!aborted) {
-      latestLedgerCursor = cursor;
-    }
+    const updatedCursor = getCursor();
+    const updatedTip = getLatestSequence();
 
     // Warn if the indexer is too far behind the network tip
-    if (latestLedgerSequence !== undefined && !aborted) {
-      const lag = latestLedgerSequence - cursor;
+    if (updatedTip !== undefined && !aborted) {
+      const lag = updatedTip - (updatedCursor ?? startLedger);
       if (lag > env.INDEXER_LAG_WARN_THRESHOLD) {
         fastify.log.warn(
           { lag, threshold: env.INDEXER_LAG_WARN_THRESHOLD },
@@ -1907,10 +2053,9 @@ async function pollEvents() {
     }
 
     // Issue #345 — Update lag metrics after each poll cycle
-    if (latestLedgerSequence !== undefined) {
-      indexerNetworkTipLedgerGauge.set(latestLedgerSequence);
-      const currentLag =
-        latestLedgerSequence - (latestLedgerCursor ?? latestLedgerSequence);
+    if (updatedTip !== undefined) {
+      indexerNetworkTipLedgerGauge.set(updatedTip);
+      const currentLag = updatedTip - (updatedCursor ?? updatedTip);
       for (const contractId of CONTRACT_IDS) {
         indexerLagGauge.set({ contractId }, currentLag);
       }
@@ -1921,14 +2066,14 @@ async function pollEvents() {
       }
     }
 
-    if (latestLedgerCursor !== undefined) {
-      indexerLastIndexedLedgerGauge.set(latestLedgerCursor);
+    if (updatedCursor !== undefined && updatedCursor !== null) {
+      indexerLastIndexedLedgerGauge.set(updatedCursor);
     }
 
     calculateBackoffAfterSuccess();
     pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
     pollCyclesCounter.inc({ status: "success" });
-    setTimeout(pollEvents, currentBackoff);
+    return currentBackoff;
   } catch (err) {
     fastify.log.error(`[Indexer] Polling error: ${err}`);
     pollCyclesCounter.inc({ status: "error" });
@@ -1937,8 +2082,22 @@ async function pollEvents() {
     fastify.log.info(
       `[Indexer] Retrying in ${Math.round(jitter)}ms (backoff: ${backoffMs}ms)`,
     );
-    setTimeout(pollEvents, jitter);
+    return jitter;
+  } finally {
+    if (lockAcquired) {
+      await redisClient.eval(RELEASE_POLL_LOCK_SCRIPT, 1, POLL_LEADER_LOCK_KEY, lockToken).catch((releaseErr) => {
+        fastify.log.warn(
+          { err: releaseErr },
+          "[Indexer] Failed to release poll leader lock",
+        );
+      });
+    }
   }
+}
+
+async function pollEvents() {
+  const nextDelayMs = await runPollCycle();
+  setTimeout(pollEvents, nextDelayMs);
 }
 
 /**
