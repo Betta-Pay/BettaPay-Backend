@@ -1573,18 +1573,44 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   },
 );
 
-// ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
+// ── Admin: dead-letter queue (#354, #1063) ───────────────────────────────────
+
+const DEFAULT_DEAD_LETTER_LIMIT = 50;
+const MAX_DEAD_LETTER_LIMIT = 200;
 
 fastify.get(
   "/api/admin/webhooks/dead-letter",
   { preValidation: [fastify.serviceAuth] },
-  async (request) => {
-    const { limit = 50, offset = 0 } = request.query as Record<
-      string,
-      unknown
-    > as { limit?: number; offset?: number };
-    const safeLimit = Math.min(Number(limit) || 50, 200);
-    const safeOffset = Math.max(Number(offset) || 0, 0);
+  async (request, reply) => {
+    const query = (request.query ?? {}) as {
+      limit?: number | string;
+      offset?: number | string;
+    };
+
+    let safeLimit = DEFAULT_DEAD_LETTER_LIMIT;
+    if (query.limit !== undefined) {
+      const parsedLimit =
+        typeof query.limit === "string" && query.limit.trim() === ""
+          ? Number.NaN
+          : Number(query.limit);
+      if (
+        !Number.isInteger(parsedLimit) ||
+        parsedLimit < 1 ||
+        parsedLimit > MAX_DEAD_LETTER_LIMIT
+      ) {
+        return reply.code(400).send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            `limit must be an integer between 1 and ${MAX_DEAD_LETTER_LIMIT}`,
+            { limit: query.limit, min: 1, max: MAX_DEAD_LETTER_LIMIT },
+            request.id,
+          ),
+        );
+      }
+      safeLimit = parsedLimit;
+    }
+
+    const safeOffset = Math.max(Number(query.offset) || 0, 0);
 
     const jobs = await dlqQueue.getJobs(
       ["failed"],
@@ -1665,13 +1691,28 @@ fastify.post<{ Params: { id: string } }>(
     // webhookWorker "failed" handler) — omitting it here meant a replayed
     // delivery arrived without the merchant's expected auth header and was
     // rejected (#614).
-    await webhookQueue.add("deliver", {
-      url: job.data.url,
-      event: (job.data.event ?? {}) as Record<string, unknown>,
-      signingSecret,
-      subscriptionId,
-      headers: job.data.headers,
-    });
+    try {
+      await webhookQueue.add("deliver", {
+        url: job.data.url,
+        event: (job.data.event ?? {}) as Record<string, unknown>,
+        signingSecret,
+        subscriptionId,
+        headers: job.data.headers,
+      });
+    } catch (err) {
+      fastify.log.error(
+        { err, jobId: id, url: job.data.url },
+        "[Indexer] Failed to re-enqueue DLQ job to webhook queue",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Webhook queue unavailable; failed to re-enqueue dead-letter job",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     // Remove from DLQ
     await job.remove();
