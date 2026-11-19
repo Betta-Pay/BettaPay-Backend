@@ -233,6 +233,7 @@ import {
   isEncrypted,
   encryptSensitiveFields,
   decryptSensitiveFields,
+  SENSITIVE_FIELDS,
 } from './encryption.js';
 
 const TEST_KEY = 'super-secret-32-character-encryption-key-for-bettapay!';
@@ -307,4 +308,51 @@ testNode('encryptSensitiveFields & decryptSensitiveFields: processes sensitive f
   assert.equal(decrypted.secretHash, 'raw-secret-hash-value');
   assert.equal(decrypted.nested.secret, 'nested-secret-value');
   assert.equal(decrypted.nested.name, 'Legit Merchant');
+});
+
+testNode('SENSITIVE_FIELDS: signingSecret is registered and round-trips through encryption (#1067)', () => {
+  assert.ok(SENSITIVE_FIELDS.has('signingSecret'), 'signingSecret is part of SENSITIVE_FIELDS');
+
+  const data = {
+    id: 'wh_123',
+    url: 'https://example.com/webhook',
+    signingSecret: 'whsec_plaintext_signing_secret_value',
+  };
+
+  const encrypted = encryptSensitiveFields(data, TEST_KEY);
+  assert.notEqual(encrypted.signingSecret, data.signingSecret, 'signingSecret is encrypted at rest');
+  assert.ok(isEncrypted(encrypted.signingSecret), 'encrypted signingSecret carries the $enc$v1$ prefix');
+  assert.equal(encrypted.url, data.url, 'non-sensitive fields are left untouched');
+
+  const decrypted = decryptSensitiveFields(encrypted, TEST_KEY);
+  assert.equal(decrypted.signingSecret, data.signingSecret, 'signingSecret decrypts back to the original value');
+});
+
+testNode('decryptField: rejects odd-length hex instead of silently truncating it (#1067)', () => {
+  // 12-byte iv, 16-byte auth tag, ciphertext with an odd number of hex chars
+  const payload = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(32)}:${'c'.repeat(5)}`;
+
+  assert.throws(
+    () => decryptField(payload, TEST_KEY),
+    /Invalid hex encoding in encrypted payload segment/i,
+    'odd-length hex is rejected with a descriptive error rather than truncated',
+  );
+});
+
+testNode('decryptField: rejects non-hex input instead of stopping at the first bad character (#1067)', () => {
+  const payload = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(32)}:${'zz'.repeat(8)}`;
+
+  assert.throws(
+    () => decryptField(payload, TEST_KEY),
+    /Invalid hex encoding in encrypted payload segment/i,
+    'non-hex characters are rejected with a descriptive error',
+  );
+});
+
+testNode('decryptField: malformed hex in the iv or auth tag segment is rejected too (#1067)', () => {
+  const badIv = `$enc$v1$${'zz'.repeat(12)}:${'b'.repeat(32)}:${'c'.repeat(16)}`;
+  const badTag = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(31)}:${'c'.repeat(16)}`;
+
+  assert.throws(() => decryptField(badIv, TEST_KEY), /Invalid hex encoding in encrypted payload segment/i, 'iv segment is validated');
+  assert.throws(() => decryptField(badTag, TEST_KEY), /Invalid hex encoding in encrypted payload segment/i, 'auth tag segment is validated');
 });

@@ -138,7 +138,16 @@ export function verifyPassword(encrypted: string, password: string): boolean {
 const TAG_LENGTH = 16; // 128-bit authentication tag
 const ENCRYPTED_PREFIX = '$enc$v1$';
 
-export const SENSITIVE_FIELDS = new Set(['secretHash', 'secret', 'privateKey', 'secretKey']);
+export const SENSITIVE_FIELDS = new Set([
+  'secretHash',
+  'secret',
+  'privateKey',
+  'secretKey',
+  // #1067 — webhook signing secrets are credentials like any other: without
+  // this entry encryptSensitiveFields/decryptSensitiveFields skipped them and
+  // the value moved through the system in plaintext.
+  'signingSecret',
+]);
 
 function deriveKey(secretKey?: string): Buffer {
   const key = secretKey || process.env.FIELD_ENCRYPTION_KEY;
@@ -188,6 +197,25 @@ export function decryptField(ciphertext: string, secretKey?: string): string {
   }
 
   const [ivHex, tagHex, encryptedHex] = parts;
+
+  // #1067 — Buffer.from(x, 'hex') does not throw on malformed input: it stops
+  // at the first invalid character (or drops a trailing nibble for odd-length
+  // strings) and silently returns a shorter buffer, which then fails later as
+  // a confusing "authentication tag mismatch". Reject bad hex up front with a
+  // clear error instead.
+  const hexSegments: Array<[string, string]> = [
+    ['iv', ivHex],
+    ['auth tag', tagHex],
+    ['ciphertext', encryptedHex],
+  ];
+  for (const [segment, value] of hexSegments) {
+    if (value.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(value)) {
+      throw new Error(
+        `Invalid hex encoding in encrypted payload segment: ${segment}`,
+      );
+    }
+  }
+
   const iv = Buffer.from(ivHex, 'hex');
   const tag = Buffer.from(tagHex, 'hex');
   const encrypted = Buffer.from(encryptedHex, 'hex');
