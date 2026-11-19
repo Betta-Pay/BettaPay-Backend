@@ -352,6 +352,17 @@ webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
 });
 
+// #1059 — shared QueueEvents for POST /api/webhooks/:id/test completion
+// notifications. It used to be constructed per request, which opened (and, on
+// close, tore down) a fresh Redis connection for every test delivery; the
+// module-scope instance is created once and closed during shutdown.
+export const webhookQueueEvents = new QueueEvents("indexer-webhooks", {
+  connection: sharedRedis,
+});
+webhookQueueEvents.on("error", (err) => {
+  fastify.log.error({ err: err.message }, "[Indexer] Webhook QueueEvents error");
+});
+
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
 const replayQueue = new Queue("indexer-replays", {
@@ -1484,7 +1495,12 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
         url: existing.url,
         event: payload,
         version: "1.0",
-        signingSecret: existing.signingSecret ?? undefined,
+        // #1059 — signingSecret is stored encrypted (#617). Enqueueing the
+        // ciphertext made the worker sign test payloads with the encrypted
+        // bytes, so receivers never matched the HMAC signature.
+        signingSecret: existing.signingSecret
+          ? decryptField(existing.signingSecret)
+          : undefined,
         headers:
           (existing.headers as Record<string, string> | null) ?? undefined,
         traceId: (request as any).traceId ?? request.headers["x-trace-id"] ?? undefined,
@@ -1493,12 +1509,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       { attempts: 1 },
     );
 
-    const queueEvents = new QueueEvents("indexer-webhooks", {
-      connection: sharedRedis,
-    });
     try {
       const finished = await Promise.race([
-        job.waitUntilFinished(queueEvents),
+        job.waitUntilFinished(webhookQueueEvents),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
         ),
@@ -1538,8 +1551,6 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       const response: any = { success: false, error: errorMsg };
       if (statusCode) response.statusCode = statusCode;
       return response;
-    } finally {
-      await queueEvents.close();
     }
   },
 );
@@ -2114,6 +2125,9 @@ const shutdown = async (signal: string) => {
       fastify.log,
       getActiveWebhookJob,
     );
+    // #1059 — the shared QueueEvents instance must be closed on shutdown too,
+    // otherwise its Redis connection outlives the process teardown sequence.
+    await webhookQueueEvents.close();
     await dlqQueue.close();
     await replayProgressRedis.quit().catch(() => {});
     await fastify.close();
