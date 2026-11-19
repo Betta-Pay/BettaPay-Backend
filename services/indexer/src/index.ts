@@ -21,6 +21,7 @@ import {
   createWebhookQueue,
   createWebhookWorker,
   WEBHOOK_DEFAULTS,
+  type WebhookJobData,
 } from "@bettapay/webhook-delivery";
 import { closeWorkerWithTimeout, trackActiveJob } from "@bettapay/worker-shutdown";
 import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
@@ -289,7 +290,7 @@ export function calculateBackoffAfterError(err: unknown): number {
 // safety — see shared/webhook-delivery/index.ts for details).
 export const webhookQueue = createWebhookQueue("indexer-webhooks", sharedRedis);
 // Ensure only one webhook worker is created to prevent duplicate deliveries
-const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
+export const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
@@ -301,7 +302,7 @@ const getActiveWebhookJob = trackActiveJob(webhookWorker);
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
 // The queue relies on the unconditionally initialized canonical sharedRedis client
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
-const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
+export const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   connection: sharedRedis,
   defaultJobOptions: {
     removeOnComplete: { count: 100 },
@@ -309,21 +310,47 @@ const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   },
 });
 
+/**
+ * Builds the dead-letter payload for a permanently failed webhook delivery job,
+ * stripping plaintext `signingSecret` before persisting (#1064).
+ *
+ * @internal exported for testing
+ */
+export function buildDeadLetterPayload(
+  job: {
+    id?: string;
+    attemptsMade: number;
+    data?: WebhookJobData | Record<string, unknown>;
+  },
+  err: unknown,
+): Record<string, unknown> {
+  const { signingSecret: _redacted, ...safeJobData } = (job.data ??
+    {}) as Record<string, unknown>;
+  return {
+    ...safeJobData,
+    failedAt: new Date().toISOString(),
+    error:
+      err instanceof Error
+        ? err.message
+        : (err as { message?: string } | null | undefined)?.message ??
+          String(err),
+    attempts: job.attemptsMade,
+    originalJobId: job.id,
+  };
+}
+
 webhookWorker.on("failed", async (job, err) => {
   if (
     !job ||
     job.attemptsMade < (job.opts.attempts ?? WEBHOOK_DEFAULTS.attempts)
   )
     return;
-  // All retries exhausted — move to DLQ
+  // All retries exhausted — move to DLQ with signingSecret stripped (#1064)
   try {
-    await dlqQueue.add("failed-delivery", {
-      ...job.data,
-      failedAt: new Date().toISOString(),
-      error: err?.message ?? String(err),
-      attempts: job.attemptsMade,
-      originalJobId: job.id,
-    } as any);
+    await dlqQueue.add(
+      "failed-delivery",
+      buildDeadLetterPayload(job, err) as any,
+    );
     fastify.log.warn(
       { jobId: job.id, url: job.data.url },
       "[Indexer] Webhook moved to dead-letter queue after all retries",
@@ -750,6 +777,7 @@ export async function dispatchPendingWebhookDeliveries(): Promise<void> {
           event: delivery.event,
           version: "1.0",
           signingSecret: decryptedSecret,
+          subscriptionId: delivery.subscriptionId,
           headers: delivery.headers ?? undefined,
         },
         { jobId: `indexed-event-delivery-${delivery.id}` },
@@ -1485,6 +1513,7 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
         event: payload,
         version: "1.0",
         signingSecret: existing.signingSecret ?? undefined,
+        subscriptionId: existing.id,
         headers:
           (existing.headers as Record<string, string> | null) ?? undefined,
         traceId: (request as any).traceId ?? request.headers["x-trace-id"] ?? undefined,
@@ -1580,6 +1609,28 @@ fastify.get(
   },
 );
 
+async function resolveSubscriptionSigningSecret(
+  subscriptionId?: string,
+  url?: string,
+): Promise<string | undefined> {
+  let subscription: Pick<WebhookSubscription, "signingSecret"> | null = null;
+  if (subscriptionId) {
+    subscription = await prisma.webhookSubscription.findUnique({
+      where: { id: subscriptionId },
+      select: { signingSecret: true },
+    });
+  } else if (url) {
+    subscription = await prisma.webhookSubscription.findFirst({
+      where: { url },
+      orderBy: { createdAt: "desc" },
+      select: { signingSecret: true },
+    });
+  }
+  return subscription?.signingSecret
+    ? decryptField(subscription.signingSecret)
+    : undefined;
+}
+
 fastify.post<{ Params: { id: string } }>(
   "/api/admin/webhooks/dead-letter/:id/replay",
   { preValidation: [fastify.serviceAuth] },
@@ -1592,16 +1643,33 @@ fastify.post<{ Params: { id: string } }>(
       );
     }
 
+    const subscriptionId =
+      typeof job.data.subscriptionId === "string"
+        ? job.data.subscriptionId
+        : typeof (job.data.event as Record<string, unknown> | undefined)
+              ?.subscriptionId === "string"
+          ? ((job.data.event as Record<string, unknown>)
+              .subscriptionId as string)
+          : undefined;
+
+    // Re-fetch and decrypt signingSecret from the subscription record because
+    // dead-letter payloads strip plaintext secrets before persisting (#1064).
+    const signingSecret = await resolveSubscriptionSigningSecret(
+      subscriptionId,
+      job.data.url,
+    );
+
     // Re-enqueue on the main webhook delivery queue. Custom headers
     // (Authorization, X-Idempotency-Key, ...) live on job.data.headers
-    // alongside url/event/signingSecret (see dispatchPendingWebhookDeliveries
-    // and the webhookWorker "failed" handler that spreads job.data into the
-    // DLQ) — omitting it here meant a replayed delivery arrived without the
-    // merchant's expected auth header and was rejected (#614).
+    // alongside url/event (see dispatchPendingWebhookDeliveries and the
+    // webhookWorker "failed" handler) — omitting it here meant a replayed
+    // delivery arrived without the merchant's expected auth header and was
+    // rejected (#614).
     await webhookQueue.add("deliver", {
       url: job.data.url,
       event: (job.data.event ?? {}) as Record<string, unknown>,
-      signingSecret: job.data.signingSecret,
+      signingSecret,
+      subscriptionId,
       headers: job.data.headers,
     });
 
