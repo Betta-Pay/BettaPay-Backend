@@ -78,21 +78,34 @@ export function createLoggerOptions(options: LoggerConfigOptions = {}) {
   };
 }
 
+// Single source of truth for last-resort process guards lives in
+// crash-handlers.ts; re-exported here so existing `@bettapay/validation`
+// imports keep working (#1080).
+export { installCrashHandlers } from './crash-handlers.js';
+export type { CrashHandlerLogger } from './crash-handlers.js';
+
 /**
- * Last-resort process guards so a missed await or stray throw produces a
- * structured fatal log instead of silently killing the container. Nothing is
- * registered until this is called.
+ * Flushes a Pino logger's buffered output, giving up after `timeoutMs` so a
+ * wedged destination can never block process exit. Loggers without `flush`
+ * resolve immediately.
  */
-export function installCrashHandlers(log: FastifyBaseLogger): void {
-  process.on('unhandledRejection', (reason: unknown) => {
-    log.fatal(
-      { err: reason instanceof Error ? reason : new Error(String(reason)), errorClass: 'fatal' as const },
-      'Unhandled promise rejection — exiting for supervisor restart',
-    );
-    process.exitCode = 1;
-  });
-  process.on('uncaughtException', (err: Error) => {
-    log.fatal({ err, errorClass: 'fatal' as const }, 'Uncaught exception — exiting');
-    process.exit(1);
+export function flushLogger(
+  log: object,
+  timeoutMs = 500,
+): Promise<void> {
+  const flush = (log as { flush?: unknown }).flush;
+  if (typeof flush !== 'function') return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    try {
+      (flush as (cb?: (err?: Error) => void) => void).call(log, done);
+    } catch {
+      done();
+    }
   });
 }
