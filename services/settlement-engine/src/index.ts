@@ -1519,6 +1519,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         feeBps,
         monthlyVolume,
         discountTiers,
+        d.asset,
+        { maxFeeBps, maxFeeThreshold },
       );
     } catch (error) {
       if (error instanceof SettlementAmountError) {
@@ -1742,7 +1744,14 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       let itemResult;
       try {
-        itemResult = computeSettlementAmounts(item.amount as Amount, feeBps, monthlyVolume, discountTiers);
+        itemResult = computeSettlementAmounts(
+          item.amount as Amount,
+          feeBps,
+          monthlyVolume,
+          discountTiers,
+          item.asset,
+          { maxFeeBps, maxFeeThreshold },
+        );
       } catch (error) {
         if (error instanceof SettlementAmountError) {
           errors.push({ index: i, reason: error.message });
