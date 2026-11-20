@@ -5,6 +5,7 @@ import { registerErrorHandler } from "@bettapay/validation";
 import {
   createQuoteQuerySchema,
   FX_QUOTE_BODY_LIMIT_DEFAULT,
+  FX_QUOTE_BODY_LIMIT_MIN,
   isPositiveFiniteAmount,
   POSITIVE_AMOUNT_MESSAGE,
   resolveFxQuoteBodyLimit,
@@ -44,6 +45,32 @@ test("quote body limit is configurable and falls back safely", () => {
   assert.equal(resolveFxQuoteBodyLimit(32_768), 32_768);
   assert.equal(resolveFxQuoteBodyLimit("not-a-number"), FX_QUOTE_BODY_LIMIT_DEFAULT);
   assert.equal(resolveFxQuoteBodyLimit(undefined), FX_QUOTE_BODY_LIMIT_DEFAULT);
+});
+
+test("quote body limit honours integers of at least 1KB", () => {
+  assert.equal(FX_QUOTE_BODY_LIMIT_MIN, 1024);
+  assert.equal(resolveFxQuoteBodyLimit(1024), 1024);
+  assert.equal(resolveFxQuoteBodyLimit("1024"), 1024);
+  assert.equal(resolveFxQuoteBodyLimit(" 2048 "), 2048);
+  assert.equal(resolveFxQuoteBodyLimit(10_485_760), 10_485_760);
+});
+
+test("quote body limit falls back for sub-1KB, zero and negative values", () => {
+  for (const raw of [1, 512, 1023, "1", "1023", 0, "0", -1, "-2048", -1024]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${raw} falls back`);
+  }
+});
+
+test("quote body limit falls back for fractional and non-finite values instead of truncating", () => {
+  for (const raw of [2048.5, "2048.5", "1024.0", 1500.25, NaN, Infinity, -Infinity, Number.MAX_VALUE]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${raw} falls back`);
+  }
+});
+
+test("quote body limit falls back for unparseable or empty input", () => {
+  for (const raw of ["", "   ", "64kb", "1e4", "0x800", "abc", undefined]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${String(raw)} falls back`);
+  }
 });
 
 test("oversized quote body returns a typed 413 and a normal body is processed", async () => {
