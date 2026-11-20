@@ -237,18 +237,33 @@ const indexerDedupEventsTotal = new promClient.Counter({
   help: "Total number of on-chain events dropped as duplicates (Prisma P2002 / skipDuplicates)",
 });
 
-function parseRetryAfterMs(err: unknown): number | null {
+/** @internal exported for testing only */
+export function parseRetryAfterMs(
+  err: unknown,
+  nowMs: number = Date.now(),
+): number | null {
   const status = (err as any)?.response?.status ?? (err as any)?.status;
   if (status !== 429) return null;
 
   const retryHeader =
     (err as any)?.response?.headers?.["retry-after"] ??
+    (err as any)?.response?.headers?.["Retry-After"] ??
     (err as any)?.response?.headers?.get?.("retry-after");
-  if (!retryHeader) return null;
+  if (retryHeader === undefined || retryHeader === null) return null;
 
-  const retrySeconds = parseInt(String(retryHeader), 10);
-  if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
-  return retrySeconds * 1000;
+  const raw = String(retryHeader).trim();
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const retrySeconds = Number(raw);
+    if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
+    return retrySeconds * 1000;
+  }
+
+  const retryDateMs = Date.parse(raw);
+  if (!Number.isFinite(retryDateMs)) return null;
+  const delayMs = retryDateMs - nowMs;
+  return delayMs > 0 ? delayMs : null;
 }
 
 export function getCurrentBackoffMs(): number {
@@ -866,28 +881,47 @@ async function loadWebhookSubscriptions(): Promise<WebhookSubscription[]> {
   return cacheState.subscriptions.data;
 }
 
+/** @internal exported for testing only */
+export const FLUSH_BATCH_SIZE = 500;
+
 /**
- * #713 — Persist a whole poll cycle's events with one `createMany` instead of a
- * `create` per event, preserving the composite-unique P2002-skip semantics via
- * `skipDuplicates`. Webhook deliveries are created in a single batch for the
- * events that actually landed. Returns the inserted count and the highest
- * ledger among them so the caller can advance its cursor.
+ * #713 — Persist a whole poll cycle's events with chunked `createMany` calls
+ * instead of a `create` per event, preserving the composite-unique P2002-skip
+ * semantics via `skipDuplicates` while staying safely under Postgres's
+ * 65,535-parameter limit (#1065). Webhook deliveries are also created in
+ * bounded chunks for the events that actually landed. Returns the inserted
+ * count and the highest ledger among them so the caller can advance its cursor.
+ *
+ * @internal exported for testing only
  */
-async function flushIndexedEvents(
+export async function flushIndexedEvents(
   data: Prisma.IndexedEventCreateManyInput[],
+  batchSize: number = FLUSH_BATCH_SIZE,
 ): Promise<{ inserted: number; maxInsertedLedger: number | null }> {
   if (data.length === 0) return { inserted: 0, maxInsertedLedger: null };
 
-  await prisma.indexedEvent.createMany({ data, skipDuplicates: true });
+  const safeBatchSize =
+    Number.isFinite(batchSize) && batchSize > 0
+      ? Math.floor(batchSize)
+      : FLUSH_BATCH_SIZE;
 
-  // `createMany` does not report which rows were skipped, so read back the ids
-  // that landed. Deliveries must exist only for newly-persisted events, exactly
-  // as the per-event path did after a successful create.
-  const insertedRows = await prisma.indexedEvent.findMany({
-    where: { id: { in: data.map((row) => row.id) } },
-    select: { id: true },
-  });
-  const insertedIds = new Set(insertedRows.map((row) => row.id));
+  const insertedIds = new Set<string>();
+  for (let i = 0; i < data.length; i += safeBatchSize) {
+    const chunk = data.slice(i, i + safeBatchSize);
+    await prisma.indexedEvent.createMany({ data: chunk, skipDuplicates: true });
+
+    // `createMany` does not report which rows were skipped, so read back the ids
+    // that landed. Deliveries must exist only for newly-persisted events, exactly
+    // as the per-event path did after a successful create.
+    const insertedRows = await prisma.indexedEvent.findMany({
+      where: { id: { in: chunk.map((row) => row.id) } },
+      select: { id: true },
+    });
+    for (const row of insertedRows) {
+      insertedIds.add(row.id);
+    }
+  }
+
   const records = data.filter((row) => insertedIds.has(row.id));
 
   for (const record of records) {
@@ -905,22 +939,25 @@ async function flushIndexedEvents(
   if (records.length > 0) {
     const subs = await loadWebhookSubscriptions();
     if (subs.length) {
-      await (prisma as any).indexedEventWebhookDelivery.createMany({
-        data: records.flatMap((record) =>
-          subs.map((sub) => ({
-            id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
-            indexedEventId: record.id,
-            subscriptionId: sub.id,
-            url: sub.url,
-            event: record,
-            signingSecret: sub.signingSecret
-              ? encryptField(sub.signingSecret)
-              : undefined,
-            headers: (sub.headers as Record<string, string> | null) ?? undefined,
-          })),
-        ),
-        skipDuplicates: true,
-      });
+      const deliveries = records.flatMap((record) =>
+        subs.map((sub) => ({
+          id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+          indexedEventId: record.id,
+          subscriptionId: sub.id,
+          url: sub.url,
+          event: record,
+          signingSecret: sub.signingSecret
+            ? encryptField(sub.signingSecret)
+            : undefined,
+          headers: (sub.headers as Record<string, string> | null) ?? undefined,
+        })),
+      );
+      for (let i = 0; i < deliveries.length; i += safeBatchSize) {
+        await (prisma as any).indexedEventWebhookDelivery.createMany({
+          data: deliveries.slice(i, i + safeBatchSize),
+          skipDuplicates: true,
+        });
+      }
     }
   }
 
@@ -1323,18 +1360,27 @@ fastify.post(
       );
     }
 
-    // Both modes return the same fields; only `status` (and whether rows were
-    // deleted) differs. A real run reports the preview of what it removed.
-    const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
+    // Only run the dry-run preview queries when dryRun=true; a real run
+    // executes deleteMany directly to avoid redundant count/size queries (#1065).
     if (dryRun) {
+      const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
       return reply
         .code(200)
         .send({ status: "dry-run", ...preview, deletedCount: 0 });
     }
-    const deletedCount = (await cleanupOldEvents()) as number;
-    return reply
-      .code(200)
-      .send({ status: "completed", ...preview, deletedCount });
+    const deletedCount = (await cleanupOldEvents(false)) as number;
+    const retentionDays =
+      Number.isFinite(env.EVENT_RETENTION_DAYS) && env.EVENT_RETENTION_DAYS > 0
+        ? env.EVENT_RETENTION_DAYS
+        : 0;
+    return reply.code(200).send({
+      status: "completed",
+      wouldDelete: deletedCount,
+      totalSizeBytes: 0,
+      retentionDays,
+      oldestEventDate: "",
+      deletedCount,
+    });
   },
 );
 
@@ -1842,7 +1888,7 @@ export function buildCleanupWhere(
   retentionDays: number,
   now: Date,
 ): { indexedAt: { lt: Date } } | null {
-  if (retentionDays <= 0) return null;
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return null;
   const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
   return { indexedAt: { lt: cutoff } };
 }
