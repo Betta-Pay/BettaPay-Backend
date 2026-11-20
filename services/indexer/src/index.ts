@@ -1204,14 +1204,14 @@ fastify.post(
         );
     }
 
-    const activeReplay = getActiveReplayJob();
-    const activeReplayData = activeReplay?.data as
-      | { fromLedger?: number; toLedger?: number }
-      | undefined;
-    if (
-      activeReplayData?.fromLedger === fromLedger &&
-      activeReplayData?.toLedger === toLedger
-    ) {
+    // Any in-flight replay counts, not just one, when the worker runs jobs concurrently (#1095).
+    const activeReplay = getActiveReplayJob().find((job) => {
+      const data = job.data as
+        | { fromLedger?: number; toLedger?: number }
+        | undefined;
+      return data?.fromLedger === fromLedger && data?.toLedger === toLedger;
+    });
+    if (activeReplay) {
       return reply.code(409).send(
         createErrorResponse(
           "CONFLICT",
@@ -1289,15 +1289,17 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
         );
     }
 
-    const activeContractReplay = getActiveReplayJob();
-    const activeContractReplayData = activeContractReplay?.data as
-      | { contractId?: string; fromLedger?: number; toLedger?: number }
-      | undefined;
-    if (
-      activeContractReplayData?.contractId === contractId &&
-      activeContractReplayData?.fromLedger === startLedger &&
-      activeContractReplayData?.toLedger === endLedger
-    ) {
+    const activeContractReplay = getActiveReplayJob().find((job) => {
+      const data = job.data as
+        | { contractId?: string; fromLedger?: number; toLedger?: number }
+        | undefined;
+      return (
+        data?.contractId === contractId &&
+        data?.fromLedger === startLedger &&
+        data?.toLedger === endLedger
+      );
+    });
+    if (activeContractReplay) {
       return reply.code(409).send(
         createErrorResponse(
           "CONFLICT",

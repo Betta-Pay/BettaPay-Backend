@@ -16,11 +16,11 @@ function collectFiles(dir) {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
+      // scripts/ is intentionally NOT excluded so operational/migration scripts are linted too (#1100)
       if (
         entry.name === 'node_modules' ||
         entry.name === 'dist' ||
-        entry.name === '.git' ||
-        entry.name === 'scripts'
+        entry.name === '.git'
       ) {
         continue;
       }
@@ -57,8 +57,8 @@ for (const file of files) {
       return;
     }
 
-    // Check: Debugger statement
-    if (/\bdebugger\b;?/.test(line)) {
+    // Check: Debugger statement (statement position only, so regex/string literals don't match)
+    if (/(?:^|[;{}])\s*debugger\s*(?:;|}|$)/.test(line)) {
       console.error(`[LINT] ${relPath}:${lineNum}: 'debugger' statement is forbidden in production code`);
       violations++;
     }
