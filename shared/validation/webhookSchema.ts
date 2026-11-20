@@ -59,6 +59,13 @@ export function isPrivateOrRestrictedIp(ip: string): boolean {
       if (net.isIPv4(v4Part)) {
         return isPrivateOrRestrictedIp(v4Part);
       }
+      // Hex form produced by URL normalisation (::ffff:7f00:1 === ::ffff:127.0.0.1)
+      const hexMatch = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v4Part);
+      if (hexMatch) {
+        const hi = parseInt(hexMatch[1], 16);
+        const lo = parseInt(hexMatch[2], 16);
+        return isPrivateOrRestrictedIp(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+      }
     }
     // Unique local (fc00::/7)
     if (/^f[cd][0-9a-f]{2}:/i.test(lower) || lower.startsWith('fc') || lower.startsWith('fd')) {
@@ -96,6 +103,14 @@ export function isHostAllowed(host: string, allowedHosts: string[]): boolean {
   return false;
 }
 
+/** Removes the surrounding `[` `]` from a bracketed IPv6 host literal. */
+export function stripIpv6Brackets(host: string): string {
+  if (host.length >= 2 && host.startsWith('[') && host.endsWith(']')) {
+    return host.slice(1, -1);
+  }
+  return host;
+}
+
 export interface WebhookTestTargetValidation {
   allowed: boolean;
   reason?: string;
@@ -126,10 +141,12 @@ export async function validateWebhookTestTarget(
     };
   }
 
-  const hostname = url.hostname;
+  // WHATWG URL keeps the brackets on IPv6 literals (`[::1]`), which makes
+  // net.isIP() return 0 and would skip the private-IP check below (#1079).
+  const hostname = stripIpv6Brackets(url.hostname);
 
   // 2. Validate host against configurable host allowlist
-  if (!isHostAllowed(hostname, allowedHosts)) {
+  if (!isHostAllowed(hostname, allowedHosts) && !isHostAllowed(url.hostname, allowedHosts)) {
     return {
       allowed: false,
       reason: `Host "${hostname}" is not in the webhook test allowlist.`,
@@ -197,7 +214,26 @@ function isPrivateOrLocalhost(urlString: string): boolean {
 export const WEBHOOK_VALIDATE_RATE_LIMIT = 10;
 export const WEBHOOK_VALIDATE_RATE_WINDOW_SEC = 60;
 export const DNS_CACHE_TTL_MS = 60_000;
+// Upper bound on cached hostnames so arbitrary user-supplied webhook hosts
+// cannot grow the cache without limit (#1079).
+export const DNS_CACHE_MAX_SIZE = 1_000;
 const dnsCache = new Map<string, { addresses: string[]; timestamp: number }>();
+
+function setDnsCacheEntry(hostname: string, addresses: string[]): void {
+  // Re-inserting moves the key to the end of the Map's insertion order, so
+  // the first key is always the least recently written entry.
+  dnsCache.delete(hostname);
+  while (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
+    const oldest = dnsCache.keys().next().value;
+    if (oldest === undefined) break;
+    dnsCache.delete(oldest);
+  }
+  dnsCache.set(hostname, { addresses, timestamp: Date.now() });
+}
+
+export function getDnsCacheSize(): number {
+  return dnsCache.size;
+}
 
 export async function checkWebhookRateLimit(redis: Redis, ip: string): Promise<boolean> {
   const key = `webhook_validate_rate:${ip}`;
@@ -214,9 +250,10 @@ export async function resolveWithCache(url: string): Promise<string[]> {
   if (cached && Date.now() - cached.timestamp < DNS_CACHE_TTL_MS) {
     return cached.addresses;
   }
+  if (cached) dnsCache.delete(hostname);
   try {
     const addresses = await dns.promises.resolve4(hostname);
-    dnsCache.set(hostname, { addresses, timestamp: Date.now() });
+    setDnsCacheEntry(hostname, addresses);
     return addresses;
   } catch {
     return [];

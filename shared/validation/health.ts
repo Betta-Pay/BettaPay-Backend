@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import type { AggregatedHealthResponse, DependencyHealth, HealthResponse, HealthStatus } from './schemas.js';
@@ -9,15 +9,30 @@ export const HEALTH_CHECK_TIMEOUT_MS = 3_000;
 export const UPSTREAM_HEALTH_TIMEOUT_MS = 5_000;
 export const POSTGRESQL_DEGRADED_LATENCY_MS = 1000;
 
-export function readServiceVersion(importMetaUrl: string): string {
-  const serviceDir = dirname(fileURLToPath(importMetaUrl));
-  const pkgPath = join(serviceDir, '../package.json');
+function readPackageVersion(pkgPath: string): string | undefined {
   try {
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: string };
-    return pkg.version ?? '0.0.0';
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : undefined;
   } catch {
-    return '0.0.0';
+    return undefined;
   }
+}
+
+/**
+ * Resolves the calling service's package.json version. Walks upward from the
+ * module's directory so it works from both `src/` and compiled `dist/` (or
+ * nested `dist/src/`) layouts, then falls back to `process.cwd()` (#1083).
+ */
+export function readServiceVersion(importMetaUrl: string): string {
+  let dir = dirname(fileURLToPath(importMetaUrl));
+  const { root } = parse(dir);
+  for (;;) {
+    const version = readPackageVersion(join(dir, 'package.json'));
+    if (version) return version;
+    if (dir === root) break;
+    dir = dirname(dir);
+  }
+  return readPackageVersion(join(process.cwd(), 'package.json')) ?? '0.0.0';
 }
 
 export function computeOverallStatus(
@@ -84,13 +99,22 @@ export async function checkPostgresql(
   const serverVersion = result.ok ? extractPostgresqlServerVersion(result.value) : null;
 
   if (result.ok) {
+    // Connection status stays binary (envelope unchanged); a slow response is
+    // surfaced via details.degraded so buildHealthResponse can downgrade (#1083).
+    const degraded = result.latencyMs > POSTGRESQL_DEGRADED_LATENCY_MS;
+    const details: Record<string, unknown> = {};
+    if (serverVersion) details.serverVersion = serverVersion;
+    if (degraded) {
+      details.degraded = true;
+      details.degradedThresholdMs = POSTGRESQL_DEGRADED_LATENCY_MS;
+    }
     return {
       name: 'postgresql',
       status: 'connected',
       latencyMs: result.latencyMs,
       healthy: true,
       serverVersion,
-      details: serverVersion ? { serverVersion } : undefined,
+      details: Object.keys(details).length > 0 ? details : undefined,
     };
   }
 
@@ -162,12 +186,18 @@ export async function checkRedisPing(
       ...(Object.keys(details).length > 0 ? { details } : {}),
     };
   }
+
+  details.error = result.ok
+    ? `Unexpected PING response: ${String(result.value)}`
+    : result.error instanceof Error
+      ? result.error.message
+      : String(result.error);
   
   return { 
     name: 'redis', 
     status: 'disconnected', 
     latencyMs: result.latencyMs,
-    ...(Object.keys(details).length > 0 ? { details } : {}),
+    details,
   };
 }
 
@@ -202,14 +232,20 @@ export async function checkBullMQ(
     return { name: queueName, status: 'disconnected', latencyMs: result.latencyMs };
   }
 
-  const { counts, isPaused } = result.value;
+  const { isPaused } = result.value;
+  // getJobCounts may return null/undefined or omit/mistype keys (#1083).
+  const counts: Record<string, unknown> = result.value.counts ?? {};
+  const count = (key: string): number => {
+    const value = counts[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  };
   const details = {
     queueName,
     isPaused,
-    waiting: counts.waiting ?? 0,
-    active: counts.active ?? 0,
-    failed: counts.failed ?? 0,
-    delayed: counts.delayed ?? 0,
+    waiting: count('waiting'),
+    active: count('active'),
+    failed: count('failed'),
+    delayed: count('delayed'),
   };
 
   // A paused queue processes no jobs, so treat it as down regardless of job counts.
@@ -340,8 +376,8 @@ export function buildHealthResponse(params: {
   const postgresLatencyExceeded = combined.some((dep) =>
     dep.name === 'postgresql' &&
     dep.status === 'connected' &&
-    typeof dep.latencyMs === 'number' &&
-    dep.latencyMs > POSTGRESQL_DEGRADED_LATENCY_MS,
+    ((dep.details as Record<string, unknown> | undefined)?.degraded === true ||
+      (typeof dep.latencyMs === 'number' && dep.latencyMs > POSTGRESQL_DEGRADED_LATENCY_MS)),
   );
 
   if (status === 'healthy' && postgresLatencyExceeded) {
