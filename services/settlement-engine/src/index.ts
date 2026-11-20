@@ -1943,6 +1943,7 @@ const batchWorker = new Worker(
           minCount: env.BATCH_MIN_COUNT,
           volumeThreshold: env.BATCH_VOLUME_THRESHOLD,
           maxBatchSize: env.BATCH_MAX_SIZE,
+          redis,
         },
         lastBatchCompletedAt,
         fastify.log,
