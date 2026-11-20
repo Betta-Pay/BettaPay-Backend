@@ -855,6 +855,28 @@ test('canonicalize — semantically identical payloads produce identical bytes',
   t.end();
 });
 
+test('#1094 — canonicalize serializes Date instances as ISO-8601 strings', (t) => {
+  const at = new Date('2026-01-02T03:04:05.678Z');
+  t.equal(canonicalize(at), '"2026-01-02T03:04:05.678Z"', 'top-level Date');
+  t.equal(
+    canonicalize({ createdAt: at, id: 'evt_1' }),
+    '{"createdAt":"2026-01-02T03:04:05.678Z","id":"evt_1"}',
+    'Date property is not collapsed to {}',
+  );
+  t.equal(
+    canonicalize({ event: { times: [at, { settledAt: at }] } }),
+    '{"event":{"times":["2026-01-02T03:04:05.678Z",{"settledAt":"2026-01-02T03:04:05.678Z"}]}}',
+    'nested Dates inside arrays and objects are preserved',
+  );
+  t.equal(canonicalize({ at: new Date('nope') }), '{"at":null}', 'invalid Date mirrors JSON.stringify (null)');
+  t.equal(
+    canonicalize({ b: at, a: 1 }),
+    canonicalize(JSON.parse(JSON.stringify({ b: at, a: 1 }))),
+    'Date payload canonicalizes identically to its JSON round-trip',
+  );
+  t.end();
+});
+
 test('#567 — signature survives canonical re-serialization (sign & verify the canonical form)', (t) => {
   const secret = 'merchant-secret';
   const payload = {
