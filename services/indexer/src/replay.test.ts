@@ -89,7 +89,8 @@ test('replay: status endpoint requires a service token', (t) => {
 test('replay: graceful shutdown closes replay queue and worker', (t) => {
   t.ok(content.includes('replayQueue.close()'), 'replayQueue closed on shutdown');
   t.ok(content.includes('replayWorker.close()'), 'replayWorker closed on shutdown');
-  t.ok(content.includes('replayProgressRedis.quit()'), 'replayProgressRedis quit on shutdown');
+  t.ok(content.includes('sharedRedis.quit()'), 'sharedRedis quit on shutdown');
+  t.notOk(content.includes('replayProgressRedis'), 'unused replayProgressRedis client removed');
   t.end();
 });
 
