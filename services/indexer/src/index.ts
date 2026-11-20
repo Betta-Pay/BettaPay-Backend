@@ -1474,17 +1474,45 @@ fastify.get(
   },
 );
 
-fastify.delete<{ Params: { id: string } }>(
+fastify.delete<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   "/api/webhooks/:id",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
+    const queryMerchantId =
+      typeof request.query?.merchantId === "string"
+        ? request.query.merchantId.trim() || undefined
+        : undefined;
+    const rawHeaderMerchantId = request.headers["x-merchant-id"];
+    const headerMerchantId =
+      typeof rawHeaderMerchantId === "string"
+        ? rawHeaderMerchantId.trim() || undefined
+        : Array.isArray(rawHeaderMerchantId)
+          ? rawHeaderMerchantId[0]?.trim() || undefined
+          : undefined;
+    const callerMerchantId = queryMerchantId ?? headerMerchantId;
+
     const existing = await prisma.webhookSubscription.findUnique({
       where: { id },
     });
     if (!existing) {
       return reply.code(404).send(
-        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
+      );
+    }
+    if (callerMerchantId && existing.merchantId !== callerMerchantId) {
+      return reply.code(403).send(
+        createErrorResponse(
+          ErrorCodes.FORBIDDEN,
+          "Cannot delete webhook subscription owned by another merchant",
+          undefined,
+          request.id,
+        ),
       );
     }
     await prisma.$transaction(async (tx) => {
