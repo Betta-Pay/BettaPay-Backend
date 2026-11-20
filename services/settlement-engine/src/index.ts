@@ -86,6 +86,11 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
   }
   return out as T;
 }
+import {
+  computeSettlementPayloadHash,
+  idempotencyHashKey,
+  settlementPayloadHash,
+} from './settlement-idempotency.js';
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
 import {
@@ -1545,10 +1550,23 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 
     const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
-    if (idempotencyKey) {
+    const payloadHash = idempotencyKey
+      ? computeSettlementPayloadHash({ merchantId: d.merchantId, amount: d.amount, asset: d.asset })
+      : null;
+    const payloadMismatch = () =>
+      reply.code(409).send(createErrorResponse(
+        'IDEMPOTENCY_PAYLOAD_MISMATCH',
+        'Idempotency-Key was already used with different request parameters',
+      ));
+
+    if (idempotencyKey && payloadHash) {
       let claimed: string | null = null;
       try {
         claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'EX', 86400, 'NX');
+        if (claimed !== null) {
+          // Store the canonical payload hash alongside the idempotency record.
+          await redis.set(idempotencyHashKey(idempotencyKey), payloadHash, 'EX', 86400).catch(() => undefined);
+        }
       } catch {
         // Redis unavailable — fall through to DB @unique constraint
       }
@@ -1561,6 +1579,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
             where: { id: existingId },
           });
           if (existingSettlement) {
+            // Prefer the stored hash; fall back to the persisted settlement
+            // when it is missing (e.g. Redis evicted it).
+            const storedHash = await redis.get(idempotencyHashKey(idempotencyKey)).catch(() => null);
+            const originalHash = storedHash ?? settlementPayloadHash(existingSettlement);
+            if (originalHash !== payloadHash) return payloadMismatch();
             return reply.code(200).send({ data: existingSettlement });
           }
         }
@@ -1583,6 +1606,13 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       idempotencyKey: idempotencyKey ?? undefined,
       idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
     });
+
+    // The DB unique guard returned a pre-existing settlement for this key
+    // (Redis was unavailable or lost the claim): verify it is a true replay.
+    if (idempotencyKey && payloadHash && settlement.id !== settlementId) {
+      if (settlementPayloadHash(settlement) !== payloadHash) return payloadMismatch();
+      return reply.code(200).send({ data: settlement });
+    }
 
     const traceId = (request as unknown as { traceId?: string }).traceId;
 
