@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { getClientIp, parseTrustedProxyCount } from './audit.js';
+import { getClientIp, parseTrustedProxyCount, serializeChanges } from './audit.js';
 
 // Issue #621 & #866 — getClientIp trusted proxy depth and spoofed header rejection.
 
@@ -165,4 +165,80 @@ test('getClientIp: omitting argument falls back to parseTrustedProxyCount(proces
       delete process.env.TRUSTED_PROXY_COUNT;
     }
   }
+});
+
+// Issue #1072 — BigInt serialization and secret redaction in serializeChanges
+
+test('serializeChanges: converts BigInt values to strings without throwing (#1072)', () => {
+  const changes = {
+    amount: 1000000000000000000000n,
+    details: {
+      nestedBigInt: 999999999999999999n,
+      normal: 123,
+    },
+    list: [1n, 2n, { itemAmount: 3n }],
+  };
+
+  const serialized = serializeChanges(changes);
+  assert.deepStrictEqual(serialized, {
+    amount: '1000000000000000000000',
+    details: {
+      nestedBigInt: '999999999999999999',
+      normal: 123,
+    },
+    list: ['1', '2', { itemAmount: '3' }],
+  });
+
+  // Top-level BigInt primitive
+  assert.deepStrictEqual(serializeChanges(42n), { value: '42' });
+});
+
+test('serializeChanges: redacts sensitive keys (secret, signingSecret, password, token) (#1072)', () => {
+  const changes = {
+    id: 'user-1',
+    secret: 'super-secret-123',
+    signingSecret: 'whsec_test_abc',
+    password: 'plaintext-pass',
+    token: 'bearer-token-val',
+    apiKey: 'normal-key',
+    nested: {
+      secret: 'nested-secret',
+      signingSecret: 'nested-signing-secret',
+      password: 'nested-password',
+      token: 'nested-token',
+      safeField: 'visible',
+    },
+    arrayOfSecrets: [
+      { token: 'item-token', value: 10n },
+      { secret: 'item-secret', name: 'item' },
+    ],
+  };
+
+  const serialized = serializeChanges(changes);
+  assert.deepStrictEqual(serialized, {
+    id: 'user-1',
+    secret: '[REDACTED]',
+    signingSecret: '[REDACTED]',
+    password: '[REDACTED]',
+    token: '[REDACTED]',
+    apiKey: 'normal-key',
+    nested: {
+      secret: '[REDACTED]',
+      signingSecret: '[REDACTED]',
+      password: '[REDACTED]',
+      token: '[REDACTED]',
+      safeField: 'visible',
+    },
+    arrayOfSecrets: [
+      { token: '[REDACTED]', value: '10' },
+      { secret: '[REDACTED]', name: 'item' },
+    ],
+  });
+});
+
+test('serializeChanges: handles null, undefined, and non-object primitives', () => {
+  assert.strictEqual(serializeChanges(null), null);
+  assert.strictEqual(serializeChanges(undefined), null);
+  assert.deepStrictEqual(serializeChanges('hello'), { value: 'hello' });
+  assert.deepStrictEqual(serializeChanges(123), { value: 123 });
 });
