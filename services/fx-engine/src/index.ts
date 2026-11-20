@@ -791,6 +791,13 @@ fastify.addHook("onClose", async () => {
   await redis.quit().catch(() => {});
 });
 
+/** @internal exported for testing only */
+export function setRedisClientForTesting(client: any): any {
+  const prev = redis;
+  redis = client;
+  return prev;
+}
+
 // ── Rate history cleanup job ──────────────────────────────────────────────
 // BullMQ repeatable job that runs daily to purge rate history snapshots
 // older than RATE_HISTORY_RETENTION_DAYS.  Re-reads the env var each run
@@ -1482,14 +1489,28 @@ fastify.get(
         );
     }
 
-    const members = await redis.zrevrangebyscore(
-      SNAPSHOT_KEY,
-      atMs,
-      "-inf",
-      "LIMIT",
-      0,
-      1,
-    );
+    let members: string[];
+    try {
+      members = await redis.zrevrangebyscore(
+        SNAPSHOT_KEY,
+        atMs,
+        "-inf",
+        "LIMIT",
+        0,
+        1,
+      );
+    } catch (err) {
+      fastify.log.warn({ err }, "Failed to read rate history from Redis");
+      return reply
+        .code(503)
+        .send(
+          createErrorResponse(
+            "SERVICE_UNAVAILABLE",
+            "Rate history store unavailable",
+          ),
+        );
+    }
+
     if (!members.length) {
       return reply
         .code(404)
@@ -1501,10 +1522,33 @@ fastify.get(
         );
     }
 
-    const snapshot = JSON.parse(members[0]) as {
-      ts: number;
-      rates: Record<string, number>;
-    };
+    let snapshot: { ts: number; rates: Record<string, number> };
+    try {
+      const parsed = JSON.parse(members[0]) as {
+        ts?: unknown;
+        rates?: unknown;
+      };
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.ts !== "number" ||
+        !parsed.rates ||
+        typeof parsed.rates !== "object"
+      ) {
+        throw new Error("Invalid rate snapshot shape");
+      }
+      snapshot = parsed as { ts: number; rates: Record<string, number> };
+    } catch (err) {
+      fastify.log.error({ err }, "Corrupt rate snapshot in Redis");
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(
+            ErrorCodes.INTERNAL_ERROR,
+            "Corrupt rate snapshot data",
+          ),
+        );
+    }
 
     if (!(from in snapshot.rates) || !(to in snapshot.rates)) {
       return reply
