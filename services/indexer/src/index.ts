@@ -1419,6 +1419,16 @@ fastify.get(
   { preValidation: [fastify.serviceAuth] },
   async () => {
     return prisma.webhookSubscription.findMany({
+      select: {
+        id: true,
+        url: true,
+        createdAt: true,
+        merchantId: true,
+        headers: true,
+        lastTestedAt: true,
+        lastTestStatus: true,
+        lastTestStatusCode: true,
+      },
       orderBy: { createdAt: "desc" },
     });
   },
