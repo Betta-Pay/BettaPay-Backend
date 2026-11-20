@@ -14,6 +14,7 @@ function createMockWorker(closeImpl: () => Promise<void>) {
     emit(event: string, ...args: unknown[]) {
       for (const listener of listeners[event] ?? []) listener(...args);
     },
+    pause: async () => {},
     close: closeImpl,
   };
 }
@@ -81,5 +82,19 @@ test('closeWorkerWithTimeout: clears tracked job once it completes before the ti
 
   t.equal(log.warns().length, 1, 'still force-stops since close() never resolved');
   t.equal(log.warns()[0].obj.jobId, undefined, 'no job reported as stuck once it completed');
+  t.end();
+});
+
+
+test('trackActiveJob: waits for all concurrent jobs, not only the most recent', async (t) => {
+  const worker = createMockWorker(() => Promise.resolve());
+  const active = trackActiveJob(worker as unknown as Worker);
+  worker.emit('active', { id: 'a', data: { n: 1 } });
+  worker.emit('active', { id: 'b', data: { n: 2 } });
+  t.deepEqual(active().map((job) => job.id), ['a', 'b']);
+  worker.emit('completed', { id: 'b' });
+  t.deepEqual(active().map((job) => job.id), ['a'], 'other active job remains');
+  worker.emit('failed', { id: 'a' });
+  t.equal(active().length, 0);
   t.end();
 });

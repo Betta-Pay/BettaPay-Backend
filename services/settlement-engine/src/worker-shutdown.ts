@@ -19,20 +19,14 @@ export const DEFAULT_DRAIN_POLL_INTERVAL_MS = 500;
  * that became active before shutdown began would otherwise be invisible to
  * closeWorkerWithTimeout, since BullMQ only fires 'active' when a job starts.
  */
-export function trackActiveJob(worker: Worker): () => ActiveJobInfo | undefined {
-  let activeJob: ActiveJobInfo | undefined;
-
+export function trackActiveJob(worker: Worker): () => ActiveJobInfo[] {
+  const activeJobs = new Map<string, ActiveJobInfo>();
   worker.on('active', (job: Job) => {
-    activeJob = { id: job.id, data: job.data };
+    if (job.id !== undefined) activeJobs.set(job.id, { id: job.id, data: job.data });
   });
-  worker.on('completed', () => {
-    activeJob = undefined;
-  });
-  worker.on('failed', () => {
-    activeJob = undefined;
-  });
-
-  return () => activeJob;
+  worker.on('completed', (job: Job) => { if (job?.id !== undefined) activeJobs.delete(job.id); });
+  worker.on('failed', (job: Job) => { if (job?.id !== undefined) activeJobs.delete(job.id); });
+  return () => [...activeJobs.values()];
 }
 
 /**
@@ -41,7 +35,7 @@ export function trackActiveJob(worker: Worker): () => ActiveJobInfo | undefined 
  * false if the budget expired while a job was still running.
  */
 export async function drainActiveJobs(
-  getActiveJob: () => ActiveJobInfo | undefined,
+  getActiveJob: () => ActiveJobInfo[],
   log: WorkerShutdownLogger,
   workerName: string,
   budgetMs: number,
@@ -50,29 +44,29 @@ export async function drainActiveJobs(
   const deadline = Date.now() + budgetMs;
 
   while (Date.now() < deadline) {
-    const activeJob = getActiveJob();
-    if (!activeJob) {
+    const activeJobs = getActiveJob();
+    if (activeJobs.length === 0) {
       log.info({ workerName }, 'No active jobs — drain complete');
       return true;
     }
 
     log.info(
-      { workerName, jobId: activeJob.id, remainingMs: deadline - Date.now() },
+      { workerName, jobIds: activeJobs.map((job) => job.id), remainingMs: deadline - Date.now() },
       'Waiting for in-flight job to complete before closing worker',
     );
 
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 
-  const stuckJob = getActiveJob();
-  if (!stuckJob) {
+  const stuckJobs = getActiveJob();
+  if (stuckJobs.length === 0) {
     // The job finished between the last poll and the deadline — the drain
     // still succeeded, so report completion instead of a false exhaustion.
     log.info({ workerName }, 'No active jobs — drain complete');
     return true;
   }
   log.warn(
-    { workerName, jobId: stuckJob?.id, jobData: stuckJob?.data },
+    { workerName, jobId: stuckJobs[0]?.id, jobData: stuckJobs[0]?.data, jobIds: stuckJobs.map((job) => job.id) },
     'Drain budget exhausted with job still in-flight — proceeding with forced close',
   );
   return false;
@@ -95,28 +89,31 @@ export async function closeWorkerWithTimeout(
   worker: Worker,
   workerName: string,
   log: WorkerShutdownLogger,
-  getActiveJob: () => ActiveJobInfo | undefined,
+  getActiveJob: () => ActiveJobInfo[],
   timeoutMs: number = DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS,
   drainBudgetMs: number = Math.max(timeoutMs * 2, 20_000),
 ): Promise<void> {
+  // Prevent new jobs from starting while draining existing work.
+  await worker.pause(true);
   // Phase 1: Wait for in-flight jobs to complete within the drain budget
   await drainActiveJobs(getActiveJob, log, workerName, drainBudgetMs);
 
   // Phase 2: Close the worker (stop polling, wait for any remaining active job)
   let timedOut = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((resolve) => {
-    setTimeout(() => {
-      timedOut = true;
-      resolve();
-    }, timeoutMs);
+    timeoutHandle = setTimeout(() => { timedOut = true; resolve(); }, timeoutMs);
   });
-
-  await Promise.race([worker.close(), timeout]);
+  try {
+    await Promise.race([worker.close(), timeout]);
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
 
   if (timedOut) {
-    const activeJob = getActiveJob();
+    const activeJobs = getActiveJob();
     log.warn(
-      { workerName, jobId: activeJob?.id, jobData: activeJob?.data },
+      { workerName, jobId: activeJobs[0]?.id, jobData: activeJobs[0]?.data, jobIds: activeJobs.map((job) => job.id) },
       'Worker did not close within shutdown timeout — force-stopping and proceeding with shutdown',
     );
   }
