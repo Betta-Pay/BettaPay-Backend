@@ -268,9 +268,22 @@ export function buildMemo(type: MemoType, value: string): { type: MemoType; valu
   return { type, value };
 }
 
+// Path segments are joined with exactly one '/' (#1090). Traversal ('..'),
+// URL delimiters and control characters are rejected rather than encoded so a
+// caller-supplied resource can never escape or reshape the Horizon endpoint.
+const UNSAFE_HORIZON_SEGMENT = /[\x00-\x1f\x7f\\?#%]/;
+
+function assertSafeHorizonSegment(segment: string): void {
+  if (segment.includes('..') || segment === '.' || UNSAFE_HORIZON_SEGMENT.test(segment)) {
+    throw new TypeError(`Invalid Horizon path segment: ${JSON.stringify(segment)}`);
+  }
+}
+
 /**
  * Builds a properly encoded Horizon API URL for the specified resource.
- * Handles trailing slashes in base URL and encodes query parameters.
+ * Leading/trailing slashes on the base URL and resource are normalized so the
+ * path never contains '//', and query parameters are encoded. Throws a
+ * TypeError if the resource contains '..' traversal or URL control characters.
  *
  * @param baseUrl - The Horizon API base URL (e.g., 'https://horizon.stellar.org' or 'https://horizon.stellar.org/')
  * @param resource - The Horizon resource path (e.g., 'accounts', 'transactions', 'operations', 'payments', 'effects')
@@ -302,8 +315,12 @@ export function buildHorizonUrl(
   resource: string,
   params?: Record<string, any>
 ): string {
-  const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-  const url = new URL(`${normalizedBase}/${resource}`);
+  const resourceSegments = resource.split('/').filter(Boolean);
+  resourceSegments.forEach(assertSafeHorizonSegment);
+
+  const url = new URL(baseUrl);
+  const baseSegments = url.pathname.split('/').filter(Boolean);
+  url.pathname = `/${[...baseSegments, ...resourceSegments].join('/')}`;
 
   if (params) {
     const searchParams = new URLSearchParams();
