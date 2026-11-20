@@ -308,3 +308,50 @@ testNode('encryptSensitiveFields & decryptSensitiveFields: processes sensitive f
   assert.equal(decrypted.nested.secret, 'nested-secret-value');
   assert.equal(decrypted.nested.name, 'Legit Merchant');
 });
+
+testNode('encryptSensitiveFields: prevents prototype pollution with __proto__, constructor, and prototype payloads', () => {
+  const untrusted = JSON.parse(
+    '{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"secret":"raw-secret-value","normal":"safe"}',
+  );
+
+  const beforePollution = (Object.prototype as any).polluted;
+  assert.equal(beforePollution, undefined);
+
+  const encrypted = encryptSensitiveFields(untrusted, TEST_KEY);
+
+  assert.equal((Object.prototype as any).polluted, undefined, 'Object.prototype must not be modified');
+  assert.equal(encrypted.__proto__?.polluted, undefined);
+  assert.equal(encrypted.normal, 'safe');
+  assert.notEqual(encrypted.secret, 'raw-secret-value');
+  assert.ok(isEncrypted(encrypted.secret));
+});
+
+testNode('decryptSensitiveFields: prevents prototype pollution with __proto__, constructor, and prototype payloads', () => {
+  const encryptedSecret = encryptField('my-clear-secret', TEST_KEY);
+  const untrusted = JSON.parse(
+    `{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"secret":"${encryptedSecret}","merchant":"acme"}`,
+  );
+
+  const beforePollution = (Object.prototype as any).polluted;
+  assert.equal(beforePollution, undefined);
+
+  const decrypted = decryptSensitiveFields(untrusted, TEST_KEY);
+
+  assert.equal((Object.prototype as any).polluted, undefined, 'Object.prototype must not be modified');
+  assert.equal(decrypted.merchant, 'acme');
+  assert.equal(decrypted.secret, 'my-clear-secret');
+});
+
+testNode('encryptSensitiveFields & decryptSensitiveFields: prevents prototype pollution in nested structures', () => {
+  const nestedPayload = JSON.parse(
+    '{"profile":{"__proto__":{"pollutedNested":"yes"},"secretHash":"raw-nested-hash"},"data":{"constructor":{"prototype":{"pollutedNested":"yes"}}}}',
+  );
+
+  const encrypted = encryptSensitiveFields(nestedPayload, TEST_KEY);
+  assert.equal((Object.prototype as any).pollutedNested, undefined);
+  assert.ok(isEncrypted(encrypted.profile.secretHash));
+
+  const decrypted = decryptSensitiveFields(encrypted, TEST_KEY);
+  assert.equal((Object.prototype as any).pollutedNested, undefined);
+  assert.equal(decrypted.profile.secretHash, 'raw-nested-hash');
+});
