@@ -35,6 +35,9 @@ const {
   runCleanupJob,
   startCleanupScheduler,
   stopCleanupScheduler,
+  flushIndexedEvents,
+  FLUSH_BATCH_SIZE,
+  cacheState,
   fastify,
   prisma,
 } = await import('./index.js');
@@ -50,6 +53,13 @@ test('buildCleanupWhere — returns null when retention is disabled (0)', (t) =>
 test('buildCleanupWhere — returns null for negative retention days', (t) => {
   const result = buildCleanupWhere(-1, new Date());
   t.equal(result, null, 'should return null for negative retentionDays');
+  t.end();
+});
+
+test('buildCleanupWhere — returns null for NaN and non-finite retention days (#1065)', (t) => {
+  t.equal(buildCleanupWhere(Number.NaN, new Date()), null, 'should return null for NaN');
+  t.equal(buildCleanupWhere(Number.POSITIVE_INFINITY, new Date()), null, 'should return null for Infinity');
+  t.equal(buildCleanupWhere(Number.NEGATIVE_INFINITY, new Date()), null, 'should return null for -Infinity');
   t.end();
 });
 
@@ -290,6 +300,82 @@ test('cleanupOldEvents — skips entries with active webhook jobs', async (t) =>
   } finally {
     webhookQueue.getJobs = origGetJobs;
     prisma.indexedEvent.deleteMany = origDeleteMany;
+  }
+  t.end();
+});
+
+// ── Part 6: flushIndexedEvents batch chunking (#1065) ─────────────────────────
+
+test('flushIndexedEvents — chunks large event and delivery createMany calls safely (#1065)', async (t) => {
+  const origEventCreateMany = prisma.indexedEvent.createMany.bind(prisma.indexedEvent);
+  const origEventFindMany = prisma.indexedEvent.findMany.bind(prisma.indexedEvent);
+  const deliveryStore = (prisma as any).indexedEventWebhookDelivery;
+  const origDeliveryCreateMany = deliveryStore.createMany.bind(deliveryStore);
+  const origCache = cacheState.subscriptions;
+
+  const eventChunkSizes: number[] = [];
+  const deliveryChunkSizes: number[] = [];
+  const persistedIds = new Set<string>();
+
+  prisma.indexedEvent.createMany = (async (args: any) => {
+    eventChunkSizes.push(args.data.length);
+    for (const row of args.data) {
+      persistedIds.add(row.id);
+    }
+    return { count: args.data.length };
+  }) as any;
+
+  prisma.indexedEvent.findMany = (async (args: any) => {
+    const ids: string[] = args.where.id.in;
+    return ids.filter((id) => persistedIds.has(id)).map((id) => ({ id }));
+  }) as any;
+
+  deliveryStore.createMany = (async (args: any) => {
+    deliveryChunkSizes.push(args.data.length);
+    return { count: args.data.length };
+  }) as any;
+
+  // Populate subscription cache with 2 subscriptions so deliveries = 2 * events
+  cacheState.subscriptions = {
+    cachedAt: Date.now(),
+    data: [
+      { id: 'wh_1', url: 'https://example.com/1', signingSecret: null, headers: null } as any,
+      { id: 'wh_2', url: 'https://example.com/2', signingSecret: null, headers: null } as any,
+    ],
+  };
+
+  const totalEvents = FLUSH_BATCH_SIZE + 50;
+  const rows = Array.from({ length: totalEvents }, (_, idx) => ({
+    id: `evt_chunk_${idx}`,
+    stellarId: `stellar_${idx}`,
+    contractId: 'CDLZFC3SYXDT4MMSTXTU4Z4VABMFR6SPLPNCZF656SIHPXT6LPWEEXGO',
+    contractName: 'settlement',
+    topics: ['PaymentCompleted'],
+    type: 'PaymentCompleted',
+    rawValue: 'AAAA',
+    ledger: 1000 + idx,
+    indexedAt: new Date(),
+  }));
+
+  try {
+    const result = await flushIndexedEvents(rows);
+    t.equal(result.inserted, totalEvents, 'reports all inserted events across chunks');
+    t.equal(result.maxInsertedLedger, 1000 + totalEvents - 1, 'tracks max ledger across chunks');
+    t.deepEqual(
+      eventChunkSizes,
+      [FLUSH_BATCH_SIZE, 50],
+      'splits indexedEvent.createMany into safe chunks',
+    );
+    t.deepEqual(
+      deliveryChunkSizes,
+      [FLUSH_BATCH_SIZE, FLUSH_BATCH_SIZE, 100],
+      'splits indexedEventWebhookDelivery.createMany into safe chunks',
+    );
+  } finally {
+    prisma.indexedEvent.createMany = origEventCreateMany;
+    prisma.indexedEvent.findMany = origEventFindMany;
+    deliveryStore.createMany = origDeliveryCreateMany;
+    cacheState.subscriptions = origCache;
   }
   t.end();
 });

@@ -238,26 +238,33 @@ const indexerDedupEventsTotal = new promClient.Counter({
   help: "Total number of on-chain events dropped as duplicates (Prisma P2002 / skipDuplicates)",
 });
 
-// Issue #1058 — tracks on-chain events that fail payload schema validation in
-// pollEvents so contract schema drift is surfaced in metrics and alerts.
-export const indexerValidationErrorsTotal = new promClient.Counter({
-  name: "indexer_validation_errors_total",
-  help: "Total number of on-chain events that failed payload schema validation",
-  labelNames: ["contractId", "type"] as const,
-});
-
-function parseRetryAfterMs(err: unknown): number | null {
+/** @internal exported for testing only */
+export function parseRetryAfterMs(
+  err: unknown,
+  nowMs: number = Date.now(),
+): number | null {
   const status = (err as any)?.response?.status ?? (err as any)?.status;
   if (status !== 429) return null;
 
   const retryHeader =
     (err as any)?.response?.headers?.["retry-after"] ??
+    (err as any)?.response?.headers?.["Retry-After"] ??
     (err as any)?.response?.headers?.get?.("retry-after");
-  if (!retryHeader) return null;
+  if (retryHeader === undefined || retryHeader === null) return null;
 
-  const retrySeconds = parseInt(String(retryHeader), 10);
-  if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
-  return retrySeconds * 1000;
+  const raw = String(retryHeader).trim();
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const retrySeconds = Number(raw);
+    if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
+    return retrySeconds * 1000;
+  }
+
+  const retryDateMs = Date.parse(raw);
+  if (!Number.isFinite(retryDateMs)) return null;
+  const delayMs = retryDateMs - nowMs;
+  return delayMs > 0 ? delayMs : null;
 }
 
 export function getCurrentBackoffMs(): number {
@@ -400,7 +407,7 @@ webhookQueueEvents.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-const replayQueue = new Queue("indexer-replays", {
+export const replayQueue = new Queue("indexer-replays", {
   connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
@@ -1032,28 +1039,47 @@ async function loadWebhookSubscriptions(): Promise<WebhookSubscription[]> {
   return cacheState.subscriptions.data;
 }
 
+/** @internal exported for testing only */
+export const FLUSH_BATCH_SIZE = 500;
+
 /**
- * #713 — Persist a whole poll cycle's events with one `createMany` instead of a
- * `create` per event, preserving the composite-unique P2002-skip semantics via
- * `skipDuplicates`. Webhook deliveries are created in a single batch for the
- * events that actually landed. Returns the inserted count and the highest
- * ledger among them so the caller can advance its cursor.
+ * #713 — Persist a whole poll cycle's events with chunked `createMany` calls
+ * instead of a `create` per event, preserving the composite-unique P2002-skip
+ * semantics via `skipDuplicates` while staying safely under Postgres's
+ * 65,535-parameter limit (#1065). Webhook deliveries are also created in
+ * bounded chunks for the events that actually landed. Returns the inserted
+ * count and the highest ledger among them so the caller can advance its cursor.
+ *
+ * @internal exported for testing only
  */
-async function flushIndexedEvents(
+export async function flushIndexedEvents(
   data: Prisma.IndexedEventCreateManyInput[],
+  batchSize: number = FLUSH_BATCH_SIZE,
 ): Promise<{ inserted: number; maxInsertedLedger: number | null }> {
   if (data.length === 0) return { inserted: 0, maxInsertedLedger: null };
 
-  await prisma.indexedEvent.createMany({ data, skipDuplicates: true });
+  const safeBatchSize =
+    Number.isFinite(batchSize) && batchSize > 0
+      ? Math.floor(batchSize)
+      : FLUSH_BATCH_SIZE;
 
-  // `createMany` does not report which rows were skipped, so read back the ids
-  // that landed. Deliveries must exist only for newly-persisted events, exactly
-  // as the per-event path did after a successful create.
-  const insertedRows = await prisma.indexedEvent.findMany({
-    where: { id: { in: data.map((row) => row.id) } },
-    select: { id: true },
-  });
-  const insertedIds = new Set(insertedRows.map((row) => row.id));
+  const insertedIds = new Set<string>();
+  for (let i = 0; i < data.length; i += safeBatchSize) {
+    const chunk = data.slice(i, i + safeBatchSize);
+    await prisma.indexedEvent.createMany({ data: chunk, skipDuplicates: true });
+
+    // `createMany` does not report which rows were skipped, so read back the ids
+    // that landed. Deliveries must exist only for newly-persisted events, exactly
+    // as the per-event path did after a successful create.
+    const insertedRows = await prisma.indexedEvent.findMany({
+      where: { id: { in: chunk.map((row) => row.id) } },
+      select: { id: true },
+    });
+    for (const row of insertedRows) {
+      insertedIds.add(row.id);
+    }
+  }
+
   const records = data.filter((row) => insertedIds.has(row.id));
 
   for (const record of records) {
@@ -1072,22 +1098,25 @@ async function flushIndexedEvents(
   if (deliverableRecords.length > 0) {
     const subs = await loadWebhookSubscriptions();
     if (subs.length) {
-      await (prisma as any).indexedEventWebhookDelivery.createMany({
-        data: deliverableRecords.flatMap((record) =>
-          subs.map((sub) => ({
-            id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
-            indexedEventId: record.id,
-            subscriptionId: sub.id,
-            url: sub.url,
-            event: record,
-            signingSecret: sub.signingSecret
-              ? encryptField(sub.signingSecret)
-              : undefined,
-            headers: (sub.headers as Record<string, string> | null) ?? undefined,
-          })),
-        ),
-        skipDuplicates: true,
-      });
+      const deliveries = records.flatMap((record) =>
+        subs.map((sub) => ({
+          id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+          indexedEventId: record.id,
+          subscriptionId: sub.id,
+          url: sub.url,
+          event: record,
+          signingSecret: sub.signingSecret
+            ? encryptField(sub.signingSecret)
+            : undefined,
+          headers: (sub.headers as Record<string, string> | null) ?? undefined,
+        })),
+      );
+      for (let i = 0; i < deliveries.length; i += safeBatchSize) {
+        await (prisma as any).indexedEventWebhookDelivery.createMany({
+          data: deliveries.slice(i, i + safeBatchSize),
+          skipDuplicates: true,
+        });
+      }
     }
   }
 
@@ -1311,7 +1340,23 @@ fastify.post(
       );
     }
 
-    const job = await replayQueue.add("replay", { fromLedger, toLedger });
+    let job;
+    try {
+      job = await replayQueue.add("replay", { fromLedger, toLedger });
+    } catch (err) {
+      fastify.log.error(
+        { err, fromLedger, toLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1404,12 +1449,28 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       );
     }
 
-    const job = await replayQueue.add("replay-contract", {
-      contractId,
-      fromLedger: startLedger,
-      toLedger: endLedger,
-      force,
-    });
+    let job;
+    try {
+      job = await replayQueue.add("replay-contract", {
+        contractId,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        force,
+      });
+    } catch (err) {
+      fastify.log.error(
+        { err, contractId, fromLedger: startLedger, toLedger: endLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue per-contract replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1425,6 +1486,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
   },
 );
 
+const REPLAY_JOB_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+
 // Issue #229 — replay job progress status
 // Internal endpoint — job introspection leaks worker activity to anonymous
 // callers, so it requires a valid x-service-token like the other replay
@@ -1434,6 +1497,16 @@ fastify.get<{ Params: { jobId: string } }>(
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { jobId } = request.params;
+    if (!REPLAY_JOB_ID_REGEX.test(jobId)) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          "Invalid jobId format",
+          { jobId },
+          request.id,
+        ),
+      );
+    }
     try {
       const raw = await sharedRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
@@ -1492,18 +1565,27 @@ fastify.post(
       );
     }
 
-    // Both modes return the same fields; only `status` (and whether rows were
-    // deleted) differs. A real run reports the preview of what it removed.
-    const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
+    // Only run the dry-run preview queries when dryRun=true; a real run
+    // executes deleteMany directly to avoid redundant count/size queries (#1065).
     if (dryRun) {
+      const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
       return reply
         .code(200)
         .send({ status: "dry-run", ...preview, deletedCount: 0 });
     }
-    const deletedCount = (await cleanupOldEvents()) as number;
-    return reply
-      .code(200)
-      .send({ status: "completed", ...preview, deletedCount });
+    const deletedCount = (await cleanupOldEvents(false)) as number;
+    const retentionDays =
+      Number.isFinite(env.EVENT_RETENTION_DAYS) && env.EVENT_RETENTION_DAYS > 0
+        ? env.EVENT_RETENTION_DAYS
+        : 0;
+    return reply.code(200).send({
+      status: "completed",
+      wouldDelete: deletedCount,
+      totalSizeBytes: 0,
+      retentionDays,
+      oldestEventDate: "",
+      deletedCount,
+    });
   },
 );
 
@@ -1553,17 +1635,45 @@ fastify.get(
   },
 );
 
-fastify.delete<{ Params: { id: string } }>(
+fastify.delete<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   "/api/webhooks/:id",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
+    const queryMerchantId =
+      typeof request.query?.merchantId === "string"
+        ? request.query.merchantId.trim() || undefined
+        : undefined;
+    const rawHeaderMerchantId = request.headers["x-merchant-id"];
+    const headerMerchantId =
+      typeof rawHeaderMerchantId === "string"
+        ? rawHeaderMerchantId.trim() || undefined
+        : Array.isArray(rawHeaderMerchantId)
+          ? rawHeaderMerchantId[0]?.trim() || undefined
+          : undefined;
+    const callerMerchantId = queryMerchantId ?? headerMerchantId;
+
     const existing = await prisma.webhookSubscription.findUnique({
       where: { id },
     });
     if (!existing) {
       return reply.code(404).send(
-        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
+      );
+    }
+    if (callerMerchantId && existing.merchantId !== callerMerchantId) {
+      return reply.code(403).send(
+        createErrorResponse(
+          ErrorCodes.FORBIDDEN,
+          "Cannot delete webhook subscription owned by another merchant",
+          undefined,
+          request.id,
+        ),
       );
     }
     await prisma.$transaction(async (tx) => {
@@ -2313,7 +2423,7 @@ export function buildCleanupWhere(
   retentionDays: number,
   now: Date,
 ): { indexedAt: { lt: Date } } | null {
-  if (retentionDays <= 0) return null;
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return null;
   const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
   return { indexedAt: { lt: cutoff } };
 }

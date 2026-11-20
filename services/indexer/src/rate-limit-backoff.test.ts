@@ -1,6 +1,7 @@
 import test from 'tape';
 import {
   env,
+  parseRetryAfterMs,
   calculateBackoffAfter429,
   calculateBackoffAfterError,
   calculateBackoffAfterSuccess,
@@ -74,5 +75,38 @@ test('a successful poll decays the backoff back toward the base interval', async
   const raised = getCurrentBackoffMs();
   const afterSuccess = calculateBackoffAfterSuccess();
   t.ok(afterSuccess <= raised, `backoff decreases after success (${raised} -> ${afterSuccess})`);
+  t.end();
+});
+
+test('parseRetryAfterMs parses numeric delta-seconds and HTTP-date Retry-After headers (#1065)', (t) => {
+  const nowMs = Date.parse('Wed, 21 Oct 2026 07:27:50 GMT');
+
+  t.equal(parseRetryAfterMs(err429('12'), nowMs), 12000, 'numeric seconds converted to ms');
+  t.equal(
+    parseRetryAfterMs(err429('Wed, 21 Oct 2026 07:28:00 GMT'), nowMs),
+    10000,
+    'future HTTP-date returns remaining ms until retry time',
+  );
+  t.equal(
+    parseRetryAfterMs(err429('Wed, 21 Oct 2026 07:27:40 GMT'), nowMs),
+    null,
+    'past HTTP-date returns null',
+  );
+  t.equal(
+    parseRetryAfterMs(err429('Wed, 21 Oct 2026 07:27:50 GMT'), nowMs),
+    null,
+    'HTTP-date equal to now returns null',
+  );
+  t.equal(parseRetryAfterMs(err429('not-a-date'), nowMs), null, 'garbage string returns null');
+  t.equal(parseRetryAfterMs(err429('0'), nowMs), null, 'zero seconds returns null');
+  t.equal(parseRetryAfterMs(err429('-5'), nowMs), null, 'negative seconds returns null');
+  t.end();
+});
+
+test('429 with an HTTP-date Retry-After header backs off until that date (#1065)', (t) => {
+  const futureDate = new Date(Date.now() + 8000).toUTCString();
+  const backoff = calculateBackoffAfter429(err429(futureDate));
+  t.ok(backoff > 0 && backoff <= Math.min(8000, MAX), `HTTP-date Retry-After -> bounded backoff (${backoff}ms)`);
+  calculateBackoffAfterSuccess();
   t.end();
 });
