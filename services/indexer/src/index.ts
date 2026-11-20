@@ -440,209 +440,258 @@ async function updateReplayProgress(
   }
 }
 
-const replayWorker = new Worker(
-  "indexer-replays",
-  async (job) => {
-    type ReplayJobData = {
-      fromLedger: number;
-      toLedger: number;
-      contractId?: string;
-      force?: boolean;
-    };
-    const { fromLedger, toLedger, contractId, force } =
-      job.data as ReplayJobData;
-    const totalLedgers = toLedger - fromLedger + 1;
+export interface ReplayJobData {
+  fromLedger: number;
+  toLedger: number;
+  contractId?: string;
+  force?: boolean;
+}
 
-    await updateReplayProgress(job.id!, {
-      totalLedgers,
-      processedLedgers: 0,
-      status: "running",
-    });
+export interface ReplayJobDeps {
+  rpcServer?: Pick<typeof server, "getEvents">;
+  chunkSize?: number;
+}
 
-    let processedCount = 0;
+/** @internal exported for testing only */
+export async function runReplayJob(
+  jobId: string,
+  data: ReplayJobData,
+  deps: ReplayJobDeps = {},
+): Promise<void> {
+  const { fromLedger, toLedger, contractId, force } = data;
+  const rpcServer = deps.rpcServer ?? server;
+  const chunkSize = deps.chunkSize ?? REPLAY_CHUNK_SIZE;
+  const totalLedgers = toLedger - fromLedger + 1;
 
-    try {
-      // If contractId is specified, only replay that contract; otherwise replay all
-      const contractsToReplay = contractId ? [contractId] : CONTRACT_IDS;
+  await updateReplayProgress(jobId, {
+    totalLedgers,
+    processedLedgers: 0,
+    status: "running",
+  });
 
-      for (const targetContractId of contractsToReplay) {
-        let cursor = fromLedger;
+  let processedCount = 0;
 
-        // If force=true, delete existing events in the range for this contract
-        if (force) {
-          await prisma.indexedEvent.deleteMany({
-            where: {
-              contractId: targetContractId,
-              ledger: {
-                gte: fromLedger,
-                lte: toLedger,
-              },
+  try {
+    // If contractId is specified, only replay that contract; otherwise replay all
+    const contractsToReplay = contractId ? [contractId] : CONTRACT_IDS;
+
+    for (const targetContractId of contractsToReplay) {
+      let ledgerCursor = fromLedger;
+      let rpcCursor: string | undefined;
+
+      // If force=true, delete existing events in the range for this contract
+      if (force) {
+        await prisma.indexedEvent.deleteMany({
+          where: {
+            contractId: targetContractId,
+            ledger: {
+              gte: fromLedger,
+              lte: toLedger,
             },
-          });
-          fastify.log.info(
-            { contractId: targetContractId, fromLedger, toLedger },
-            "[Indexer] Deleted existing events for forced replay",
-          );
-        }
+          },
+        });
+        fastify.log.info(
+          { contractId: targetContractId, fromLedger, toLedger },
+          "[Indexer] Deleted existing events for forced replay",
+        );
+      }
 
-        const processedLedgerSet = new Set<number>();
-        let currentLedger = -1;
+      const processedLedgerSet = new Set<number>();
+      let currentLedger = -1;
 
-        while (cursor <= toLedger) {
-          const response = await server.getEvents({
-            startLedger: cursor,
-            filters: [
-              {
-                type: "contract" as const,
-                contractIds: [targetContractId],
-                topics: [],
+      while (rpcCursor !== undefined || ledgerCursor <= toLedger) {
+        const filters = [
+          {
+            type: "contract" as const,
+            contractIds: [targetContractId],
+            topics: [],
+          },
+        ];
+        // Use RPC cursor pagination within a chunk before advancing startLedger
+        // so high-volume ledgers exceeding REPLAY_CHUNK_SIZE are not split and skipped (#1054).
+        const response = await rpcServer.getEvents(
+          rpcCursor !== undefined
+            ? {
+                cursor: rpcCursor,
+                filters,
+                limit: chunkSize,
+              }
+            : {
+                startLedger: ledgerCursor,
+                filters,
+                limit: chunkSize,
               },
-            ],
-            limit: REPLAY_CHUNK_SIZE,
-          });
+        );
 
-          if (!response.events || response.events.length === 0) break;
+        if (!response.events || response.events.length === 0) break;
 
-          const stellarIds = response.events
-            .map((evt) => (typeof evt.id === "string" ? evt.id : null))
-            .filter((id): id is string => id !== null);
+        const stellarIds = response.events
+          .map((evt) => (typeof evt.id === "string" ? evt.id : null))
+          .filter((id): id is string => id !== null);
 
-          // When force=false, check for existing events to skip
-          const existingStellarIds = force
-            ? new Set<string>()
-            : new Set<string>(
-                stellarIds.length > 0
-                  ? (
-                      await prisma.indexedEvent.findMany({
-                        where: { stellarId: { in: stellarIds } },
-                        select: { stellarId: true },
-                      })
-                    )
-                      .map((e) => e.stellarId)
-                      .filter((id): id is string => id !== null)
-                  : [],
-              );
+        // When force=false, check for existing events to skip
+        const existingStellarIds = force
+          ? new Set<string>()
+          : new Set<string>(
+              stellarIds.length > 0
+                ? (
+                    await prisma.indexedEvent.findMany({
+                      where: { stellarId: { in: stellarIds } },
+                      select: { stellarId: true },
+                    })
+                  )
+                    .map((e) => e.stellarId)
+                    .filter((id): id is string => id !== null)
+                : [],
+            );
 
-          for (const evt of response.events) {
-            if (evt.ledger > toLedger) continue;
+        let reachedPastToLedger = false;
 
-            if (currentLedger !== -1 && currentLedger !== evt.ledger) {
-              processedLedgerSet.add(currentLedger);
+        for (const evt of response.events) {
+          if (evt.ledger > toLedger) {
+            reachedPastToLedger = true;
+            continue;
+          }
+
+          if (currentLedger !== -1 && currentLedger !== evt.ledger) {
+            processedLedgerSet.add(currentLedger);
+          }
+          currentLedger = evt.ledger;
+
+          if (processedLedgerSet.has(evt.ledger)) {
+            fastify.log.warn(
+              { ledger: evt.ledger },
+              "[Indexer] Skipping out-of-order or duplicate ledger",
+            );
+            continue;
+          }
+
+          const topics = Array.isArray(evt.topic)
+            ? evt.topic.map(String)
+            : [String(evt.topic)];
+          const rawValue = evt.value.toXDR("base64");
+          const decodedPayload = decodeScVal(evt.value, topics[0]) ?? null;
+          const resolvedContractId = evt.contractId
+            ? evt.contractId.toString()
+            : targetContractId;
+          const contractName = getContractName(resolvedContractId);
+          const stellarId = typeof evt.id === "string" ? evt.id : null;
+          const validationError = validatePayload(topics[0], decodedPayload);
+
+          // Skip if already indexed (when force=false)
+          if (!force) {
+            if (stellarId) {
+              if (existingStellarIds.has(stellarId)) continue;
+            } else {
+              const existing = await prisma.indexedEvent.findFirst({
+                where: {
+                  ledger: evt.ledger,
+                  contractId: resolvedContractId,
+                  rawValue,
+                },
+              });
+              if (existing) continue;
             }
-            currentLedger = evt.ledger;
+          }
 
-            if (processedLedgerSet.has(evt.ledger)) {
-              fastify.log.warn(
-                { ledger: evt.ledger },
-                "[Indexer] Skipping out-of-order or duplicate ledger",
+          try {
+            await prisma.indexedEvent.create({
+              data: {
+                id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
+                stellarId,
+                contractId: resolvedContractId,
+                contractName,
+                topics,
+                type: topics[0],
+                rawValue,
+                decodedPayload:
+                  decodedPayload !== null
+                    ? (decodedPayload as any)
+                    : undefined,
+                validationError: validationError ?? undefined,
+                ledger: evt.ledger,
+                indexedAt: new Date(),
+              },
+            });
+          } catch (err: any) {
+            if (err?.code === "P2002") {
+              fastify.log.debug(
+                {
+                  stellarId,
+                  contractId: resolvedContractId,
+                  ledger: evt.ledger,
+                },
+                "[Indexer] Replay duplicate event — skipping (composite constraint)",
               );
               continue;
             }
-
-            cursor = Math.max(cursor, evt.ledger + 1);
-
-            const topics = Array.isArray(evt.topic)
-              ? evt.topic.map(String)
-              : [String(evt.topic)];
-            const rawValue = evt.value.toXDR("base64");
-            const decodedPayload =
-              decodeScVal(evt.value, topics[0]) ?? null;
-            const resolvedContractId = evt.contractId
-              ? evt.contractId.toString()
-              : targetContractId;
-            const contractName = getContractName(resolvedContractId);
-            const stellarId = typeof evt.id === "string" ? evt.id : null;
-            const validationError = validatePayload(topics[0], decodedPayload);
-
-            // Skip if already indexed (when force=false)
-            if (!force) {
-              if (stellarId) {
-                if (existingStellarIds.has(stellarId)) continue;
-              } else {
-                const existing = await prisma.indexedEvent.findFirst({
-                  where: {
-                    ledger: evt.ledger,
-                    contractId: resolvedContractId,
-                    rawValue,
-                  },
-                });
-                if (existing) continue;
-              }
-            }
-
-            try {
-              await prisma.indexedEvent.create({
-                data: {
-                  id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
-                  stellarId,
-                  contractId: resolvedContractId,
-                  contractName,
-                  topics,
-                  type: topics[0],
-                  rawValue,
-                  decodedPayload:
-                    decodedPayload !== null
-                      ? (decodedPayload as any)
-                      : undefined,
-                  validationError: validationError ?? undefined,
-                  ledger: evt.ledger,
-                  indexedAt: new Date(),
-                },
-              });
-            } catch (err: any) {
-              if (err?.code === "P2002") {
-                fastify.log.debug(
-                  {
-                    stellarId,
-                    contractId: resolvedContractId,
-                    ledger: evt.ledger,
-                  },
-                  "[Indexer] Replay duplicate event — skipping (composite constraint)",
-                );
-                continue;
-              }
-              throw err;
-            }
-
-            processedCount = Math.max(
-              processedCount,
-              evt.ledger - fromLedger + 1,
-            );
-            await updateReplayProgress(job.id!, {
-              totalLedgers,
-              processedLedgers: processedCount,
-              status: "running",
-            });
+            throw err;
           }
 
-          const lastEvt = response.events[response.events.length - 1];
-          if (
-            lastEvt.ledger >= toLedger ||
-            response.events.length < REPLAY_CHUNK_SIZE
-          )
+          processedCount = Math.max(
+            processedCount,
+            evt.ledger - fromLedger + 1,
+          );
+          await updateReplayProgress(jobId, {
+            totalLedgers,
+            processedLedgers: processedCount,
+            status: "running",
+          });
+        }
+
+        const lastEvt = response.events[response.events.length - 1];
+        if (
+          reachedPastToLedger ||
+          lastEvt.ledger > toLedger ||
+          response.events.length < chunkSize
+        ) {
+          break;
+        }
+
+        const nextRpcCursor =
+          typeof (response as { cursor?: unknown }).cursor === "string" &&
+          (response as { cursor?: string }).cursor!.length > 0
+            ? (response as { cursor: string }).cursor
+            : undefined;
+
+        if (nextRpcCursor && nextRpcCursor !== rpcCursor) {
+          rpcCursor = nextRpcCursor;
+        } else {
+          rpcCursor = undefined;
+          const nextLedger = lastEvt.ledger + 1;
+          if (nextLedger <= ledgerCursor || nextLedger > toLedger) {
             break;
+          }
+          ledgerCursor = nextLedger;
         }
       }
-
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers: processedCount,
-        status: "completed",
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      fastify.log.error(
-        { err: errMsg, jobId: job.id },
-        "[Indexer] Replay job failed",
-      );
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers: processedCount,
-        status: "failed",
-        error: errMsg,
-      });
-      throw err;
     }
+
+    await updateReplayProgress(jobId, {
+      totalLedgers,
+      processedLedgers: processedCount,
+      status: "completed",
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    fastify.log.error(
+      { err: errMsg, jobId },
+      "[Indexer] Replay job failed",
+    );
+    await updateReplayProgress(jobId, {
+      totalLedgers,
+      processedLedgers: processedCount,
+      status: "failed",
+      error: errMsg,
+    });
+    throw err;
+  }
+}
+
+const replayWorker = new Worker(
+  "indexer-replays",
+  async (job) => {
+    await runReplayJob(job.id!, job.data as ReplayJobData);
   },
   {
     connection: sharedRedis,
@@ -692,7 +741,17 @@ function getContractName(contractId: string): string {
 }
 
 // ── Stellar RPC client ────────────────────────────────────────────────────────
-const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
+/** @internal exported for testing only */
+export function createRpcServerOptions(nodeEnv: string | undefined): {
+  allowHttp: boolean;
+} {
+  return { allowHttp: nodeEnv !== "production" };
+}
+
+const server = new rpc.Server(
+  env.STELLAR_RPC_URL,
+  createRpcServerOptions(env.NODE_ENV),
+);
 
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
@@ -1630,6 +1689,16 @@ fastify.get(
   { preValidation: [fastify.serviceAuth] },
   async () => {
     return prisma.webhookSubscription.findMany({
+      select: {
+        id: true,
+        url: true,
+        createdAt: true,
+        merchantId: true,
+        headers: true,
+        lastTestedAt: true,
+        lastTestStatus: true,
+        lastTestStatusCode: true,
+      },
       orderBy: { createdAt: "desc" },
     });
   },
