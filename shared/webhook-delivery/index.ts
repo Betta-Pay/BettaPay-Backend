@@ -106,7 +106,8 @@ export interface WebhookJobData {
    *
    * Because these live on `WebhookJobData`, BullMQ persists them as part of
    * the job — the same headers are replayed on every retry attempt, not just
-   * the first.  `Content-Type` and `X-BettaPay-Signature` are reserved and
+   * the first.  `Content-Type`, `X-BettaPay-Signature`, `Host` and
+   * `Content-Length` are reserved and
    * cannot be overridden this way (checked case-insensitively) so a
    * misconfigured or malicious header set can't spoof the HMAC signature or
    * change how the body is interpreted.
@@ -114,8 +115,17 @@ export interface WebhookJobData {
   headers?: Record<string, string>;
 }
 
-/** Header names the worker always controls; custom headers cannot override them. */
-const RESERVED_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature']);
+/**
+ * Header names the worker always controls; custom headers cannot override them.
+ * `host` and `content-length` are transport-level — letting a merchant set them
+ * would corrupt or misroute the outbound request (#1093).
+ */
+const RESERVED_HEADER_NAMES = new Set(['content-type', 'x-bettapay-signature', 'host', 'content-length']);
+
+/** True if `name` is a reserved header that custom webhook headers may not set (case-insensitive). */
+export function isReservedHeaderName(name: string): boolean {
+  return RESERVED_HEADER_NAMES.has(name.toLowerCase());
+}
 
 /** Subset of a logger that the worker uses for structured output. */
 export interface WebhookLogger {
@@ -283,8 +293,9 @@ export function signPayload(body: string, secret: string): string {
 /** Options accepted by verifySignature. */
 export interface VerifySignatureOptions {
   /**
-   * Reject signatures whose embedded timestamp is older than this many
-   * seconds.  Recommended: 300 (5 minutes) to prevent replay attacks.
+   * Reject signatures whose embedded timestamp is more than this many seconds
+   * away from now — in either direction, so far-future timestamps can't be
+   * used to outlive the replay window (#1093).  Recommended: 300 (5 minutes).
    */
   maxAgeSeconds?: number;
   /** Current unix time in seconds — injectable for deterministic tests. */
@@ -321,7 +332,7 @@ export function verifySignature(
 
   if (opts.maxAgeSeconds !== undefined) {
     const now = opts.now ?? Math.floor(Date.now() / 1000);
-    if (!Number.isFinite(timestamp) || now - timestamp > opts.maxAgeSeconds) return false;
+    if (!Number.isFinite(timestamp) || Math.abs(now - timestamp) > opts.maxAgeSeconds) return false;
   }
 
   const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
@@ -434,7 +445,7 @@ export function createWebhookWorker(
       // BullMQ persists across retries.  Reserved names are dropped here so
       // they can't shadow the Content-Type / signature headers set below.
       for (const [key, value] of Object.entries(customHeaders ?? {})) {
-        if (RESERVED_HEADER_NAMES.has(key.toLowerCase())) continue;
+        if (isReservedHeaderName(key)) continue;
         headers[key] = value;
       }
 

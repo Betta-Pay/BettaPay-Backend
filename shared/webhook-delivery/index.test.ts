@@ -26,6 +26,7 @@ import {
   createWebhookWorker,
   signPayload,
   verifySignature,
+  isReservedHeaderName,
   canonicalize,
   resolveWebhookConcurrency,
   webhookDeliveryDurationSeconds,
@@ -928,6 +929,33 @@ test('verifySignature — enforces maxAgeSeconds replay window', (t) => {
   t.end();
 });
 
+test('verifySignature — rejects far-future timestamps symmetrically (#1093)', (t) => {
+  const secret = 'secret';
+  const body = canonicalize({ event: { type: 'payment.completed' } });
+  const now = 1_700_000_000;
+
+  const makeSig = (ts: number) => {
+    const hmac = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+    return `t=${ts},s=${hmac}`;
+  };
+
+  t.ok(verifySignature(body, secret, makeSig(now + 100), { maxAgeSeconds: 300, now }), 'small forward clock skew accepted');
+  t.ok(verifySignature(body, secret, makeSig(now + 300), { maxAgeSeconds: 300, now }), 'timestamp exactly at +tolerance accepted');
+  t.notOk(verifySignature(body, secret, makeSig(now + 301), { maxAgeSeconds: 300, now }), 'timestamp just beyond +tolerance rejected');
+  t.notOk(verifySignature(body, secret, makeSig(now + 86_400 * 365), { maxAgeSeconds: 300, now }), 'far-future timestamp rejected');
+  t.end();
+});
+
+test('isReservedHeaderName — host and content-length are reserved alongside existing names (#1093)', (t) => {
+  for (const name of ['Content-Type', 'X-BettaPay-Signature', 'Host', 'HOST', 'host', 'Content-Length', 'content-length']) {
+    t.ok(isReservedHeaderName(name), `${name} is reserved`);
+  }
+  for (const name of ['Idempotency-Key', 'X-Safe-Header', 'Authorization']) {
+    t.notOk(isReservedHeaderName(name), `${name} is not reserved`);
+  }
+  t.end();
+});
+
 test('worker processor — signs the canonical body, verification survives reserialization (#567)', async (t) => {
   let capturedBody = '';
   let capturedSignature = '';
@@ -1149,6 +1177,8 @@ test('worker processor — custom headers cannot override Content-Type or the si
     headers: {
       'content-type': 'text/plain',
       'X-BETTAPAY-SIGNATURE': 'forged',
+      Host: 'evil.example',
+      'Content-Length': '1',
       'X-Safe-Header': 'kept',
     },
   });
@@ -1158,6 +1188,8 @@ test('worker processor — custom headers cannot override Content-Type or the si
   t.equal(capturedHeaders['Content-Type'], 'application/json', 'Content-Type cannot be overridden (case-insensitive)');
   t.notEqual(capturedHeaders['X-BettaPay-Signature'], 'forged', 'signature cannot be spoofed via custom headers (case-insensitive)');
   t.ok(capturedHeaders['X-BettaPay-Signature']?.startsWith('t='), 'real computed signature is sent instead');
+  t.equal(capturedHeaders['Host'], undefined, 'Host cannot be set via custom headers');
+  t.equal(capturedHeaders['Content-Length'], undefined, 'Content-Length cannot be set via custom headers');
   t.equal(capturedHeaders['X-Safe-Header'], 'kept', 'non-reserved custom headers still pass through');
   t.end();
 });
