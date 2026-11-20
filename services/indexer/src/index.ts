@@ -748,49 +748,119 @@ export const cacheState: {
   subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null;
 } = { subscriptions: null };
 
-export async function dispatchPendingWebhookDeliveries(): Promise<void> {
-  const store = (prisma as any).indexedEventWebhookDelivery;
-  let pending: any[];
-  try {
-    pending = await store.findMany({
-      where: { status: "pending" },
-      orderBy: { createdAt: "asc" },
-      take: 100,
-    });
-  } catch (err) {
-    fastify.log.warn(
-      { err: String(err) },
-      "[Indexer] Unable to load pending webhook deliveries",
-    );
-    return;
-  }
-  for (const delivery of pending) {
+const DEFAULT_WEBHOOK_DISPATCH_BATCH_SIZE = 100;
+const DEFAULT_WEBHOOK_DISPATCH_MAX_PER_TICK = 1000;
+
+export interface DispatchWebhookDependencies {
+  store?: {
+    findMany: (args: {
+      where: { status: string };
+      orderBy: { createdAt: "asc" };
+      take: number;
+    }) => Promise<any[]>;
+    updateMany: (args: {
+      where: { id: string; status: string };
+      data: { status: string; processedAt?: Date | null };
+    }) => Promise<{ count: number }>;
+  };
+  queue?: Pick<typeof webhookQueue, "add">;
+  decrypt?: (val: string) => string;
+  log?: Pick<typeof fastify.log, "warn">;
+  batchSize?: number;
+  maxPerTick?: number;
+}
+
+export async function dispatchPendingWebhookDeliveries(
+  deps: DispatchWebhookDependencies = {},
+): Promise<void> {
+  const store = deps.store ?? (prisma as any).indexedEventWebhookDelivery;
+  const queue = deps.queue ?? webhookQueue;
+  const decrypt = deps.decrypt ?? decryptField;
+  const log = deps.log ?? fastify.log;
+  const batchSize = Math.max(1, deps.batchSize ?? DEFAULT_WEBHOOK_DISPATCH_BATCH_SIZE);
+  const maxPerTick = Math.max(
+    batchSize,
+    deps.maxPerTick ?? DEFAULT_WEBHOOK_DISPATCH_MAX_PER_TICK,
+  );
+
+  let processedInTick = 0;
+
+  while (processedInTick < maxPerTick) {
+    const take = Math.min(batchSize, maxPerTick - processedInTick);
+    let pending: any[];
     try {
-      // Decrypt signingSecret on read (#617)
-      const decryptedSecret = delivery.signingSecret
-        ? decryptField(delivery.signingSecret)
-        : undefined;
-      await webhookQueue.add(
-        "deliver",
-        {
-          url: delivery.url,
-          event: delivery.event,
-          version: "1.0",
-          signingSecret: decryptedSecret,
-          subscriptionId: delivery.subscriptionId,
-          headers: delivery.headers ?? undefined,
-        },
-        { jobId: `indexed-event-delivery-${delivery.id}` },
-      );
-      await store.update({
-        where: { id: delivery.id },
-        data: { status: "processed", processedAt: new Date() },
+      pending = await store.findMany({
+        where: { status: "pending" },
+        orderBy: { createdAt: "asc" },
+        take,
       });
     } catch (err) {
-      fastify.log.warn(
-        { deliveryId: delivery.id, err: String(err) },
-        "[Indexer] Webhook enqueue failed; delivery remains pending",
+      log.warn(
+        { err: String(err) },
+        "[Indexer] Unable to load pending webhook deliveries",
       );
+      return;
+    }
+
+    if (pending.length === 0) {
+      break;
+    }
+
+    processedInTick += pending.length;
+
+    for (const delivery of pending) {
+      let claimedCount = 0;
+      try {
+        const claimed = await store.updateMany({
+          where: { id: delivery.id, status: "pending" },
+          data: { status: "processed", processedAt: new Date() },
+        });
+        claimedCount = claimed.count;
+      } catch (err) {
+        log.warn(
+          { deliveryId: delivery.id, err: String(err) },
+          "[Indexer] Failed to claim pending webhook delivery",
+        );
+        continue;
+      }
+
+      if (claimedCount === 0) {
+        continue;
+      }
+
+      try {
+        // Decrypt signingSecret on read (#617)
+        const decryptedSecret = delivery.signingSecret
+          ? decrypt(delivery.signingSecret)
+          : undefined;
+        await queue.add(
+          "deliver",
+          {
+            url: delivery.url,
+            event: delivery.event,
+            version: "1.0",
+            signingSecret: decryptedSecret,
+            subscriptionId: delivery.subscriptionId,
+            headers: delivery.headers ?? undefined,
+          },
+          { jobId: `indexed-event-delivery-${delivery.id}` },
+        );
+      } catch (err) {
+        await store
+          .updateMany({
+            where: { id: delivery.id, status: "processed" },
+            data: { status: "pending", processedAt: null },
+          })
+          .catch(() => {});
+        log.warn(
+          { deliveryId: delivery.id, err: String(err) },
+          "[Indexer] Webhook enqueue failed; delivery remains pending",
+        );
+      }
+    }
+
+    if (pending.length < take) {
+      break;
     }
   }
 }
