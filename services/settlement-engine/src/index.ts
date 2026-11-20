@@ -40,6 +40,7 @@ import {
 } from './settlement-amounts.js';
 import type {
   DiscountTier,
+  FeeAuditSnapshot,
   ReconcileDiffResult,
   ReconcileRecordLike,
 } from './settlement-amounts.js';
@@ -86,6 +87,11 @@ function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
   }
   return out as T;
 }
+import {
+  computeSettlementPayloadHash,
+  idempotencyHashKey,
+  settlementPayloadHash,
+} from './settlement-idempotency.js';
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
 import {
@@ -1519,6 +1525,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         feeBps,
         monthlyVolume,
         discountTiers,
+        d.asset,
+        { maxFeeBps, maxFeeThreshold },
       );
     } catch (error) {
       if (error instanceof SettlementAmountError) {
@@ -1543,10 +1551,23 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 
     const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
-    if (idempotencyKey) {
+    const payloadHash = idempotencyKey
+      ? computeSettlementPayloadHash({ merchantId: d.merchantId, amount: d.amount, asset: d.asset })
+      : null;
+    const payloadMismatch = () =>
+      reply.code(409).send(createErrorResponse(
+        'IDEMPOTENCY_PAYLOAD_MISMATCH',
+        'Idempotency-Key was already used with different request parameters',
+      ));
+
+    if (idempotencyKey && payloadHash) {
       let claimed: string | null = null;
       try {
         claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'EX', 86400, 'NX');
+        if (claimed !== null) {
+          // Store the canonical payload hash alongside the idempotency record.
+          await redis.set(idempotencyHashKey(idempotencyKey), payloadHash, 'EX', 86400).catch(() => undefined);
+        }
       } catch {
         // Redis unavailable — fall through to DB @unique constraint
       }
@@ -1559,6 +1580,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
             where: { id: existingId },
           });
           if (existingSettlement) {
+            // Prefer the stored hash; fall back to the persisted settlement
+            // when it is missing (e.g. Redis evicted it).
+            const storedHash = await redis.get(idempotencyHashKey(idempotencyKey)).catch(() => null);
+            const originalHash = storedHash ?? settlementPayloadHash(existingSettlement);
+            if (originalHash !== payloadHash) return payloadMismatch();
             return reply.code(200).send({ data: existingSettlement });
           }
         }
@@ -1581,6 +1607,13 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       idempotencyKey: idempotencyKey ?? undefined,
       idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
     });
+
+    // The DB unique guard returned a pre-existing settlement for this key
+    // (Redis was unavailable or lost the claim): verify it is a true replay.
+    if (idempotencyKey && payloadHash && settlement.id !== settlementId) {
+      if (settlementPayloadHash(settlement) !== payloadHash) return payloadMismatch();
+      return reply.code(200).send({ data: settlement });
+    }
 
     const traceId = (request as unknown as { traceId?: string }).traceId;
 
@@ -1615,9 +1648,23 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
     const payloadHash = idempotencyKey ? crypto.createHash('sha256').update(JSON.stringify(d)).digest('hex') : null;
 
+    // True once THIS request holds the idempotency lock, so a 4xx rejection can
+    // release it and let the caller retry the corrected request immediately.
+    let idempotencyLockHeld = false;
+    const rejectBulk = async (statusCode: number, payload: unknown) => {
+      if (idempotencyKey && idempotencyLockHeld) {
+        idempotencyLockHeld = false;
+        await redis.del(`idempotency:bulk:${idempotencyKey}`).catch((err) => {
+          request.log.error({ err }, 'Redis error releasing bulk idempotency lock');
+        });
+      }
+      return reply.code(statusCode).send(payload);
+    };
+
     if (idempotencyKey && payloadHash) {
       try {
         const claimed = await redis.set(`idempotency:bulk:${idempotencyKey}`, payloadHash, 'EX', 86400, 'NX');
+        idempotencyLockHeld = claimed !== null;
         if (claimed === null) {
           const existingHash = await redis.get(`idempotency:bulk:${idempotencyKey}`);
           if (existingHash && existingHash !== payloadHash) {
@@ -1637,11 +1684,11 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     }
 
     if (d.settlements.length === 0) {
-      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch must contain at least one settlement'));
+      return rejectBulk(400, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch must contain at least one settlement'));
     }
 
     if (d.settlements.length > 100) {
-      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
+      return rejectBulk(400, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }
 
     const merchant = await getCachedMerchant(
@@ -1650,13 +1697,13 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       (id) => prisma.merchant.findUnique({ where: { id } }),
     );
     if (!merchant) {
-      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+      return rejectBulk(404, createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
     if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+      return rejectBulk(422, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
+      return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {
@@ -1690,25 +1737,27 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       AND "initiatedAt" >= ${todayStart}
     `;
 
-    const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+    // Exact decimal math for limit checks — floats lose precision on large or
+    // high-scale amounts (e.g. 0.1 + 0.2, 7-decimal Stellar amounts).
+    const currentDailyTotal = new BigNumber(aggregateResult?.[0]?.sum ?? 0);
 
-    let runningBatchTotal = 0;
-    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number }> = [];
+    let runningBatchTotal = new BigNumber(0);
+    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number; feeSnapshot: FeeAuditSnapshot }> = [];
     const errors: Array<{ index: number; reason: string }> = [];
 
     for (let i = 0; i < d.settlements.length; i++) {
       const item = d.settlements[i];
-      const amount = parseFloat(item.amount);
+      const amount = new BigNumber(item.amount);
 
-      if (isNaN(amount) || amount <= 0) {
+      if (!amount.isFinite() || amount.isLessThanOrEqualTo(0)) {
         errors.push({ index: i, reason: 'amount must be greater than zero' });
         continue;
       }
 
       // Check min/max amount limits
       if (settings?.minSettlementAmount) {
-        const minAmount = parseFloat(settings.minSettlementAmount);
-        if (amount < minAmount) {
+        const minAmount = new BigNumber(settings.minSettlementAmount);
+        if (amount.isLessThan(minAmount)) {
           errors.push({
             index: i,
             reason: `Settlement amount ${item.amount} is below minimum ${settings.minSettlementAmount}`
@@ -1718,8 +1767,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       }
 
       if (settings?.maxSettlementAmount) {
-        const maxAmount = parseFloat(settings.maxSettlementAmount);
-        if (amount > maxAmount) {
+        const maxAmount = new BigNumber(settings.maxSettlementAmount);
+        if (amount.isGreaterThan(maxAmount)) {
           errors.push({
             index: i,
             reason: `Settlement amount ${item.amount} exceeds maximum ${settings.maxSettlementAmount}`
@@ -1730,11 +1779,12 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       // Check daily settlement limits
       if (settings?.dailySettlementLimit) {
-        const dailyLimit = parseFloat(settings.dailySettlementLimit);
-        if (currentDailyTotal + runningBatchTotal + amount > dailyLimit) {
+        const dailyLimit = new BigNumber(settings.dailySettlementLimit);
+        const projectedTotal = currentDailyTotal.plus(runningBatchTotal).plus(amount);
+        if (projectedTotal.isGreaterThan(dailyLimit)) {
           errors.push({
             index: i,
-            reason: `Daily settlement limit exceeded. Current: ${currentDailyTotal + runningBatchTotal}, Requested: ${amount}, Limit: ${settings.dailySettlementLimit}`
+            reason: `Daily settlement limit exceeded. Current: ${currentDailyTotal.plus(runningBatchTotal).toFixed()}, Requested: ${amount.toFixed()}, Limit: ${settings.dailySettlementLimit}`
           });
           continue;
         }
@@ -1742,7 +1792,14 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       let itemResult;
       try {
-        itemResult = computeSettlementAmounts(item.amount as Amount, feeBps, monthlyVolume, discountTiers);
+        itemResult = computeSettlementAmounts(
+          item.amount as Amount,
+          feeBps,
+          monthlyVolume,
+          discountTiers,
+          item.asset,
+          { maxFeeBps, maxFeeThreshold },
+        );
       } catch (error) {
         if (error instanceof SettlementAmountError) {
           errors.push({ index: i, reason: error.message });
@@ -1760,9 +1817,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         grossAmount,
         feeAmount,
         netAmount,
-        feeBps: feeSnapshot.feeBpsApplied
+        feeBps: feeSnapshot.feeBpsApplied,
+        feeSnapshot,
       });
-      runningBatchTotal += amount;
+      runningBatchTotal = runningBatchTotal.plus(amount);
     }
 
     const batchId = 'batch_' + crypto.randomUUID().replace(/-/g, '');
@@ -1795,6 +1853,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
             status: 'pending',
             webhookUrl,
             webhookHeaders: webhookHeaders as any,
+            feeSnapshot: item.feeSnapshot as any,
             batchId,
           });
         }
@@ -1842,6 +1901,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   }
 );
 
+// Batch ids are generated as `batch_<32 hex chars>`; accept only a bounded
+// `batch_` + [A-Za-z0-9_] token so malformed identifiers never reach the DB.
+const BatchIdParam = z.string().regex(/^batch_[A-Za-z0-9_]{1,64}$/);
+
 fastify.get<{ Params: { batchId: string } }>(
   '/api/settlements/batch/:batchId/status',
   {
@@ -1854,11 +1917,11 @@ fastify.get<{ Params: { batchId: string } }>(
     },
   },
   async (request, reply) => {
-    const { batchId } = request.params;
-
-    if (!batchId || !batchId.startsWith('batch_')) {
+    const parsedBatchId = BatchIdParam.safeParse(request.params.batchId);
+    if (!parsedBatchId.success) {
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid batchId format'));
     }
+    const batchId = parsedBatchId.data;
 
     const settlements = await prisma.settlement.findMany({
       where: { batchId },
@@ -1873,18 +1936,26 @@ fastify.get<{ Params: { batchId: string } }>(
     let processing = 0;
     let completed = 0;
     let failed = 0;
+    let superseded = 0;
 
     for (const s of settlements) {
-      if (s.status === 'pending') pending++;
+      // A settlement replaced by a retry is reported under `superseded` only,
+      // so its stale status (typically `failed`) doesn't skew the batch counts.
+      if (s.supersededById != null) superseded++;
+      else if (s.status === 'pending') pending++;
       else if (s.status === 'processing') processing++;
       else if (s.status === 'completed') completed++;
       else if (s.status === 'failed') failed++;
     }
 
+    // Overall status is judged against the settlements that are still live.
+    const active = total - superseded;
     let overallStatus = 'processing';
-    if (completed === total) overallStatus = 'completed';
-    else if (failed === total) overallStatus = 'failed';
-    else if (pending === total) overallStatus = 'pending';
+    if (active > 0) {
+      if (completed === active) overallStatus = 'completed';
+      else if (failed === active) overallStatus = 'failed';
+      else if (pending === active) overallStatus = 'pending';
+    }
 
     return {
       data: {
@@ -1894,6 +1965,7 @@ fastify.get<{ Params: { batchId: string } }>(
         processing,
         completed,
         failed,
+        superseded,
         status: overallStatus,
       },
     };
