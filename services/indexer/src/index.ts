@@ -21,6 +21,7 @@ import {
   createWebhookQueue,
   createWebhookWorker,
   WEBHOOK_DEFAULTS,
+  type WebhookJobData,
 } from "@bettapay/webhook-delivery";
 import { closeWorkerWithTimeout, trackActiveJob } from "@bettapay/worker-shutdown";
 import { PrismaClient, WebhookSubscription, type Prisma } from "@prisma/client";
@@ -289,7 +290,7 @@ export function calculateBackoffAfterError(err: unknown): number {
 // safety — see shared/webhook-delivery/index.ts for details).
 export const webhookQueue = createWebhookQueue("indexer-webhooks", sharedRedis);
 // Ensure only one webhook worker is created to prevent duplicate deliveries
-const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
+export const webhookWorker = createWebhookWorker("indexer-webhooks", sharedRedis, {
   logger: {
     info: (obj, msg) => fastify.log.info(obj, msg),
     warn: (obj, msg) => fastify.log.warn(obj, msg),
@@ -301,7 +302,7 @@ const getActiveWebhookJob = trackActiveJob(webhookWorker);
 // ── Dead-letter queue (DLQ) for webhooks that exhaust all retries (#354) ─────
 // The queue relies on the unconditionally initialized canonical sharedRedis client
 const DLQ_QUEUE_NAME = "indexer-webhooks-dlq";
-const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
+export const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   connection: sharedRedis,
   defaultJobOptions: {
     removeOnComplete: { count: 100 },
@@ -309,21 +310,47 @@ const dlqQueue = new Queue(DLQ_QUEUE_NAME, {
   },
 });
 
+/**
+ * Builds the dead-letter payload for a permanently failed webhook delivery job,
+ * stripping plaintext `signingSecret` before persisting (#1064).
+ *
+ * @internal exported for testing
+ */
+export function buildDeadLetterPayload(
+  job: {
+    id?: string;
+    attemptsMade: number;
+    data?: WebhookJobData | Record<string, unknown>;
+  },
+  err: unknown,
+): Record<string, unknown> {
+  const { signingSecret: _redacted, ...safeJobData } = (job.data ??
+    {}) as Record<string, unknown>;
+  return {
+    ...safeJobData,
+    failedAt: new Date().toISOString(),
+    error:
+      err instanceof Error
+        ? err.message
+        : (err as { message?: string } | null | undefined)?.message ??
+          String(err),
+    attempts: job.attemptsMade,
+    originalJobId: job.id,
+  };
+}
+
 webhookWorker.on("failed", async (job, err) => {
   if (
     !job ||
     job.attemptsMade < (job.opts.attempts ?? WEBHOOK_DEFAULTS.attempts)
   )
     return;
-  // All retries exhausted — move to DLQ
+  // All retries exhausted — move to DLQ with signingSecret stripped (#1064)
   try {
-    await dlqQueue.add("failed-delivery", {
-      ...job.data,
-      failedAt: new Date().toISOString(),
-      error: err?.message ?? String(err),
-      attempts: job.attemptsMade,
-      originalJobId: job.id,
-    } as any);
+    await dlqQueue.add(
+      "failed-delivery",
+      buildDeadLetterPayload(job, err) as any,
+    );
     fastify.log.warn(
       { jobId: job.id, url: job.data.url },
       "[Indexer] Webhook moved to dead-letter queue after all retries",
@@ -750,6 +777,7 @@ export async function dispatchPendingWebhookDeliveries(): Promise<void> {
           event: delivery.event,
           version: "1.0",
           signingSecret: decryptedSecret,
+          subscriptionId: delivery.subscriptionId,
           headers: delivery.headers ?? undefined,
         },
         { jobId: `indexed-event-delivery-${delivery.id}` },
@@ -1487,6 +1515,7 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
         event: payload,
         version: "1.0",
         signingSecret: existing.signingSecret ?? undefined,
+        subscriptionId: existing.id,
         headers:
           (existing.headers as Record<string, string> | null) ?? undefined,
         traceId: (request as any).traceId ?? request.headers["x-trace-id"] ?? undefined,
@@ -1546,18 +1575,44 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   },
 );
 
-// ── Admin: dead-letter queue (#354) ──────────────────────────────────────────
+// ── Admin: dead-letter queue (#354, #1063) ───────────────────────────────────
+
+const DEFAULT_DEAD_LETTER_LIMIT = 50;
+const MAX_DEAD_LETTER_LIMIT = 200;
 
 fastify.get(
   "/api/admin/webhooks/dead-letter",
   { preValidation: [fastify.serviceAuth] },
-  async (request) => {
-    const { limit = 50, offset = 0 } = request.query as Record<
-      string,
-      unknown
-    > as { limit?: number; offset?: number };
-    const safeLimit = Math.min(Number(limit) || 50, 200);
-    const safeOffset = Math.max(Number(offset) || 0, 0);
+  async (request, reply) => {
+    const query = (request.query ?? {}) as {
+      limit?: number | string;
+      offset?: number | string;
+    };
+
+    let safeLimit = DEFAULT_DEAD_LETTER_LIMIT;
+    if (query.limit !== undefined) {
+      const parsedLimit =
+        typeof query.limit === "string" && query.limit.trim() === ""
+          ? Number.NaN
+          : Number(query.limit);
+      if (
+        !Number.isInteger(parsedLimit) ||
+        parsedLimit < 1 ||
+        parsedLimit > MAX_DEAD_LETTER_LIMIT
+      ) {
+        return reply.code(400).send(
+          createErrorResponse(
+            ErrorCodes.VALIDATION_ERROR,
+            `limit must be an integer between 1 and ${MAX_DEAD_LETTER_LIMIT}`,
+            { limit: query.limit, min: 1, max: MAX_DEAD_LETTER_LIMIT },
+            request.id,
+          ),
+        );
+      }
+      safeLimit = parsedLimit;
+    }
+
+    const safeOffset = Math.max(Number(query.offset) || 0, 0);
 
     const jobs = await dlqQueue.getJobs(
       ["failed"],
@@ -1582,6 +1637,28 @@ fastify.get(
   },
 );
 
+async function resolveSubscriptionSigningSecret(
+  subscriptionId?: string,
+  url?: string,
+): Promise<string | undefined> {
+  let subscription: Pick<WebhookSubscription, "signingSecret"> | null = null;
+  if (subscriptionId) {
+    subscription = await prisma.webhookSubscription.findUnique({
+      where: { id: subscriptionId },
+      select: { signingSecret: true },
+    });
+  } else if (url) {
+    subscription = await prisma.webhookSubscription.findFirst({
+      where: { url },
+      orderBy: { createdAt: "desc" },
+      select: { signingSecret: true },
+    });
+  }
+  return subscription?.signingSecret
+    ? decryptField(subscription.signingSecret)
+    : undefined;
+}
+
 fastify.post<{ Params: { id: string } }>(
   "/api/admin/webhooks/dead-letter/:id/replay",
   { preValidation: [fastify.serviceAuth] },
@@ -1594,18 +1671,50 @@ fastify.post<{ Params: { id: string } }>(
       );
     }
 
+    const subscriptionId =
+      typeof job.data.subscriptionId === "string"
+        ? job.data.subscriptionId
+        : typeof (job.data.event as Record<string, unknown> | undefined)
+              ?.subscriptionId === "string"
+          ? ((job.data.event as Record<string, unknown>)
+              .subscriptionId as string)
+          : undefined;
+
+    // Re-fetch and decrypt signingSecret from the subscription record because
+    // dead-letter payloads strip plaintext secrets before persisting (#1064).
+    const signingSecret = await resolveSubscriptionSigningSecret(
+      subscriptionId,
+      job.data.url,
+    );
+
     // Re-enqueue on the main webhook delivery queue. Custom headers
     // (Authorization, X-Idempotency-Key, ...) live on job.data.headers
-    // alongside url/event/signingSecret (see dispatchPendingWebhookDeliveries
-    // and the webhookWorker "failed" handler that spreads job.data into the
-    // DLQ) — omitting it here meant a replayed delivery arrived without the
-    // merchant's expected auth header and was rejected (#614).
-    await webhookQueue.add("deliver", {
-      url: job.data.url,
-      event: (job.data.event ?? {}) as Record<string, unknown>,
-      signingSecret: job.data.signingSecret,
-      headers: job.data.headers,
-    });
+    // alongside url/event (see dispatchPendingWebhookDeliveries and the
+    // webhookWorker "failed" handler) — omitting it here meant a replayed
+    // delivery arrived without the merchant's expected auth header and was
+    // rejected (#614).
+    try {
+      await webhookQueue.add("deliver", {
+        url: job.data.url,
+        event: (job.data.event ?? {}) as Record<string, unknown>,
+        signingSecret,
+        subscriptionId,
+        headers: job.data.headers,
+      });
+    } catch (err) {
+      fastify.log.error(
+        { err, jobId: id, url: job.data.url },
+        "[Indexer] Failed to re-enqueue DLQ job to webhook queue",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Webhook queue unavailable; failed to re-enqueue dead-letter job",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     // Remove from DLQ
     await job.remove();
@@ -1618,32 +1727,163 @@ fastify.post<{ Params: { id: string } }>(
   },
 );
 
-// ── Stellar RPC polling loop ──────────────────────────────────────────────────
+// ── Stellar RPC polling loop (#1057) ─────────────────────────────────────────
 
-async function pollEvents() {
+export const POLL_LEADER_LOCK_KEY = "lock:indexer:poll-events";
+const POLL_LEADER_LOCK_TTL_MS = Math.max(env.POLL_TIMEOUT_MS * 2, 30_000);
+const RELEASE_POLL_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+export interface PollLeaderLockClient {
+  set(
+    key: string,
+    value: string,
+    millisecondsToken: "PX",
+    milliseconds: number,
+    nx: "NX",
+  ): Promise<"OK" | string | null>;
+  eval(
+    script: string,
+    numkeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
+}
+
+export interface PollCycleDependencies {
+  redis?: PollLeaderLockClient;
+  rpcServer?: Pick<typeof server, "getLatestLedger" | "getEvents">;
+  flushEvents?: typeof flushIndexedEvents;
+  dispatchWebhooks?: typeof dispatchPendingWebhookDeliveries;
+  getCursor?: () => number | null | undefined;
+  setCursor?: (cursor: number | undefined) => void;
+  getLatestSequence?: () => number | undefined;
+  setLatestSequence?: (seq: number | undefined) => void;
+  getIndexFromLedger?: () => string | undefined;
+}
+
+/** @internal exported for testing */
+export function getLatestLedgerCursor(): number | undefined {
+  return latestLedgerCursor;
+}
+
+/** @internal exported for testing */
+export function setLatestLedgerCursor(cursor: number | undefined): void {
+  latestLedgerCursor = cursor;
+}
+
+function resolveConfiguredStartLedger(
+  indexFromLedger: string | undefined,
+): number | undefined {
+  if (!indexFromLedger) return undefined;
+  const parsed = parseInt(indexFromLedger, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : undefined;
+}
+
+/**
+ * Executes a single poll cycle under a Redis distributed leader lock (#1057).
+ *
+ * Guarantees:
+ *   1. Only one replica polls at a time (Redis SET NX PX + atomic Lua release).
+ *   2. Never falls back to startLedger: 0 when latestLedgerCursor is null/undefined;
+ *      uses configured INDEX_FROM_LEDGER or the latest ledger sequence from RPC.
+ *   3. Only advances latestLedgerCursor after flushIndexedEvents commits.
+ *
+ * @internal exported for testing
+ */
+export async function runPollCycle(
+  deps: PollCycleDependencies = {},
+): Promise<number> {
+  const redisClient = deps.redis ?? sharedRedis;
+  const rpcServer = deps.rpcServer ?? server;
+  const flushEvents = deps.flushEvents ?? flushIndexedEvents;
+  const dispatchWebhooks =
+    deps.dispatchWebhooks ?? dispatchPendingWebhookDeliveries;
+  const getCursor = deps.getCursor ?? (() => latestLedgerCursor);
+  const setCursor =
+    deps.setCursor ??
+    ((next: number | undefined) => {
+      latestLedgerCursor = next;
+    });
+  const getLatestSequence =
+    deps.getLatestSequence ?? (() => latestLedgerSequence);
+  const setLatestSequence =
+    deps.setLatestSequence ??
+    ((seq: number | undefined) => {
+      latestLedgerSequence = seq;
+    });
+  const getIndexFromLedger =
+    deps.getIndexFromLedger ?? (() => env.INDEX_FROM_LEDGER);
+
   const pollStart = Date.now();
   let aborted = false;
 
-  // On each poll, fetch the latest Stellar ledger to track lag
+  // 1. Acquire Redis distributed leader lock so only one replica polls at a time (#1057)
+  let lockAcquired = false;
+  const lockToken = crypto.randomUUID();
   try {
-    const latest = await server.getLatestLedger();
-    latestLedgerSequence = latest.sequence;
-  } catch {
-    // Cannot reach the network; keep the previous sequence for lag computation
+    const res = await redisClient.set(
+      POLL_LEADER_LOCK_KEY,
+      lockToken,
+      "PX",
+      POLL_LEADER_LOCK_TTL_MS,
+      "NX",
+    );
+    lockAcquired = res === "OK";
+  } catch (lockErr) {
+    fastify.log.warn(
+      { err: lockErr },
+      "[Indexer] Failed to acquire poll leader lock — skipping cycle",
+    );
+    pollCyclesCounter.inc({ status: "lock_error" });
+    return currentBackoff;
+  }
+
+  if (!lockAcquired) {
+    fastify.log.debug(
+      "[Indexer] Poll leader lock held by another replica — skipping cycle",
+    );
+    pollCyclesCounter.inc({ status: "skipped_not_leader" });
+    return currentBackoff;
   }
 
   try {
-    let cursor = latestLedgerCursor;
-    if (cursor === undefined) {
-      cursor = latestLedgerSequence;
+    // On each poll, fetch the latest Stellar ledger to track lag and provide a
+    // fallback starting ledger when latestLedgerCursor is not yet initialized.
+    try {
+      const latest = await rpcServer.getLatestLedger();
+      setLatestSequence(latest.sequence);
+    } catch {
+      // Cannot reach the network; keep the previous sequence for lag computation
     }
 
-    if (cursor === undefined) {
+    const currentCursor = getCursor();
+    const configuredStartLedger = resolveConfiguredStartLedger(
+      getIndexFromLedger(),
+    );
+    const currentTip = getLatestSequence();
+
+    // Never fall back to ledger 0 (#1057): require an existing valid cursor, a
+    // configured INDEX_FROM_LEDGER (>= 1), or a fetched network tip (>= 1).
+    const startLedger =
+      currentCursor !== undefined &&
+      currentCursor !== null &&
+      currentCursor >= 1
+        ? currentCursor
+        : (configuredStartLedger ??
+          (currentTip !== undefined && currentTip >= 1
+            ? currentTip
+            : undefined));
+
+    if (startLedger === undefined) {
       currentBackoff = BASE_BACKOFF;
       pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
       pollCyclesCounter.inc({ status: "success" });
-      setTimeout(pollEvents, currentBackoff);
-      return;
+      return currentBackoff;
     }
 
     const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
@@ -1652,8 +1892,8 @@ async function pollEvents() {
     let response: Awaited<ReturnType<typeof server.getEvents>>;
     try {
       response = await Promise.race([
-        server.getEvents({
-          startLedger: latestLedgerCursor ?? 0,
+        rpcServer.getEvents({
+          startLedger,
           filters: CONTRACT_IDS.map((contractId) => ({
             type: "contract" as const,
             contractIds: [contractId],
@@ -1662,7 +1902,10 @@ async function pollEvents() {
           limit: 100,
         }),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("PER_LEDGER_TIMEOUT")), perLedgerTimeoutMs),
+          setTimeout(
+            () => reject(new Error("PER_LEDGER_TIMEOUT")),
+            perLedgerTimeoutMs,
+          ),
         ),
       ]);
       consecutiveSkips = 0;
@@ -1685,8 +1928,7 @@ async function pollEvents() {
         indexerLedgerSkipsCounter.inc();
         pollCyclesCounter.inc({ status: "timeout" });
         pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
-        setTimeout(pollEvents, currentBackoff);
-        return;
+        return currentBackoff;
       }
       throw err;
     }
@@ -1763,34 +2005,47 @@ async function pollEvents() {
       }
 
       if (pendingEvents.length > 0) {
-        const { maxInsertedLedger } = await flushIndexedEvents(pendingEvents);
-        if (latestLedgerCursor !== undefined && maxInsertedLedger !== null) {
-          latestLedgerCursor = Math.max(
-            latestLedgerCursor,
-            maxInsertedLedger + 1,
-          );
+        // Advance latestLedgerCursor ONLY after flushEvents commits (#1057).
+        // If flushEvents throws, we jump to catch without mutating the cursor.
+        const { maxInsertedLedger } = await flushEvents(pendingEvents);
+        const maxPendingLedger = pendingEvents.reduce<number | null>(
+          (max, evt) => (max === null ? evt.ledger : Math.max(max, evt.ledger)),
+          null,
+        );
+        const committedLedger = maxInsertedLedger ?? maxPendingLedger;
+        if (committedLedger !== null) {
+          setCursor(Math.max(startLedger, committedLedger + 1));
+        }
+      } else if (!aborted) {
+        const maxSkippedLedger = response.events.reduce<number | null>(
+          (max, evt) => (max === null ? evt.ledger : Math.max(max, evt.ledger)),
+          null,
+        );
+        if (maxSkippedLedger !== null) {
+          setCursor(Math.max(startLedger, maxSkippedLedger + 1));
         }
       }
 
       // #712 — one dispatch pass per poll cycle, after all writes for the cycle
       // have landed. Aborted cycles leave deliveries pending for the next pass.
       if (!aborted) {
-        await dispatchPendingWebhookDeliveries();
+        await dispatchWebhooks();
       }
-    } else if (
-      latestLedgerSequence !== undefined &&
-      latestLedgerCursor !== undefined
-    ) {
-      latestLedgerCursor = Math.max(latestLedgerCursor, latestLedgerSequence);
+    } else if (!aborted) {
+      const tip = getLatestSequence();
+      if (tip !== undefined && tip >= 1) {
+        setCursor(Math.max(startLedger, tip));
+      } else if (currentCursor === undefined || currentCursor === null) {
+        setCursor(startLedger);
+      }
     }
 
-    if (!aborted) {
-      latestLedgerCursor = cursor;
-    }
+    const updatedCursor = getCursor();
+    const updatedTip = getLatestSequence();
 
     // Warn if the indexer is too far behind the network tip
-    if (latestLedgerSequence !== undefined && !aborted) {
-      const lag = latestLedgerSequence - cursor;
+    if (updatedTip !== undefined && !aborted) {
+      const lag = updatedTip - (updatedCursor ?? startLedger);
       if (lag > env.INDEXER_LAG_WARN_THRESHOLD) {
         fastify.log.warn(
           { lag, threshold: env.INDEXER_LAG_WARN_THRESHOLD },
@@ -1800,10 +2055,9 @@ async function pollEvents() {
     }
 
     // Issue #345 — Update lag metrics after each poll cycle
-    if (latestLedgerSequence !== undefined) {
-      indexerNetworkTipLedgerGauge.set(latestLedgerSequence);
-      const currentLag =
-        latestLedgerSequence - (latestLedgerCursor ?? latestLedgerSequence);
+    if (updatedTip !== undefined) {
+      indexerNetworkTipLedgerGauge.set(updatedTip);
+      const currentLag = updatedTip - (updatedCursor ?? updatedTip);
       for (const contractId of CONTRACT_IDS) {
         indexerLagGauge.set({ contractId }, currentLag);
       }
@@ -1814,14 +2068,14 @@ async function pollEvents() {
       }
     }
 
-    if (latestLedgerCursor !== undefined) {
-      indexerLastIndexedLedgerGauge.set(latestLedgerCursor);
+    if (updatedCursor !== undefined && updatedCursor !== null) {
+      indexerLastIndexedLedgerGauge.set(updatedCursor);
     }
 
     calculateBackoffAfterSuccess();
     pollDurationHistogram.observe((Date.now() - pollStart) / 1000);
     pollCyclesCounter.inc({ status: "success" });
-    setTimeout(pollEvents, currentBackoff);
+    return currentBackoff;
   } catch (err) {
     fastify.log.error(`[Indexer] Polling error: ${err}`);
     pollCyclesCounter.inc({ status: "error" });
@@ -1830,8 +2084,22 @@ async function pollEvents() {
     fastify.log.info(
       `[Indexer] Retrying in ${Math.round(jitter)}ms (backoff: ${backoffMs}ms)`,
     );
-    setTimeout(pollEvents, jitter);
+    return jitter;
+  } finally {
+    if (lockAcquired) {
+      await redisClient.eval(RELEASE_POLL_LOCK_SCRIPT, 1, POLL_LEADER_LOCK_KEY, lockToken).catch((releaseErr) => {
+        fastify.log.warn(
+          { err: releaseErr },
+          "[Indexer] Failed to release poll leader lock",
+        );
+      });
+    }
   }
+}
+
+async function pollEvents() {
+  const nextDelayMs = await runPollCycle();
+  setTimeout(pollEvents, nextDelayMs);
 }
 
 /**
