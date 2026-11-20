@@ -394,6 +394,17 @@ webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
 });
 
+// #1059 — shared QueueEvents for POST /api/webhooks/:id/test completion
+// notifications. It used to be constructed per request, which opened (and, on
+// close, tore down) a fresh Redis connection for every test delivery; the
+// module-scope instance is created once and closed during shutdown.
+export const webhookQueueEvents = new QueueEvents("indexer-webhooks", {
+  connection: sharedRedis,
+});
+webhookQueueEvents.on("error", (err) => {
+  fastify.log.error({ err: err.message }, "[Indexer] Webhook QueueEvents error");
+});
+
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
 export const replayQueue = new Queue("indexer-replays", {
@@ -727,6 +738,64 @@ export function decodeScVal(
   }
 }
 
+/**
+ * Decodes a single Soroban event topic (typically an `xdr.ScVal`) into a
+ * string via `scValToNative`, falling back cleanly instead of producing
+ * `"[object Object]"` (#1058).
+ *
+ * @internal exported for testing only
+ */
+export function decodeTopicScVal(topic: unknown): string {
+  if (typeof topic === "string") return topic;
+  if (
+    typeof topic === "number" ||
+    typeof topic === "boolean" ||
+    typeof topic === "bigint"
+  ) {
+    return String(topic);
+  }
+  if (topic === null || topic === undefined) {
+    return String(topic);
+  }
+  try {
+    const native = scValToNative(topic as xdr.ScVal);
+    if (typeof native === "string") return native;
+    if (typeof native === "bigint") return native.toString();
+    if (native instanceof Uint8Array || Buffer.isBuffer(native)) {
+      return Buffer.from(native).toString("hex");
+    }
+    if (native !== null && typeof native === "object") {
+      return JSON.stringify(serializeNative(native));
+    }
+    return String(native);
+  } catch (err) {
+    fastify.log.warn(
+      { err: String(err) },
+      "[Indexer] Failed to decode topic ScVal — falling back to raw representation",
+    );
+    if (typeof (topic as { toXDR?: unknown }).toXDR === "function") {
+      try {
+        return (topic as xdr.ScVal).toXDR("base64");
+      } catch {
+        // fall through to generic string fallback
+      }
+    }
+    return String(topic);
+  }
+}
+
+/**
+ * Decodes an event's `topic` field (array of ScVals or single ScVal) into
+ * human-readable string topics (#1058).
+ *
+ * @internal exported for testing only
+ */
+export function decodeEventTopics(rawTopic: unknown): string[] {
+  return Array.isArray(rawTopic)
+    ? rawTopic.map(decodeTopicScVal)
+    : [decodeTopicScVal(rawTopic)];
+}
+
 // ── Event payload validation ──────────────────────────────────────────────────
 
 /** @internal exported for testing only */
@@ -964,7 +1033,8 @@ export async function flushIndexedEvents(
     );
   }
 
-  if (records.length > 0) {
+  const deliverableRecords = records.filter((record) => !record.validationError);
+  if (deliverableRecords.length > 0) {
     const subs = await loadWebhookSubscriptions();
     if (subs.length) {
       const deliveries = records.flatMap((record) =>
@@ -1642,12 +1712,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       { attempts: 1 },
     );
 
-    const queueEvents = new QueueEvents("indexer-webhooks", {
-      connection: sharedRedis,
-    });
     try {
       const finished = await Promise.race([
-        job.waitUntilFinished(queueEvents),
+        job.waitUntilFinished(webhookQueueEvents),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
         ),
@@ -1687,8 +1754,6 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       const response: any = { success: false, error: errorMsg };
       if (statusCode) response.statusCode = statusCode;
       return response;
-    } finally {
-      await queueEvents.close();
     }
   },
 );
@@ -1937,6 +2002,109 @@ export async function runPollCycle(
   const getIndexFromLedger =
     deps.getIndexFromLedger ?? (() => env.INDEX_FROM_LEDGER);
 
+/**
+ * Races `promise` against a timeout of `timeoutMs` milliseconds, always
+ * clearing the `setTimeout` handle in `finally` so successful polls never
+ * leak pending timers (#1058).
+ *
+ * @internal exported for testing only
+ */
+export async function raceWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+export interface PolledEventLike {
+  id?: unknown;
+  topic: unknown;
+  value: xdr.ScVal;
+  contractId?: { toString(): string } | null;
+  ledger: number;
+}
+
+/**
+ * Decodes topics and value for a polled Soroban event, validates its payload,
+ * and builds the `IndexedEvent` row. Events that fail schema validation are
+ * logged with full event context, counted via `indexerValidationErrorsTotal`,
+ * and returned with `validationError` populated so they are persisted
+ * (dead-lettered) rather than silently skipped (#1058). Returns `null` only
+ * when XDR decoding itself fails.
+ *
+ * @internal exported for testing only
+ */
+export function preparePolledEvent(
+  evt: PolledEventLike,
+): Prisma.IndexedEventCreateManyInput | null {
+  const topics = decodeEventTopics(evt.topic);
+  const eventType = topics[0] ?? "unknown";
+  const decodedPayload = decodeScVal(evt.value, eventType);
+  const resolvedContractId = evt.contractId
+    ? evt.contractId.toString()
+    : CONTRACT_IDS[0];
+  const contractName = getContractName(resolvedContractId);
+  const stellarId = typeof evt.id === "string" ? evt.id : null;
+
+  // A malformed payload is logged by decodeScVal and skipped so one bad
+  // event cannot stall the cycle; later events are still processed.
+  if (decodedPayload === undefined) {
+    return null;
+  }
+
+  const rawValue =
+    typeof (evt.value as { toXDR?: unknown })?.toXDR === "function"
+      ? evt.value.toXDR("base64")
+      : "";
+
+  const validationError = validatePayload(eventType, decodedPayload);
+  if (validationError !== null) {
+    indexerValidationErrorsTotal.inc({
+      contractId: resolvedContractId,
+      type: eventType,
+    });
+    fastify.log.warn(
+      {
+        stellarId,
+        contractId: resolvedContractId,
+        contractName,
+        ledger: evt.ledger,
+        type: eventType,
+        topics,
+        validationError,
+      },
+      "[Indexer] Event failed schema validation — dead-lettering with validationError",
+    );
+  }
+
+  return {
+    id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
+    stellarId,
+    contractId: resolvedContractId,
+    contractName,
+    topics,
+    type: eventType,
+    rawValue,
+    decodedPayload:
+      decodedPayload !== null ? (decodedPayload as any) : undefined,
+    validationError: validationError ?? undefined,
+    ledger: evt.ledger,
+    indexedAt: new Date(),
+  };
+}
+
+async function pollEvents() {
   const pollStart = Date.now();
   let aborted = false;
 
@@ -2006,12 +2174,12 @@ export async function runPollCycle(
 
     const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
 
-    // Wrap server.getEvents() with per-ledger timeout (#565)
+    // Wrap server.getEvents() with per-ledger timeout (#565, #1058)
     let response: Awaited<ReturnType<typeof server.getEvents>>;
     try {
-      response = await Promise.race([
-        rpcServer.getEvents({
-          startLedger,
+      response = await raceWithTimeout(
+        server.getEvents({
+          startLedger: latestLedgerCursor ?? 0,
           filters: CONTRACT_IDS.map((contractId) => ({
             type: "contract" as const,
             contractIds: [contractId],
@@ -2019,13 +2187,9 @@ export async function runPollCycle(
           })),
           limit: 100,
         }),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error("PER_LEDGER_TIMEOUT")),
-            perLedgerTimeoutMs,
-          ),
-        ),
-      ]);
+        perLedgerTimeoutMs,
+        "PER_LEDGER_TIMEOUT",
+      );
       consecutiveSkips = 0;
     } catch (err: unknown) {
       if (err instanceof Error && err.message === "PER_LEDGER_TIMEOUT") {
@@ -2054,10 +2218,10 @@ export async function runPollCycle(
     const timeoutMs = env.POLL_TIMEOUT_MS;
 
     if (response.events && response.events.length > 0) {
-      // #713 — accumulate the cycle's validated events and write them in one
+      // #713 / #1058 — accumulate the cycle's events and write them in one
       // batch instead of one create per event (and one delivery createMany per
-      // event). Decode/validate are unchanged; every event still becomes its
-      // own row, including events carrying a validationError.
+      // event). Every decoded event becomes its own row, including events
+      // carrying a validationError (dead-lettered without webhook dispatch).
       const pendingEvents: Prisma.IndexedEventCreateManyInput[] = [];
       let skippedEventCount = 0;
 
@@ -2073,52 +2237,20 @@ export async function runPollCycle(
           break;
         }
 
-        const topics = Array.isArray(evt.topic)
-          ? evt.topic.map(String)
-          : [String(evt.topic)];
-        const rawValue = evt.value.toXDR("base64");
-        const decodedPayload = decodeScVal(evt.value, topics[0]);
-        const resolvedContractId = evt.contractId
-          ? evt.contractId.toString()
-          : CONTRACT_IDS[0];
-        const contractName = getContractName(resolvedContractId);
-        const stellarId = typeof evt.id === "string" ? evt.id : null;
-
-        // A malformed payload is logged by decodeScVal and skipped so one bad
-        // event cannot stall the cycle; later events are still processed.
-        if (decodedPayload === undefined) {
+        const prepared = preparePolledEvent(evt);
+        if (prepared === null) {
           skippedEventCount++;
           continue;
         }
 
-        const validationError = validatePayload(topics[0], decodedPayload);
-        if (validationError !== null) {
-          skippedEventCount++;
-          continue;
-        }
-
-        pendingEvents.push({
-          id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
-          stellarId,
-          contractId: resolvedContractId,
-          contractName,
-          topics,
-          type: topics[0],
-          rawValue,
-          decodedPayload:
-            decodedPayload !== null ? (decodedPayload as any) : undefined,
-          validationError: validationError ?? undefined,
-          ledger: evt.ledger,
-          indexedAt: new Date(),
-        });
-
-        eventsFetchedCounter.inc({ contractId: resolvedContractId });
+        pendingEvents.push(prepared);
+        eventsFetchedCounter.inc({ contractId: prepared.contractId });
       }
 
       if (skippedEventCount > 0) {
         fastify.log.warn(
           { skipped: skippedEventCount, processed: pendingEvents.length },
-          "[Indexer] Skipped events that failed decode or validation",
+          "[Indexer] Skipped events that failed XDR decode",
         );
       }
 
@@ -2502,6 +2634,9 @@ const shutdown = async (signal: string) => {
       fastify.log,
       getActiveWebhookJob,
     );
+    // #1059 — the shared QueueEvents instance must be closed on shutdown too,
+    // otherwise its Redis connection outlives the process teardown sequence.
+    await webhookQueueEvents.close();
     await dlqQueue.close();
     await replayProgressRedis.quit().catch(() => {});
     await fastify.close();
