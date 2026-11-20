@@ -6,6 +6,8 @@ import {
   getEnabledFlags,
   logFeatureFlags,
   reloadFeatureFlags,
+  analyzeFeatureFlags,
+  KNOWN_FEATURE_FLAGS,
 } from './feature-flags.js';
 
 // Issue #865: feature-flag parsing edge cases and isFeatureEnabled / getEnabledFlags contract
@@ -169,4 +171,128 @@ test('webhook_cache_ttl_refresh flag: expired cache is always a miss regardless 
 
   const result = simulateCacheCheck(cachedAt, now, flags);
   assert.equal(result, 'miss');
+});
+
+// ── Issue #1085: unknown / malformed flag warnings ───────────────────────────
+
+function withFeatureFlags(value: string | undefined, fn: () => void): void {
+  const prev = process.env.FEATURE_FLAGS;
+  try {
+    if (value === undefined) delete process.env.FEATURE_FLAGS;
+    else process.env.FEATURE_FLAGS = value;
+    reloadFeatureFlags();
+    fn();
+  } finally {
+    if (prev !== undefined) process.env.FEATURE_FLAGS = prev;
+    else delete process.env.FEATURE_FLAGS;
+    reloadFeatureFlags();
+  }
+}
+
+function createLogSpy() {
+  const info: Array<{ obj: Record<string, unknown>; msg?: string }> = [];
+  const warn: Array<{ obj: Record<string, unknown>; msg?: string }> = [];
+  return {
+    info,
+    warn,
+    log: {
+      info: (obj: object, msg?: string) => info.push({ obj: obj as Record<string, unknown>, msg }),
+      warn: (obj: object, msg?: string) => warn.push({ obj: obj as Record<string, unknown>, msg }),
+    },
+  };
+}
+
+test('KNOWN_FEATURE_FLAGS lists every flag checked in code', () => {
+  assert.ok(KNOWN_FEATURE_FLAGS.has('webhook_cache_ttl_refresh'));
+});
+
+test('analyzeFeatureFlags: known valid flags parse unchanged with no diagnostics', () => {
+  const result = analyzeFeatureFlags(' Webhook_Cache_TTL_Refresh ');
+  assert.deepEqual(Array.from(result.flags), ['webhook_cache_ttl_refresh']);
+  assert.deepEqual(result.unknown, []);
+  assert.deepEqual(result.invalid, []);
+});
+
+test('analyzeFeatureFlags: unknown flag names are enabled but reported', () => {
+  const result = analyzeFeatureFlags('webhook_cache_ttl_refresh,webhok_cache_ttl_refresh,zeta,alpha');
+  assert.ok(result.flags.has('webhok_cache_ttl_refresh'), 'unknown flags are not dropped');
+  assert.deepEqual(result.unknown, ['alpha', 'webhok_cache_ttl_refresh', 'zeta']);
+  assert.deepEqual(result.invalid, []);
+});
+
+test('analyzeFeatureFlags: explicit boolean values enable or disable flags', () => {
+  for (const v of ['true', 'TRUE', '1', 'yes', 'on', ' On ']) {
+    const result = analyzeFeatureFlags(`webhook_cache_ttl_refresh=${v}`);
+    assert.ok(result.flags.has('webhook_cache_ttl_refresh'), `value "${v}" enables`);
+    assert.deepEqual(result.invalid, []);
+  }
+  for (const v of ['false', 'FALSE', '0', 'no', 'off']) {
+    const result = analyzeFeatureFlags(`webhook_cache_ttl_refresh=${v}`);
+    assert.equal(result.flags.has('webhook_cache_ttl_refresh'), false, `value "${v}" disables`);
+    assert.deepEqual(result.invalid, []);
+  }
+  // A later false overrides an earlier bare enable.
+  assert.equal(analyzeFeatureFlags('webhook_cache_ttl_refresh,webhook_cache_ttl_refresh=off').flags.size, 0);
+});
+
+test('analyzeFeatureFlags: invalid boolean values and missing names are reported and never enable', () => {
+  const result = analyzeFeatureFlags('webhook_cache_ttl_refresh=maybe,=true,other=');
+  assert.equal(result.flags.size, 0);
+  assert.deepEqual(result.invalid, [
+    { entry: 'webhook_cache_ttl_refresh=maybe', reason: 'invalid_value' },
+    { entry: '=true', reason: 'missing_name' },
+    { entry: 'other=', reason: 'invalid_value' },
+  ]);
+  assert.deepEqual(result.unknown, []);
+});
+
+test('analyzeFeatureFlags: accepts a custom known-flag registry', () => {
+  const result = analyzeFeatureFlags('a,b', new Set(['a']));
+  assert.deepEqual(result.unknown, ['b']);
+});
+
+test('logFeatureFlags: warns with a structured payload for unknown flags', () => {
+  withFeatureFlags('webhook_cache_ttl_refresh,webhok_cache_ttl_refresh', () => {
+    const spy = createLogSpy();
+    logFeatureFlags(spy.log);
+
+    assert.equal(spy.info.length, 1);
+    assert.deepEqual(spy.info[0].obj.flags, ['webhok_cache_ttl_refresh', 'webhook_cache_ttl_refresh']);
+    assert.equal(spy.warn.length, 1);
+    assert.match(spy.warn[0].msg ?? '', /Unknown feature flags/);
+    assert.deepEqual(spy.warn[0].obj.unknownFlags, ['webhok_cache_ttl_refresh']);
+    assert.deepEqual(spy.warn[0].obj.knownFlags, Array.from(KNOWN_FEATURE_FLAGS).sort());
+  });
+});
+
+test('logFeatureFlags: warns with a structured payload for malformed entries', () => {
+  withFeatureFlags('webhook_cache_ttl_refresh=yes please', () => {
+    const spy = createLogSpy();
+    logFeatureFlags(spy.log);
+
+    assert.equal(spy.info[0].msg, 'No feature flags enabled');
+    assert.equal(spy.warn.length, 1);
+    assert.match(spy.warn[0].msg ?? '', /malformed/);
+    assert.deepEqual(spy.warn[0].obj.invalidFlags, [
+      { entry: 'webhook_cache_ttl_refresh=yes please', reason: 'invalid_value' },
+    ]);
+  });
+});
+
+test('logFeatureFlags: no warning for known, valid flags', () => {
+  withFeatureFlags('webhook_cache_ttl_refresh=true', () => {
+    const spy = createLogSpy();
+    logFeatureFlags(spy.log);
+    assert.equal(spy.info[0].msg, 'Feature flags active');
+    assert.equal(spy.warn.length, 0);
+    assert.equal(isFeatureEnabled('webhook_cache_ttl_refresh'), true);
+  });
+});
+
+test('logFeatureFlags: loggers without warn still work', () => {
+  withFeatureFlags('typo_flag', () => {
+    const info: string[] = [];
+    assert.doesNotThrow(() => logFeatureFlags({ info: (_obj, msg) => info.push(msg ?? '') }));
+    assert.deepEqual(info, ['Feature flags active']);
+  });
 });
