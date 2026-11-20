@@ -1769,6 +1769,19 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
     if (validItems.length > 0) {
       await prisma.$transaction(async (tx) => {
+        // Settlement.batchId is a FK to SettlementBatch (#1096), so the batch
+        // row must exist before its settlements are created.
+        const assets = new Set(validItems.map((item) => item.asset));
+        await tx.settlementBatch.create({
+          data: {
+            id: batchId,
+            asset: assets.size === 1 ? validItems[0].asset : 'MIXED',
+            totalCount: validItems.length,
+            totalGross: validItems.reduce((sum, item) => sum.plus(item.grossAmount), new BigNumber(0)).toFixed(),
+            totalFees: validItems.reduce((sum, item) => sum.plus(item.feeAmount), new BigNumber(0)).toFixed(),
+            totalNet: validItems.reduce((sum, item) => sum.plus(item.netAmount), new BigNumber(0)).toFixed(),
+          },
+        });
         for (const item of validItems) {
           await createSettlementWithUniqueGuard(tx, {
             id: item.id,
