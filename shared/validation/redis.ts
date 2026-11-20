@@ -30,7 +30,35 @@ export interface CreateRedisClientOptions extends Omit<RedisOptions, 'retryStrat
   redisFactory?: (url: string, options: RedisOptions) => Redis;
 }
 
-const sharedRedisClients = new Map<string, Redis>();
+interface SharedRedisEntry {
+  client: Redis;
+  healthStates: Set<RedisHealthState>;
+}
+
+const sharedRedisClients = new Map<string, SharedRedisEntry>();
+
+/** Default upper bound on how long clearSharedRedisClients waits for each quit(). */
+export const SHARED_REDIS_QUIT_TIMEOUT_MS = 2_000;
+
+// Fan lifecycle events out to every healthState registered against a shared
+// client, so later callers are not silently left with a stale state object.
+function attachSharedHealthListeners(client: Redis, healthStates: Set<RedisHealthState>): void {
+  client.on('connect', () => {
+    for (const state of healthStates) state.connected = true;
+  });
+  client.on('error', (err: Error) => {
+    for (const state of healthStates) {
+      state.errors++;
+      state.lastError = err.message;
+    }
+  });
+  client.on('close', () => {
+    for (const state of healthStates) state.connected = false;
+  });
+  client.on('reconnecting', () => {
+    for (const state of healthStates) state.reconnects++;
+  });
+}
 
 export function getSharedRedisClient(
   urlOrOptions?: string | CreateRedisClientOptions,
@@ -51,26 +79,54 @@ export function getSharedRedisClient(
     log = logger ?? clientOpts.logger;
   }
 
-  if (!sharedRedisClients.has(url)) {
+  let entry = sharedRedisClients.get(url);
+  if (!entry) {
+    const { healthState: _healthState, ...restOpts } = clientOpts;
     const client = createRedisClient(url, log, {
-      ...clientOpts,
+      ...restOpts,
       maxRetriesPerRequest: clientOpts.maxRetriesPerRequest ?? null,
       shared: false,
     });
-    sharedRedisClients.set(url, client);
+    entry = { client, healthStates: new Set() };
+    attachSharedHealthListeners(client, entry.healthStates);
+    sharedRedisClients.set(url, entry);
+  } else if (clientOpts.healthState && !entry.healthStates.has(clientOpts.healthState)) {
+    // Late subscriber: seed with the client's current connection status.
+    clientOpts.healthState.connected = entry.client.status === 'ready';
   }
-  return sharedRedisClients.get(url)!;
+
+  if (clientOpts.healthState) {
+    entry.healthStates.add(clientOpts.healthState);
+  }
+  return entry.client;
 }
 
-export async function clearSharedRedisClients(): Promise<void> {
-  for (const client of sharedRedisClients.values()) {
-    try {
-      await client.quit();
-    } catch {
-      client.disconnect();
-    }
+async function quitWithTimeout(client: Redis, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  try {
+    const quitting = client.quit();
+    // A rejection arriving after the timeout won the race must not go unhandled.
+    quitting.catch(() => {});
+    const result = await Promise.race([quitting, timedOut]);
+    if (result === 'timeout') client.disconnect();
+  } catch {
+    client.disconnect();
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+// Quits every shared client, falling back to disconnect() if quit() rejects or
+// does not settle within timeoutMs (e.g. Redis unreachable), so shutdown cannot hang.
+export async function clearSharedRedisClients(
+  timeoutMs: number = SHARED_REDIS_QUIT_TIMEOUT_MS,
+): Promise<void> {
+  const entries = [...sharedRedisClients.values()];
   sharedRedisClients.clear();
+  await Promise.all(entries.map(({ client }) => quitWithTimeout(client, timeoutMs)));
 }
 
 // #386 & #231 — exponential backoff and shared Redis connection management.

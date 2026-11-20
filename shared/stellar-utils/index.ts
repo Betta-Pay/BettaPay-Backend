@@ -39,19 +39,37 @@ export function generateStellarKeypair(): { publicKey: string; secretKey: string
   return { publicKey: keypair.publicKey(), secretKey: keypair.secret() };
 }
 
-// Convert decimal string to stroops (string of integer stroops)
+function assertDecimals(fn: string, decimals: number): void {
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new RangeError(`${fn}: decimals must be a non-negative integer`);
+  }
+}
+
+/**
+ * Converts a decimal amount string to an integer stroops string.
+ *
+ * Scaling is done by string digit shifting and BigInt, never `10 ** decimals`
+ * floating-point math, so arbitrarily large amounts convert exactly.
+ *
+ * @throws {TypeError}  If `decimalStr` is not a plain non-negative decimal string.
+ * @throws {RangeError} If `decimalStr` has more than `decimals` fractional digits
+ *                      (rejected rather than truncated so settlements are never underpaid).
+ */
 export function toStellarAmount(decimalStr: string, decimals = 7): string {
+  assertDecimals('toStellarAmount', decimals);
   // Strict format: one or more digits, optionally followed by a decimal point
   // and one or more digits. Rejects empty strings, negatives, scientific
   // notation, whitespace, and partial decimals like '.5' or '1.'.
   if (!/^\d+(\.\d+)?$/.test(decimalStr)) {
     throw new TypeError('toStellarAmount: input must be a valid numeric string');
   }
-  // naive conversion: multiply decimal by 10^decimals
   const [whole, frac = ''] = decimalStr.split('.');
-  const paddedFrac = (frac + '0'.repeat(decimals)).slice(0, decimals);
-  const stroops = BigInt(whole || '0') * BigInt(10 ** decimals) + BigInt(paddedFrac || '0');
-  return stroops.toString();
+  if (frac.length > decimals) {
+    throw new RangeError(
+      `toStellarAmount: input has ${frac.length} fractional digits but at most ${decimals} are allowed`,
+    );
+  }
+  return BigInt(whole + frac.padEnd(decimals, '0')).toString();
 }
 
 /**
@@ -61,28 +79,36 @@ export function toStellarAmount(decimalStr: string, decimals = 7): string {
  * (e.g. `"15000000"`, `"1"`, `"0"`). Empty strings, decimal strings,
  * negative numbers, and alpha-numeric values are all rejected.
  *
+ * Scaling is done by string digit shifting, so the result is exact for any size.
+ *
  * @param stroopsStr - Non-negative integer string representing stroops.
  * @param decimals   - Number of decimal places for the asset (default 7, matching XLM/USDC).
  * @returns The equivalent amount expressed as a decimal string.
  * @throws {TypeError} If `stroopsStr` is not a valid non-negative integer string.
  */
 export function fromStellarAmount(stroopsStr: Stroops, decimals = 7): Amount {
+  assertDecimals('fromStellarAmount', decimals);
   if (!/^\d+$/.test(stroopsStr)) {
     throw new TypeError('fromStellarAmount: input must be a valid integer string');
   }
-  const n = BigInt(stroopsStr);
-  const whole = n / BigInt(10 ** decimals);
-  const frac = (n % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/, '');
-  return frac ? `${whole.toString()}.${frac}` : whole.toString();
+  const digits = stroopsStr.padStart(decimals + 1, '0');
+  const splitAt = digits.length - decimals;
+  const whole = BigInt(digits.slice(0, splitAt)).toString();
+  const frac = digits.slice(splitAt).replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole;
 }
 
+/**
+ * Formats a stroops integer string as a decimal amount string.
+ *
+ * @throws {TypeError} If `amount` is not a valid non-negative integer string;
+ *                     corrupt amounts are surfaced instead of echoed back.
+ */
 export function formatAmount(amount: Stroops, decimals: number = 7): Amount {
-  // Provided for backwards compatibility: expects stroops input
-  try {
-    return fromStellarAmount(amount, decimals);
-  } catch {
-    return amount;
+  if (typeof amount !== 'string' || !/^\d+$/.test(amount)) {
+    throw new TypeError(`formatAmount: invalid stroops amount ${JSON.stringify(amount)}`);
   }
+  return fromStellarAmount(amount, decimals);
 }
 
 /** Max amount representable on Stellar: int64 stroops. */
@@ -206,7 +232,7 @@ const HEX_32_BYTES = /^[0-9a-fA-F]{64}$/;
  * @returns     true if the value is valid for the given type, false otherwise
  *
  * Validation rules:
- *  - text:   UTF-8 encoded byte length must be ≤ 28
+ *  - text:   UTF-8 encoded byte length must be ≤ 28 and contain no null bytes (\0)
  *  - id:     unsigned 64-bit integer (0 – 2^64-1), no sign, no decimals
  *  - hash:   exactly 64 hexadecimal characters (32 bytes)
  *  - return: exactly 64 hexadecimal characters (32 bytes)
@@ -214,6 +240,8 @@ const HEX_32_BYTES = /^[0-9a-fA-F]{64}$/;
 export function validateMemo(type: string, value: string): boolean {
   switch (type) {
     case 'text':
+      // Null bytes truncate C-string/XDR consumers, silently changing the memo.
+      if (value.includes('\0')) return false;
       return Buffer.byteLength(value, 'utf8') <= 28;
 
     case 'id': {
