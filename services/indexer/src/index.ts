@@ -238,18 +238,33 @@ const indexerDedupEventsTotal = new promClient.Counter({
   help: "Total number of on-chain events dropped as duplicates (Prisma P2002 / skipDuplicates)",
 });
 
-function parseRetryAfterMs(err: unknown): number | null {
+/** @internal exported for testing only */
+export function parseRetryAfterMs(
+  err: unknown,
+  nowMs: number = Date.now(),
+): number | null {
   const status = (err as any)?.response?.status ?? (err as any)?.status;
   if (status !== 429) return null;
 
   const retryHeader =
     (err as any)?.response?.headers?.["retry-after"] ??
+    (err as any)?.response?.headers?.["Retry-After"] ??
     (err as any)?.response?.headers?.get?.("retry-after");
-  if (!retryHeader) return null;
+  if (retryHeader === undefined || retryHeader === null) return null;
 
-  const retrySeconds = parseInt(String(retryHeader), 10);
-  if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
-  return retrySeconds * 1000;
+  const raw = String(retryHeader).trim();
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const retrySeconds = Number(raw);
+    if (!Number.isFinite(retrySeconds) || retrySeconds <= 0) return null;
+    return retrySeconds * 1000;
+  }
+
+  const retryDateMs = Date.parse(raw);
+  if (!Number.isFinite(retryDateMs)) return null;
+  const delayMs = retryDateMs - nowMs;
+  return delayMs > 0 ? delayMs : null;
 }
 
 export function getCurrentBackoffMs(): number {
@@ -379,9 +394,20 @@ webhookQueue.on("error", (err) => {
   fastify.log.error({ err: err.message }, "[Indexer] Webhook queue error");
 });
 
+// #1059 — shared QueueEvents for POST /api/webhooks/:id/test completion
+// notifications. It used to be constructed per request, which opened (and, on
+// close, tore down) a fresh Redis connection for every test delivery; the
+// module-scope instance is created once and closed during shutdown.
+export const webhookQueueEvents = new QueueEvents("indexer-webhooks", {
+  connection: sharedRedis,
+});
+webhookQueueEvents.on("error", (err) => {
+  fastify.log.error({ err: err.message }, "[Indexer] Webhook QueueEvents error");
+});
+
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-const replayQueue = new Queue("indexer-replays", {
+export const replayQueue = new Queue("indexer-replays", {
   connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
@@ -390,15 +416,6 @@ const replayQueue = new Queue("indexer-replays", {
     removeOnFail: { count: 50 },
   },
 });
-
-// #386 — exponential backoff retry strategy
-const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
-replayProgressRedis.on("error", (err) =>
-  fastify.log.warn(
-    { err: err.message },
-    "[Indexer] Replay progress Redis error",
-  ),
-);
 
 const PROGRESS_KEY_PREFIX = "replay:progress:";
 
@@ -423,209 +440,258 @@ async function updateReplayProgress(
   }
 }
 
-const replayWorker = new Worker(
-  "indexer-replays",
-  async (job) => {
-    type ReplayJobData = {
-      fromLedger: number;
-      toLedger: number;
-      contractId?: string;
-      force?: boolean;
-    };
-    const { fromLedger, toLedger, contractId, force } =
-      job.data as ReplayJobData;
-    const totalLedgers = toLedger - fromLedger + 1;
+export interface ReplayJobData {
+  fromLedger: number;
+  toLedger: number;
+  contractId?: string;
+  force?: boolean;
+}
 
-    await updateReplayProgress(job.id!, {
-      totalLedgers,
-      processedLedgers: 0,
-      status: "running",
-    });
+export interface ReplayJobDeps {
+  rpcServer?: Pick<typeof server, "getEvents">;
+  chunkSize?: number;
+}
 
-    let processedCount = 0;
+/** @internal exported for testing only */
+export async function runReplayJob(
+  jobId: string,
+  data: ReplayJobData,
+  deps: ReplayJobDeps = {},
+): Promise<void> {
+  const { fromLedger, toLedger, contractId, force } = data;
+  const rpcServer = deps.rpcServer ?? server;
+  const chunkSize = deps.chunkSize ?? REPLAY_CHUNK_SIZE;
+  const totalLedgers = toLedger - fromLedger + 1;
 
-    try {
-      // If contractId is specified, only replay that contract; otherwise replay all
-      const contractsToReplay = contractId ? [contractId] : CONTRACT_IDS;
+  await updateReplayProgress(jobId, {
+    totalLedgers,
+    processedLedgers: 0,
+    status: "running",
+  });
 
-      for (const targetContractId of contractsToReplay) {
-        let cursor = fromLedger;
+  let processedCount = 0;
 
-        // If force=true, delete existing events in the range for this contract
-        if (force) {
-          await prisma.indexedEvent.deleteMany({
-            where: {
-              contractId: targetContractId,
-              ledger: {
-                gte: fromLedger,
-                lte: toLedger,
-              },
+  try {
+    // If contractId is specified, only replay that contract; otherwise replay all
+    const contractsToReplay = contractId ? [contractId] : CONTRACT_IDS;
+
+    for (const targetContractId of contractsToReplay) {
+      let ledgerCursor = fromLedger;
+      let rpcCursor: string | undefined;
+
+      // If force=true, delete existing events in the range for this contract
+      if (force) {
+        await prisma.indexedEvent.deleteMany({
+          where: {
+            contractId: targetContractId,
+            ledger: {
+              gte: fromLedger,
+              lte: toLedger,
             },
-          });
-          fastify.log.info(
-            { contractId: targetContractId, fromLedger, toLedger },
-            "[Indexer] Deleted existing events for forced replay",
-          );
-        }
+          },
+        });
+        fastify.log.info(
+          { contractId: targetContractId, fromLedger, toLedger },
+          "[Indexer] Deleted existing events for forced replay",
+        );
+      }
 
-        const processedLedgerSet = new Set<number>();
-        let currentLedger = -1;
+      const processedLedgerSet = new Set<number>();
+      let currentLedger = -1;
 
-        while (cursor <= toLedger) {
-          const response = await server.getEvents({
-            startLedger: cursor,
-            filters: [
-              {
-                type: "contract" as const,
-                contractIds: [targetContractId],
-                topics: [],
+      while (rpcCursor !== undefined || ledgerCursor <= toLedger) {
+        const filters = [
+          {
+            type: "contract" as const,
+            contractIds: [targetContractId],
+            topics: [],
+          },
+        ];
+        // Use RPC cursor pagination within a chunk before advancing startLedger
+        // so high-volume ledgers exceeding REPLAY_CHUNK_SIZE are not split and skipped (#1054).
+        const response = await rpcServer.getEvents(
+          rpcCursor !== undefined
+            ? {
+                cursor: rpcCursor,
+                filters,
+                limit: chunkSize,
+              }
+            : {
+                startLedger: ledgerCursor,
+                filters,
+                limit: chunkSize,
               },
-            ],
-            limit: REPLAY_CHUNK_SIZE,
-          });
+        );
 
-          if (!response.events || response.events.length === 0) break;
+        if (!response.events || response.events.length === 0) break;
 
-          const stellarIds = response.events
-            .map((evt) => (typeof evt.id === "string" ? evt.id : null))
-            .filter((id): id is string => id !== null);
+        const stellarIds = response.events
+          .map((evt) => (typeof evt.id === "string" ? evt.id : null))
+          .filter((id): id is string => id !== null);
 
-          // When force=false, check for existing events to skip
-          const existingStellarIds = force
-            ? new Set<string>()
-            : new Set<string>(
-                stellarIds.length > 0
-                  ? (
-                      await prisma.indexedEvent.findMany({
-                        where: { stellarId: { in: stellarIds } },
-                        select: { stellarId: true },
-                      })
-                    )
-                      .map((e) => e.stellarId)
-                      .filter((id): id is string => id !== null)
-                  : [],
-              );
+        // When force=false, check for existing events to skip
+        const existingStellarIds = force
+          ? new Set<string>()
+          : new Set<string>(
+              stellarIds.length > 0
+                ? (
+                    await prisma.indexedEvent.findMany({
+                      where: { stellarId: { in: stellarIds } },
+                      select: { stellarId: true },
+                    })
+                  )
+                    .map((e) => e.stellarId)
+                    .filter((id): id is string => id !== null)
+                : [],
+            );
 
-          for (const evt of response.events) {
-            if (evt.ledger > toLedger) continue;
+        let reachedPastToLedger = false;
 
-            if (currentLedger !== -1 && currentLedger !== evt.ledger) {
-              processedLedgerSet.add(currentLedger);
+        for (const evt of response.events) {
+          if (evt.ledger > toLedger) {
+            reachedPastToLedger = true;
+            continue;
+          }
+
+          if (currentLedger !== -1 && currentLedger !== evt.ledger) {
+            processedLedgerSet.add(currentLedger);
+          }
+          currentLedger = evt.ledger;
+
+          if (processedLedgerSet.has(evt.ledger)) {
+            fastify.log.warn(
+              { ledger: evt.ledger },
+              "[Indexer] Skipping out-of-order or duplicate ledger",
+            );
+            continue;
+          }
+
+          const topics = Array.isArray(evt.topic)
+            ? evt.topic.map(String)
+            : [String(evt.topic)];
+          const rawValue = evt.value.toXDR("base64");
+          const decodedPayload = decodeScVal(evt.value, topics[0]) ?? null;
+          const resolvedContractId = evt.contractId
+            ? evt.contractId.toString()
+            : targetContractId;
+          const contractName = getContractName(resolvedContractId);
+          const stellarId = typeof evt.id === "string" ? evt.id : null;
+          const validationError = validatePayload(topics[0], decodedPayload);
+
+          // Skip if already indexed (when force=false)
+          if (!force) {
+            if (stellarId) {
+              if (existingStellarIds.has(stellarId)) continue;
+            } else {
+              const existing = await prisma.indexedEvent.findFirst({
+                where: {
+                  ledger: evt.ledger,
+                  contractId: resolvedContractId,
+                  rawValue,
+                },
+              });
+              if (existing) continue;
             }
-            currentLedger = evt.ledger;
+          }
 
-            if (processedLedgerSet.has(evt.ledger)) {
-              fastify.log.warn(
-                { ledger: evt.ledger },
-                "[Indexer] Skipping out-of-order or duplicate ledger",
+          try {
+            await prisma.indexedEvent.create({
+              data: {
+                id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
+                stellarId,
+                contractId: resolvedContractId,
+                contractName,
+                topics,
+                type: topics[0],
+                rawValue,
+                decodedPayload:
+                  decodedPayload !== null
+                    ? (decodedPayload as any)
+                    : undefined,
+                validationError: validationError ?? undefined,
+                ledger: evt.ledger,
+                indexedAt: new Date(),
+              },
+            });
+          } catch (err: any) {
+            if (err?.code === "P2002") {
+              fastify.log.debug(
+                {
+                  stellarId,
+                  contractId: resolvedContractId,
+                  ledger: evt.ledger,
+                },
+                "[Indexer] Replay duplicate event — skipping (composite constraint)",
               );
               continue;
             }
-
-            cursor = Math.max(cursor, evt.ledger + 1);
-
-            const topics = Array.isArray(evt.topic)
-              ? evt.topic.map(String)
-              : [String(evt.topic)];
-            const rawValue = evt.value.toXDR("base64");
-            const decodedPayload =
-              decodeScVal(evt.value, topics[0]) ?? null;
-            const resolvedContractId = evt.contractId
-              ? evt.contractId.toString()
-              : targetContractId;
-            const contractName = getContractName(resolvedContractId);
-            const stellarId = typeof evt.id === "string" ? evt.id : null;
-            const validationError = validatePayload(topics[0], decodedPayload);
-
-            // Skip if already indexed (when force=false)
-            if (!force) {
-              if (stellarId) {
-                if (existingStellarIds.has(stellarId)) continue;
-              } else {
-                const existing = await prisma.indexedEvent.findFirst({
-                  where: {
-                    ledger: evt.ledger,
-                    contractId: resolvedContractId,
-                    rawValue,
-                  },
-                });
-                if (existing) continue;
-              }
-            }
-
-            try {
-              await prisma.indexedEvent.create({
-                data: {
-                  id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
-                  stellarId,
-                  contractId: resolvedContractId,
-                  contractName,
-                  topics,
-                  type: topics[0],
-                  rawValue,
-                  decodedPayload:
-                    decodedPayload !== null
-                      ? (decodedPayload as any)
-                      : undefined,
-                  validationError: validationError ?? undefined,
-                  ledger: evt.ledger,
-                  indexedAt: new Date(),
-                },
-              });
-            } catch (err: any) {
-              if (err?.code === "P2002") {
-                fastify.log.debug(
-                  {
-                    stellarId,
-                    contractId: resolvedContractId,
-                    ledger: evt.ledger,
-                  },
-                  "[Indexer] Replay duplicate event — skipping (composite constraint)",
-                );
-                continue;
-              }
-              throw err;
-            }
-
-            processedCount = Math.max(
-              processedCount,
-              evt.ledger - fromLedger + 1,
-            );
-            await updateReplayProgress(job.id!, {
-              totalLedgers,
-              processedLedgers: processedCount,
-              status: "running",
-            });
+            throw err;
           }
 
-          const lastEvt = response.events[response.events.length - 1];
-          if (
-            lastEvt.ledger >= toLedger ||
-            response.events.length < REPLAY_CHUNK_SIZE
-          )
+          processedCount = Math.max(
+            processedCount,
+            evt.ledger - fromLedger + 1,
+          );
+          await updateReplayProgress(jobId, {
+            totalLedgers,
+            processedLedgers: processedCount,
+            status: "running",
+          });
+        }
+
+        const lastEvt = response.events[response.events.length - 1];
+        if (
+          reachedPastToLedger ||
+          lastEvt.ledger > toLedger ||
+          response.events.length < chunkSize
+        ) {
+          break;
+        }
+
+        const nextRpcCursor =
+          typeof (response as { cursor?: unknown }).cursor === "string" &&
+          (response as { cursor?: string }).cursor!.length > 0
+            ? (response as { cursor: string }).cursor
+            : undefined;
+
+        if (nextRpcCursor && nextRpcCursor !== rpcCursor) {
+          rpcCursor = nextRpcCursor;
+        } else {
+          rpcCursor = undefined;
+          const nextLedger = lastEvt.ledger + 1;
+          if (nextLedger <= ledgerCursor || nextLedger > toLedger) {
             break;
+          }
+          ledgerCursor = nextLedger;
         }
       }
-
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers: processedCount,
-        status: "completed",
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      fastify.log.error(
-        { err: errMsg, jobId: job.id },
-        "[Indexer] Replay job failed",
-      );
-      await updateReplayProgress(job.id!, {
-        totalLedgers,
-        processedLedgers: processedCount,
-        status: "failed",
-        error: errMsg,
-      });
-      throw err;
     }
+
+    await updateReplayProgress(jobId, {
+      totalLedgers,
+      processedLedgers: processedCount,
+      status: "completed",
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    fastify.log.error(
+      { err: errMsg, jobId },
+      "[Indexer] Replay job failed",
+    );
+    await updateReplayProgress(jobId, {
+      totalLedgers,
+      processedLedgers: processedCount,
+      status: "failed",
+      error: errMsg,
+    });
+    throw err;
+  }
+}
+
+const replayWorker = new Worker(
+  "indexer-replays",
+  async (job) => {
+    await runReplayJob(job.id!, job.data as ReplayJobData);
   },
   {
     connection: sharedRedis,
@@ -675,7 +741,17 @@ function getContractName(contractId: string): string {
 }
 
 // ── Stellar RPC client ────────────────────────────────────────────────────────
-const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
+/** @internal exported for testing only */
+export function createRpcServerOptions(nodeEnv: string | undefined): {
+  allowHttp: boolean;
+} {
+  return { allowHttp: nodeEnv !== "production" };
+}
+
+const server = new rpc.Server(
+  env.STELLAR_RPC_URL,
+  createRpcServerOptions(env.NODE_ENV),
+);
 
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
@@ -710,6 +786,64 @@ export function decodeScVal(
     );
     return undefined;
   }
+}
+
+/**
+ * Decodes a single Soroban event topic (typically an `xdr.ScVal`) into a
+ * string via `scValToNative`, falling back cleanly instead of producing
+ * `"[object Object]"` (#1058).
+ *
+ * @internal exported for testing only
+ */
+export function decodeTopicScVal(topic: unknown): string {
+  if (typeof topic === "string") return topic;
+  if (
+    typeof topic === "number" ||
+    typeof topic === "boolean" ||
+    typeof topic === "bigint"
+  ) {
+    return String(topic);
+  }
+  if (topic === null || topic === undefined) {
+    return String(topic);
+  }
+  try {
+    const native = scValToNative(topic as xdr.ScVal);
+    if (typeof native === "string") return native;
+    if (typeof native === "bigint") return native.toString();
+    if (native instanceof Uint8Array || Buffer.isBuffer(native)) {
+      return Buffer.from(native).toString("hex");
+    }
+    if (native !== null && typeof native === "object") {
+      return JSON.stringify(serializeNative(native));
+    }
+    return String(native);
+  } catch (err) {
+    fastify.log.warn(
+      { err: String(err) },
+      "[Indexer] Failed to decode topic ScVal — falling back to raw representation",
+    );
+    if (typeof (topic as { toXDR?: unknown }).toXDR === "function") {
+      try {
+        return (topic as xdr.ScVal).toXDR("base64");
+      } catch {
+        // fall through to generic string fallback
+      }
+    }
+    return String(topic);
+  }
+}
+
+/**
+ * Decodes an event's `topic` field (array of ScVals or single ScVal) into
+ * human-readable string topics (#1058).
+ *
+ * @internal exported for testing only
+ */
+export function decodeEventTopics(rawTopic: unknown): string[] {
+  return Array.isArray(rawTopic)
+    ? rawTopic.map(decodeTopicScVal)
+    : [decodeTopicScVal(rawTopic)];
 }
 
 // ── Event payload validation ──────────────────────────────────────────────────
@@ -748,49 +882,119 @@ export const cacheState: {
   subscriptions: { data: WebhookSubscription[]; cachedAt: number } | null;
 } = { subscriptions: null };
 
-export async function dispatchPendingWebhookDeliveries(): Promise<void> {
-  const store = (prisma as any).indexedEventWebhookDelivery;
-  let pending: any[];
-  try {
-    pending = await store.findMany({
-      where: { status: "pending" },
-      orderBy: { createdAt: "asc" },
-      take: 100,
-    });
-  } catch (err) {
-    fastify.log.warn(
-      { err: String(err) },
-      "[Indexer] Unable to load pending webhook deliveries",
-    );
-    return;
-  }
-  for (const delivery of pending) {
+const DEFAULT_WEBHOOK_DISPATCH_BATCH_SIZE = 100;
+const DEFAULT_WEBHOOK_DISPATCH_MAX_PER_TICK = 1000;
+
+export interface DispatchWebhookDependencies {
+  store?: {
+    findMany: (args: {
+      where: { status: string };
+      orderBy: { createdAt: "asc" };
+      take: number;
+    }) => Promise<any[]>;
+    updateMany: (args: {
+      where: { id: string; status: string };
+      data: { status: string; processedAt?: Date | null };
+    }) => Promise<{ count: number }>;
+  };
+  queue?: Pick<typeof webhookQueue, "add">;
+  decrypt?: (val: string) => string;
+  log?: Pick<typeof fastify.log, "warn">;
+  batchSize?: number;
+  maxPerTick?: number;
+}
+
+export async function dispatchPendingWebhookDeliveries(
+  deps: DispatchWebhookDependencies = {},
+): Promise<void> {
+  const store = deps.store ?? (prisma as any).indexedEventWebhookDelivery;
+  const queue = deps.queue ?? webhookQueue;
+  const decrypt = deps.decrypt ?? decryptField;
+  const log = deps.log ?? fastify.log;
+  const batchSize = Math.max(1, deps.batchSize ?? DEFAULT_WEBHOOK_DISPATCH_BATCH_SIZE);
+  const maxPerTick = Math.max(
+    batchSize,
+    deps.maxPerTick ?? DEFAULT_WEBHOOK_DISPATCH_MAX_PER_TICK,
+  );
+
+  let processedInTick = 0;
+
+  while (processedInTick < maxPerTick) {
+    const take = Math.min(batchSize, maxPerTick - processedInTick);
+    let pending: any[];
     try {
-      // Decrypt signingSecret on read (#617)
-      const decryptedSecret = delivery.signingSecret
-        ? decryptField(delivery.signingSecret)
-        : undefined;
-      await webhookQueue.add(
-        "deliver",
-        {
-          url: delivery.url,
-          event: delivery.event,
-          version: "1.0",
-          signingSecret: decryptedSecret,
-          subscriptionId: delivery.subscriptionId,
-          headers: delivery.headers ?? undefined,
-        },
-        { jobId: `indexed-event-delivery-${delivery.id}` },
-      );
-      await store.update({
-        where: { id: delivery.id },
-        data: { status: "processed", processedAt: new Date() },
+      pending = await store.findMany({
+        where: { status: "pending" },
+        orderBy: { createdAt: "asc" },
+        take,
       });
     } catch (err) {
-      fastify.log.warn(
-        { deliveryId: delivery.id, err: String(err) },
-        "[Indexer] Webhook enqueue failed; delivery remains pending",
+      log.warn(
+        { err: String(err) },
+        "[Indexer] Unable to load pending webhook deliveries",
       );
+      return;
+    }
+
+    if (pending.length === 0) {
+      break;
+    }
+
+    processedInTick += pending.length;
+
+    for (const delivery of pending) {
+      let claimedCount = 0;
+      try {
+        const claimed = await store.updateMany({
+          where: { id: delivery.id, status: "pending" },
+          data: { status: "processed", processedAt: new Date() },
+        });
+        claimedCount = claimed.count;
+      } catch (err) {
+        log.warn(
+          { deliveryId: delivery.id, err: String(err) },
+          "[Indexer] Failed to claim pending webhook delivery",
+        );
+        continue;
+      }
+
+      if (claimedCount === 0) {
+        continue;
+      }
+
+      try {
+        // Decrypt signingSecret on read (#617)
+        const decryptedSecret = delivery.signingSecret
+          ? decrypt(delivery.signingSecret)
+          : undefined;
+        await queue.add(
+          "deliver",
+          {
+            url: delivery.url,
+            event: delivery.event,
+            version: "1.0",
+            signingSecret: decryptedSecret,
+            subscriptionId: delivery.subscriptionId,
+            headers: delivery.headers ?? undefined,
+          },
+          { jobId: `indexed-event-delivery-${delivery.id}` },
+        );
+      } catch (err) {
+        await store
+          .updateMany({
+            where: { id: delivery.id, status: "processed" },
+            data: { status: "pending", processedAt: null },
+          })
+          .catch(() => {});
+        log.warn(
+          { deliveryId: delivery.id, err: String(err) },
+          "[Indexer] Webhook enqueue failed; delivery remains pending",
+        );
+      }
+    }
+
+    if (pending.length < take) {
+      break;
     }
   }
 }
@@ -894,28 +1098,47 @@ async function loadWebhookSubscriptions(): Promise<WebhookSubscription[]> {
   return cacheState.subscriptions.data;
 }
 
+/** @internal exported for testing only */
+export const FLUSH_BATCH_SIZE = 500;
+
 /**
- * #713 — Persist a whole poll cycle's events with one `createMany` instead of a
- * `create` per event, preserving the composite-unique P2002-skip semantics via
- * `skipDuplicates`. Webhook deliveries are created in a single batch for the
- * events that actually landed. Returns the inserted count and the highest
- * ledger among them so the caller can advance its cursor.
+ * #713 — Persist a whole poll cycle's events with chunked `createMany` calls
+ * instead of a `create` per event, preserving the composite-unique P2002-skip
+ * semantics via `skipDuplicates` while staying safely under Postgres's
+ * 65,535-parameter limit (#1065). Webhook deliveries are also created in
+ * bounded chunks for the events that actually landed. Returns the inserted
+ * count and the highest ledger among them so the caller can advance its cursor.
+ *
+ * @internal exported for testing only
  */
-async function flushIndexedEvents(
+export async function flushIndexedEvents(
   data: Prisma.IndexedEventCreateManyInput[],
+  batchSize: number = FLUSH_BATCH_SIZE,
 ): Promise<{ inserted: number; maxInsertedLedger: number | null }> {
   if (data.length === 0) return { inserted: 0, maxInsertedLedger: null };
 
-  await prisma.indexedEvent.createMany({ data, skipDuplicates: true });
+  const safeBatchSize =
+    Number.isFinite(batchSize) && batchSize > 0
+      ? Math.floor(batchSize)
+      : FLUSH_BATCH_SIZE;
 
-  // `createMany` does not report which rows were skipped, so read back the ids
-  // that landed. Deliveries must exist only for newly-persisted events, exactly
-  // as the per-event path did after a successful create.
-  const insertedRows = await prisma.indexedEvent.findMany({
-    where: { id: { in: data.map((row) => row.id) } },
-    select: { id: true },
-  });
-  const insertedIds = new Set(insertedRows.map((row) => row.id));
+  const insertedIds = new Set<string>();
+  for (let i = 0; i < data.length; i += safeBatchSize) {
+    const chunk = data.slice(i, i + safeBatchSize);
+    await prisma.indexedEvent.createMany({ data: chunk, skipDuplicates: true });
+
+    // `createMany` does not report which rows were skipped, so read back the ids
+    // that landed. Deliveries must exist only for newly-persisted events, exactly
+    // as the per-event path did after a successful create.
+    const insertedRows = await prisma.indexedEvent.findMany({
+      where: { id: { in: chunk.map((row) => row.id) } },
+      select: { id: true },
+    });
+    for (const row of insertedRows) {
+      insertedIds.add(row.id);
+    }
+  }
+
   const records = data.filter((row) => insertedIds.has(row.id));
 
   for (const record of records) {
@@ -930,25 +1153,29 @@ async function flushIndexedEvents(
     );
   }
 
-  if (records.length > 0) {
+  const deliverableRecords = records.filter((record) => !record.validationError);
+  if (deliverableRecords.length > 0) {
     const subs = await loadWebhookSubscriptions();
     if (subs.length) {
-      await (prisma as any).indexedEventWebhookDelivery.createMany({
-        data: records.flatMap((record) =>
-          subs.map((sub) => ({
-            id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
-            indexedEventId: record.id,
-            subscriptionId: sub.id,
-            url: sub.url,
-            event: record,
-            signingSecret: sub.signingSecret
-              ? encryptField(sub.signingSecret)
-              : undefined,
-            headers: (sub.headers as Record<string, string> | null) ?? undefined,
-          })),
-        ),
-        skipDuplicates: true,
-      });
+      const deliveries = records.flatMap((record) =>
+        subs.map((sub) => ({
+          id: `whd_${crypto.randomUUID().replace(/-/g, "")}`,
+          indexedEventId: record.id,
+          subscriptionId: sub.id,
+          url: sub.url,
+          event: record,
+          signingSecret: sub.signingSecret
+            ? encryptField(sub.signingSecret)
+            : undefined,
+          headers: (sub.headers as Record<string, string> | null) ?? undefined,
+        })),
+      );
+      for (let i = 0; i < deliveries.length; i += safeBatchSize) {
+        await (prisma as any).indexedEventWebhookDelivery.createMany({
+          data: deliveries.slice(i, i + safeBatchSize),
+          skipDuplicates: true,
+        });
+      }
     }
   }
 
@@ -1172,7 +1399,23 @@ fastify.post(
       );
     }
 
-    const job = await replayQueue.add("replay", { fromLedger, toLedger });
+    let job;
+    try {
+      job = await replayQueue.add("replay", { fromLedger, toLedger });
+    } catch (err) {
+      fastify.log.error(
+        { err, fromLedger, toLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1265,12 +1508,28 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       );
     }
 
-    const job = await replayQueue.add("replay-contract", {
-      contractId,
-      fromLedger: startLedger,
-      toLedger: endLedger,
-      force,
-    });
+    let job;
+    try {
+      job = await replayQueue.add("replay-contract", {
+        contractId,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        force,
+      });
+    } catch (err) {
+      fastify.log.error(
+        { err, contractId, fromLedger: startLedger, toLedger: endLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue per-contract replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1286,6 +1545,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
   },
 );
 
+const REPLAY_JOB_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+
 // Issue #229 — replay job progress status
 // Internal endpoint — job introspection leaks worker activity to anonymous
 // callers, so it requires a valid x-service-token like the other replay
@@ -1295,8 +1556,18 @@ fastify.get<{ Params: { jobId: string } }>(
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { jobId } = request.params;
+    if (!REPLAY_JOB_ID_REGEX.test(jobId)) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          "Invalid jobId format",
+          { jobId },
+          request.id,
+        ),
+      );
+    }
     try {
-      const raw = await replayProgressRedis.get(
+      const raw = await sharedRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
       if (!raw) {
@@ -1353,18 +1624,27 @@ fastify.post(
       );
     }
 
-    // Both modes return the same fields; only `status` (and whether rows were
-    // deleted) differs. A real run reports the preview of what it removed.
-    const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
+    // Only run the dry-run preview queries when dryRun=true; a real run
+    // executes deleteMany directly to avoid redundant count/size queries (#1065).
     if (dryRun) {
+      const preview = (await cleanupOldEvents(true)) as CleanupDryRunResult;
       return reply
         .code(200)
         .send({ status: "dry-run", ...preview, deletedCount: 0 });
     }
-    const deletedCount = (await cleanupOldEvents()) as number;
-    return reply
-      .code(200)
-      .send({ status: "completed", ...preview, deletedCount });
+    const deletedCount = (await cleanupOldEvents(false)) as number;
+    const retentionDays =
+      Number.isFinite(env.EVENT_RETENTION_DAYS) && env.EVENT_RETENTION_DAYS > 0
+        ? env.EVENT_RETENTION_DAYS
+        : 0;
+    return reply.code(200).send({
+      status: "completed",
+      wouldDelete: deletedCount,
+      totalSizeBytes: 0,
+      retentionDays,
+      oldestEventDate: "",
+      deletedCount,
+    });
   },
 );
 
@@ -1409,22 +1689,60 @@ fastify.get(
   { preValidation: [fastify.serviceAuth] },
   async () => {
     return prisma.webhookSubscription.findMany({
+      select: {
+        id: true,
+        url: true,
+        createdAt: true,
+        merchantId: true,
+        headers: true,
+        lastTestedAt: true,
+        lastTestStatus: true,
+        lastTestStatusCode: true,
+      },
       orderBy: { createdAt: "desc" },
     });
   },
 );
 
-fastify.delete<{ Params: { id: string } }>(
+fastify.delete<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
   "/api/webhooks/:id",
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
+    const queryMerchantId =
+      typeof request.query?.merchantId === "string"
+        ? request.query.merchantId.trim() || undefined
+        : undefined;
+    const rawHeaderMerchantId = request.headers["x-merchant-id"];
+    const headerMerchantId =
+      typeof rawHeaderMerchantId === "string"
+        ? rawHeaderMerchantId.trim() || undefined
+        : Array.isArray(rawHeaderMerchantId)
+          ? rawHeaderMerchantId[0]?.trim() || undefined
+          : undefined;
+    const callerMerchantId = queryMerchantId ?? headerMerchantId;
+
     const existing = await prisma.webhookSubscription.findUnique({
       where: { id },
     });
     if (!existing) {
       return reply.code(404).send(
-        createErrorResponse(ErrorCodes.NOT_FOUND, `Webhook subscription ${id} not found`),
+        createErrorResponse(
+          ErrorCodes.NOT_FOUND,
+          `Webhook subscription ${id} not found`,
+          undefined,
+          request.id,
+        ),
+      );
+    }
+    if (callerMerchantId && existing.merchantId !== callerMerchantId) {
+      return reply.code(403).send(
+        createErrorResponse(
+          ErrorCodes.FORBIDDEN,
+          "Cannot delete webhook subscription owned by another merchant",
+          undefined,
+          request.id,
+        ),
       );
     }
     await prisma.$transaction(async (tx) => {
@@ -1524,12 +1842,9 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       { attempts: 1 },
     );
 
-    const queueEvents = new QueueEvents("indexer-webhooks", {
-      connection: sharedRedis,
-    });
     try {
       const finished = await Promise.race([
-        job.waitUntilFinished(queueEvents),
+        job.waitUntilFinished(webhookQueueEvents),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Webhook test delivery timed out")), env.WRITE_TIMEOUT_MS),
         ),
@@ -1569,8 +1884,6 @@ fastify.post<{ Params: { id: string }; Querystring: { merchantId?: string } }>(
       const response: any = { success: false, error: errorMsg };
       if (statusCode) response.statusCode = statusCode;
       return response;
-    } finally {
-      await queueEvents.close();
     }
   },
 );
@@ -1819,6 +2132,109 @@ export async function runPollCycle(
   const getIndexFromLedger =
     deps.getIndexFromLedger ?? (() => env.INDEX_FROM_LEDGER);
 
+/**
+ * Races `promise` against a timeout of `timeoutMs` milliseconds, always
+ * clearing the `setTimeout` handle in `finally` so successful polls never
+ * leak pending timers (#1058).
+ *
+ * @internal exported for testing only
+ */
+export async function raceWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+export interface PolledEventLike {
+  id?: unknown;
+  topic: unknown;
+  value: xdr.ScVal;
+  contractId?: { toString(): string } | null;
+  ledger: number;
+}
+
+/**
+ * Decodes topics and value for a polled Soroban event, validates its payload,
+ * and builds the `IndexedEvent` row. Events that fail schema validation are
+ * logged with full event context, counted via `indexerValidationErrorsTotal`,
+ * and returned with `validationError` populated so they are persisted
+ * (dead-lettered) rather than silently skipped (#1058). Returns `null` only
+ * when XDR decoding itself fails.
+ *
+ * @internal exported for testing only
+ */
+export function preparePolledEvent(
+  evt: PolledEventLike,
+): Prisma.IndexedEventCreateManyInput | null {
+  const topics = decodeEventTopics(evt.topic);
+  const eventType = topics[0] ?? "unknown";
+  const decodedPayload = decodeScVal(evt.value, eventType);
+  const resolvedContractId = evt.contractId
+    ? evt.contractId.toString()
+    : CONTRACT_IDS[0];
+  const contractName = getContractName(resolvedContractId);
+  const stellarId = typeof evt.id === "string" ? evt.id : null;
+
+  // A malformed payload is logged by decodeScVal and skipped so one bad
+  // event cannot stall the cycle; later events are still processed.
+  if (decodedPayload === undefined) {
+    return null;
+  }
+
+  const rawValue =
+    typeof (evt.value as { toXDR?: unknown })?.toXDR === "function"
+      ? evt.value.toXDR("base64")
+      : "";
+
+  const validationError = validatePayload(eventType, decodedPayload);
+  if (validationError !== null) {
+    indexerValidationErrorsTotal.inc({
+      contractId: resolvedContractId,
+      type: eventType,
+    });
+    fastify.log.warn(
+      {
+        stellarId,
+        contractId: resolvedContractId,
+        contractName,
+        ledger: evt.ledger,
+        type: eventType,
+        topics,
+        validationError,
+      },
+      "[Indexer] Event failed schema validation — dead-lettering with validationError",
+    );
+  }
+
+  return {
+    id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
+    stellarId,
+    contractId: resolvedContractId,
+    contractName,
+    topics,
+    type: eventType,
+    rawValue,
+    decodedPayload:
+      decodedPayload !== null ? (decodedPayload as any) : undefined,
+    validationError: validationError ?? undefined,
+    ledger: evt.ledger,
+    indexedAt: new Date(),
+  };
+}
+
+async function pollEvents() {
   const pollStart = Date.now();
   let aborted = false;
 
@@ -1888,12 +2304,12 @@ export async function runPollCycle(
 
     const perLedgerTimeoutMs = env.POLL_TIMEOUT_MS;
 
-    // Wrap server.getEvents() with per-ledger timeout (#565)
+    // Wrap server.getEvents() with per-ledger timeout (#565, #1058)
     let response: Awaited<ReturnType<typeof server.getEvents>>;
     try {
-      response = await Promise.race([
-        rpcServer.getEvents({
-          startLedger,
+      response = await raceWithTimeout(
+        server.getEvents({
+          startLedger: latestLedgerCursor ?? 0,
           filters: CONTRACT_IDS.map((contractId) => ({
             type: "contract" as const,
             contractIds: [contractId],
@@ -1901,13 +2317,9 @@ export async function runPollCycle(
           })),
           limit: 100,
         }),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error("PER_LEDGER_TIMEOUT")),
-            perLedgerTimeoutMs,
-          ),
-        ),
-      ]);
+        perLedgerTimeoutMs,
+        "PER_LEDGER_TIMEOUT",
+      );
       consecutiveSkips = 0;
     } catch (err: unknown) {
       if (err instanceof Error && err.message === "PER_LEDGER_TIMEOUT") {
@@ -1936,10 +2348,10 @@ export async function runPollCycle(
     const timeoutMs = env.POLL_TIMEOUT_MS;
 
     if (response.events && response.events.length > 0) {
-      // #713 — accumulate the cycle's validated events and write them in one
+      // #713 / #1058 — accumulate the cycle's events and write them in one
       // batch instead of one create per event (and one delivery createMany per
-      // event). Decode/validate are unchanged; every event still becomes its
-      // own row, including events carrying a validationError.
+      // event). Every decoded event becomes its own row, including events
+      // carrying a validationError (dead-lettered without webhook dispatch).
       const pendingEvents: Prisma.IndexedEventCreateManyInput[] = [];
       let skippedEventCount = 0;
 
@@ -1955,52 +2367,20 @@ export async function runPollCycle(
           break;
         }
 
-        const topics = Array.isArray(evt.topic)
-          ? evt.topic.map(String)
-          : [String(evt.topic)];
-        const rawValue = evt.value.toXDR("base64");
-        const decodedPayload = decodeScVal(evt.value, topics[0]);
-        const resolvedContractId = evt.contractId
-          ? evt.contractId.toString()
-          : CONTRACT_IDS[0];
-        const contractName = getContractName(resolvedContractId);
-        const stellarId = typeof evt.id === "string" ? evt.id : null;
-
-        // A malformed payload is logged by decodeScVal and skipped so one bad
-        // event cannot stall the cycle; later events are still processed.
-        if (decodedPayload === undefined) {
+        const prepared = preparePolledEvent(evt);
+        if (prepared === null) {
           skippedEventCount++;
           continue;
         }
 
-        const validationError = validatePayload(topics[0], decodedPayload);
-        if (validationError !== null) {
-          skippedEventCount++;
-          continue;
-        }
-
-        pendingEvents.push({
-          id: "evt_" + crypto.randomUUID().replace(/-/g, ""),
-          stellarId,
-          contractId: resolvedContractId,
-          contractName,
-          topics,
-          type: topics[0],
-          rawValue,
-          decodedPayload:
-            decodedPayload !== null ? (decodedPayload as any) : undefined,
-          validationError: validationError ?? undefined,
-          ledger: evt.ledger,
-          indexedAt: new Date(),
-        });
-
-        eventsFetchedCounter.inc({ contractId: resolvedContractId });
+        pendingEvents.push(prepared);
+        eventsFetchedCounter.inc({ contractId: prepared.contractId });
       }
 
       if (skippedEventCount > 0) {
         fastify.log.warn(
           { skipped: skippedEventCount, processed: pendingEvents.length },
-          "[Indexer] Skipped events that failed decode or validation",
+          "[Indexer] Skipped events that failed XDR decode",
         );
       }
 
@@ -2112,7 +2492,7 @@ export function buildCleanupWhere(
   retentionDays: number,
   now: Date,
 ): { indexedAt: { lt: Date } } | null {
-  if (retentionDays <= 0) return null;
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return null;
   const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
   return { indexedAt: { lt: cutoff } };
 }
@@ -2384,8 +2764,10 @@ const shutdown = async (signal: string) => {
       fastify.log,
       getActiveWebhookJob,
     );
+    // #1059 — the shared QueueEvents instance must be closed on shutdown too,
+    // otherwise its Redis connection outlives the process teardown sequence.
+    await webhookQueueEvents.close();
     await dlqQueue.close();
-    await replayProgressRedis.quit().catch(() => {});
     await fastify.close();
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 

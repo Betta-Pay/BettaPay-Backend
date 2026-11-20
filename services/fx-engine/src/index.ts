@@ -55,9 +55,13 @@ import {
 import {
   createHistoryQuerySchema,
   createQuoteQuerySchema,
-  createVerifyQuoteBodySchema,
   resolveFxQuoteBodyLimit,
 } from "./validation.js";
+import {
+  createVerifyQuoteHandler,
+  type StoredQuote,
+  type VerifyQuoteRouteBody,
+} from "./quote-verify.js";
 import {
   createCircuitBreakerRegistry,
   type CircuitBreakerState,
@@ -103,6 +107,17 @@ let cache: RateCache = {
   cachedAt: initialTime,
   rateCachedAt: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialTime])),
 };
+
+/** @internal exported for testing only */
+export function setRateCacheTimestampsForTesting(
+  cachedAt: number,
+  rateCachedAt: Record<string, number>,
+): { cachedAt: number; rateCachedAt: Record<string, number> } {
+  const prev = { cachedAt: cache.cachedAt, rateCachedAt: { ...cache.rateCachedAt } };
+  cache.cachedAt = cachedAt;
+  cache.rateCachedAt = { ...rateCachedAt };
+  return prev;
+}
 
 // ── Computed pair-rate cache (issue #55) ───────────────────────────────────
 // Avoids recomputing the same cross/inverse rate on every request.
@@ -872,19 +887,6 @@ const QUOTE_TTL_MS = RATE_TTL_MS;
 const QUOTE_CLEANUP_TTL_MS = 10 * 60 * 1000;
 const QUOTE_KEY_PREFIX = "fx:quote:";
 
-interface StoredQuote {
-  quoteId: string;
-  from: string;
-  to: string;
-  amount: string;
-  result: string;
-  rate: string;
-  slippageBps: number;
-  expiresAt:   number; // Unix ms — quote validity cutoff
-  rateBatchId: string;
-  unroundedRate?: number;
-}
-
 export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
   // Explicit 1MB cap — matches api-gateway and settlement-engine so the limit
@@ -908,6 +910,13 @@ redis.on("error", (err: any) =>
 fastify.addHook("onClose", async () => {
   await redis.quit().catch(() => {});
 });
+
+/** @internal exported for testing only */
+export function setRedisClientForTesting(client: any): any {
+  const prev = redis;
+  redis = client;
+  return prev;
+}
 
 // ── Rate history cleanup job ──────────────────────────────────────────────
 // BullMQ repeatable job that runs daily to purge rate history snapshots
@@ -1479,8 +1488,13 @@ fastify.get(
     }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
-    const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
-    if (stalenessSeconds > env.MAX_STALE_SECONDS) {
+    const oldestPairCachedAt = Math.min(
+      cache.rateCachedAt[from] ?? cache.cachedAt,
+      cache.rateCachedAt[to] ?? cache.cachedAt,
+    );
+    const stalenessSeconds = Math.floor((resolvedAt - oldestPairCachedAt) / 1000);
+    const isStale = stalenessSeconds > env.MAX_STALE_SECONDS;
+    if (isStale) {
       reply.header("X-FX-Stale", "true");
     }
 
@@ -1522,6 +1536,7 @@ fastify.get(
         QUOTE_CLEANUP_TTL_MS,
       );
     } catch (err) {
+      fxQuoteCacheWriteFailuresTotal.inc();
       fastify.log.warn(
         { err },
         "Failed to store quote; quote will not be verifiable",
@@ -1545,7 +1560,7 @@ fastify.get(
       rate: quote.rate,
       slippageBps: quote.slippageBps,
       slippageLimit: quote.slippageLimit,
-      stale:         Math.floor((resolvedAt - Math.min(cache.rateCachedAt[quote.from] ?? cache.cachedAt, cache.rateCachedAt[quote.to] ?? cache.cachedAt)) / 1000) > env.MAX_STALE_SECONDS,
+      stale:         isStale,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(quote.expiresAt).toISOString(),
       rateBatchId:   quote.rateBatchId,
@@ -1629,14 +1644,28 @@ fastify.get(
         );
     }
 
-    const members = await redis.zrevrangebyscore(
-      SNAPSHOT_KEY,
-      atMs,
-      "-inf",
-      "LIMIT",
-      0,
-      1,
-    );
+    let members: string[];
+    try {
+      members = await redis.zrevrangebyscore(
+        SNAPSHOT_KEY,
+        atMs,
+        "-inf",
+        "LIMIT",
+        0,
+        1,
+      );
+    } catch (err) {
+      fastify.log.warn({ err }, "Failed to read rate history from Redis");
+      return reply
+        .code(503)
+        .send(
+          createErrorResponse(
+            "SERVICE_UNAVAILABLE",
+            "Rate history store unavailable",
+          ),
+        );
+    }
+
     if (!members.length) {
       return reply
         .code(404)
@@ -1648,10 +1677,33 @@ fastify.get(
         );
     }
 
-    const snapshot = JSON.parse(members[0]) as {
-      ts: number;
-      rates: Record<string, number>;
-    };
+    let snapshot: { ts: number; rates: Record<string, number> };
+    try {
+      const parsed = JSON.parse(members[0]) as {
+        ts?: unknown;
+        rates?: unknown;
+      };
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.ts !== "number" ||
+        !parsed.rates ||
+        typeof parsed.rates !== "object"
+      ) {
+        throw new Error("Invalid rate snapshot shape");
+      }
+      snapshot = parsed as { ts: number; rates: Record<string, number> };
+    } catch (err) {
+      fastify.log.error({ err }, "Corrupt rate snapshot in Redis");
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(
+            ErrorCodes.INTERNAL_ERROR,
+            "Corrupt rate snapshot data",
+          ),
+        );
+    }
 
     if (!(from in snapshot.rates) || !(to in snapshot.rates)) {
       return reply
@@ -1677,12 +1729,6 @@ fastify.get(
 
 // ── POST /api/quote/verify (issue #57) ───────────────────────────────────
 
-const VerifyQuoteBody = createVerifyQuoteBodySchema(env.NODE_ENV);
-
-interface VerifyQuoteRouteBody {
-  quoteId?: unknown;
-}
-
 fastify.post<{ Body: VerifyQuoteRouteBody }>(
   "/api/quote/verify",
   {
@@ -1696,79 +1742,19 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       },
     },
   },
-  async (request, reply) => {
-    let body: z.infer<typeof VerifyQuoteBody>;
-    try {
-      body = VerifyQuoteBody.parse(request.body);
-    } catch (err) {
-      if (err instanceof z.ZodError) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_QUERY,
-              "Invalid request body",
-              err.errors,
-            ),
-          );
-      }
-      throw err;
-    }
-
-    const raw = await redis.get(`${QUOTE_KEY_PREFIX}${body.quoteId}`);
-    if (!raw) {
-      return reply
-        .code(404)
-        .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Quote not found"));
-    }
-
-    const stored = JSON.parse(raw) as StoredQuote;
-    const now = Date.now();
-
-    // Quote age validation
-    const createdAt = stored.expiresAt - QUOTE_TTL_MS;
-    const quoteAge = now - createdAt;
-    if (quoteAge < env.QUOTE_MIN_AGE_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_YOUNG, "Quote too young"));
-    }
-    if (quoteAge > env.QUOTE_MAX_LIFETIME_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_OLD, "Quote too old"));
-    }
-
-    const currentRate = getOrComputeRate(stored.from, stored.to);
-    const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
-    const rateBatchId = cache.batchIds[stored.from] ?? '';
-    const quotedRate = stored.unroundedRate ?? parseFloat(stored.rate);
-
-    // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
-    let valid: boolean;
-    if (fallbackStartTime !== null) {
-      valid = now <= stored.expiresAt;
-    } else {
-      const deviation =
-        (Math.abs(currentRate - quotedRate) / quotedRate) * 10000;
-      valid = now <= stored.expiresAt && deviation <= slippageBps;
-    }
-
-    return {
-      valid,
-      stale: !valid,
-      quoteId: stored.quoteId,
-      fallbackAccepted: fallbackStartTime !== null,
-      from: stored.from,
-      to: stored.to,
-      rate: stored.rate,
-      currentRate: currentRate.toFixed(8),
-      slippageBps,
-      slippageLimit: (slippageBps / 10_000).toFixed(4),
-      expiresAt:     new Date(stored.expiresAt).toISOString(),
-      rateBatchId,
-    };
-  },
+  createVerifyQuoteHandler({
+    nodeEnv: env.NODE_ENV,
+    redis,
+    log: fastify.log,
+    quoteKeyPrefix: QUOTE_KEY_PREFIX,
+    quoteTtlMs: QUOTE_TTL_MS,
+    quoteMinAgeMs: env.QUOTE_MIN_AGE_MS,
+    quoteMaxLifetimeMs: env.QUOTE_MAX_LIFETIME_MS,
+    defaultSlippageBps: env.DEFAULT_SLIPPAGE_BPS,
+    getCurrentRate: getOrComputeRate,
+    isFallbackActive: () => fallbackStartTime !== null,
+    getFallbackBatchId: (currency) => cache.batchIds[currency] ?? "",
+  }),
 );
 
 // ── Start ──────────────────────────────────────────────────────────────────
@@ -1849,6 +1835,11 @@ const fxQuoteCacheHitsTotal = new promClient.Counter({
 const fxQuoteCacheMissesTotal = new promClient.Counter({
   name: "fx_quote_cache_misses_total",
   help: "Total number of FX quote resolutions that required a live rate computation",
+});
+// Issue #1049 — FX quote cache write failure counter
+export const fxQuoteCacheWriteFailuresTotal = new promClient.Counter({
+  name: "fx_quote_cache_write_failures_total",
+  help: "Total number of failures persisting FX quotes to Redis",
 });
 
 // Served on its own port (see startMetricsServer below), not on the
