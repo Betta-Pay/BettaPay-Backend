@@ -391,15 +391,6 @@ const replayQueue = new Queue("indexer-replays", {
   },
 });
 
-// #386 — exponential backoff retry strategy
-const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
-replayProgressRedis.on("error", (err) =>
-  fastify.log.warn(
-    { err: err.message },
-    "[Indexer] Replay progress Redis error",
-  ),
-);
-
 const PROGRESS_KEY_PREFIX = "replay:progress:";
 
 async function updateReplayProgress(
@@ -1366,7 +1357,7 @@ fastify.get<{ Params: { jobId: string } }>(
   async (request, reply) => {
     const { jobId } = request.params;
     try {
-      const raw = await replayProgressRedis.get(
+      const raw = await sharedRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
       );
       if (!raw) {
@@ -2455,7 +2446,6 @@ const shutdown = async (signal: string) => {
       getActiveWebhookJob,
     );
     await dlqQueue.close();
-    await replayProgressRedis.quit().catch(() => {});
     await fastify.close();
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 
