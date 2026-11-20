@@ -89,6 +89,8 @@ export const webhookDeliveryDurationSeconds: client.Histogram<string> =
 export interface WebhookJobData {
   /** Stable, deterministic identifier for the source event. */
   eventId?: string;
+  /** Optional webhook subscription identifier for re-fetching credentials on replay. */
+  subscriptionId?: string;
   /** Distributed trace id for correlating webhook delivery across services. */
   traceId?: string;
   /** The HTTPS (or HTTP in dev) URL to POST to. */
@@ -603,7 +605,8 @@ export function createWebhookWorker(
     worker.on('failed', async (job: any, err: any) => {
       if (job && job.attemptsMade >= (job.opts?.attempts ?? WEBHOOK_DEFAULTS.attempts)) {
         try {
-          await dlq.add('dead-letter', job.data);
+          const { signingSecret: _redacted, ...safeJobData } = job.data ?? {};
+          await dlq.add('dead-letter', safeJobData);
           logger?.info(
             { jobId: job.id, eventId: job.data.eventId },
             '[webhook-delivery] Archived permanently failed job to dead-letter queue',

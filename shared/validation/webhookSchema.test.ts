@@ -15,6 +15,9 @@ import {
   isPrivateOrRestrictedIp,
   isHostAllowed,
   validateWebhookTestTarget,
+  stripIpv6Brackets,
+  getDnsCacheSize,
+  DNS_CACHE_MAX_SIZE,
 } from './webhookSchema.js';
 
 test('createWebhookUrlSchema - format & length rules apply in every environment', async (t) => {
@@ -385,4 +388,59 @@ test('webhook test allowlist and SSRF protection (#900)', async (t) => {
     assert.strictEqual(ssrfRes.allowed, false);
     assert.ok(ssrfRes.reason?.includes('private') || ssrfRes.reason?.includes('metadata'));
   });
+});
+// ─── #1079: bracketed IPv6 SSRF targets & bounded DNS cache ──────────────────
+
+test('stripIpv6Brackets removes surrounding brackets only', () => {
+  assert.strictEqual(stripIpv6Brackets('[::1]'), '::1');
+  assert.strictEqual(stripIpv6Brackets('[fd00::1]'), 'fd00::1');
+  assert.strictEqual(stripIpv6Brackets('example.com'), 'example.com');
+  assert.strictEqual(stripIpv6Brackets('::1'), '::1');
+});
+
+test('validateWebhookTestTarget blocks bracketed IPv6 loopback and ULA literals', async () => {
+  const neverResolve = async () => {
+    throw new Error('DNS must not be consulted for IP literals');
+  };
+  for (const target of ['http://[::1]/hook', 'https://[fd00::1]:8443/hook', 'http://[fe80::1]/', 'http://[::ffff:127.0.0.1]/']) {
+    const result = await validateWebhookTestTarget(target, ['*'], neverResolve);
+    assert.strictEqual(result.allowed, false, `${target} must be blocked`);
+    assert.match(result.reason ?? '', /private, loopback, or metadata/);
+  }
+});
+
+test('validateWebhookTestTarget allows a public bracketed IPv6 literal', async () => {
+  const result = await validateWebhookTestTarget('https://[2606:4700:4700::1111]/hook', ['*']);
+  assert.strictEqual(result.allowed, true);
+});
+
+test('validateWebhookTestTarget still honours a bracketed allowlist entry', async () => {
+  const result = await validateWebhookTestTarget('http://[::1]/hook', ['[::1]']);
+  assert.strictEqual(result.allowed, false);
+  assert.match(result.reason ?? '', /private, loopback, or metadata/);
+});
+
+test('resolveWithCache keeps dnsCache within DNS_CACHE_MAX_SIZE', async () => {
+  clearDnsCache();
+  const mockDns = mock.method(dns.promises, 'resolve4', async () => ['93.184.216.34']);
+  try {
+    for (let i = 0; i < DNS_CACHE_MAX_SIZE + 25; i++) {
+      await resolveWithCache(`https://host-${i}.example.com/hook`);
+    }
+    assert.strictEqual(getDnsCacheSize(), DNS_CACHE_MAX_SIZE);
+
+    // Oldest entries were evicted, so resolving one again hits DNS.
+    const callsBefore = mockDns.mock.callCount();
+    await resolveWithCache('https://host-0.example.com/hook');
+    assert.strictEqual(mockDns.mock.callCount(), callsBefore + 1);
+    assert.strictEqual(getDnsCacheSize(), DNS_CACHE_MAX_SIZE);
+
+    // Most recent entries are still cached.
+    const callsBeforeHit = mockDns.mock.callCount();
+    await resolveWithCache(`https://host-${DNS_CACHE_MAX_SIZE + 24}.example.com/hook`);
+    assert.strictEqual(mockDns.mock.callCount(), callsBeforeHit);
+  } finally {
+    mockDns.mock.restore();
+    clearDnsCache();
+  }
 });
