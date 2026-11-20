@@ -1851,6 +1851,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   }
 );
 
+// Batch ids are generated as `batch_<32 hex chars>`; accept only a bounded
+// `batch_` + [A-Za-z0-9_] token so malformed identifiers never reach the DB.
+const BatchIdParam = z.string().regex(/^batch_[A-Za-z0-9_]{1,64}$/);
+
 fastify.get<{ Params: { batchId: string } }>(
   '/api/settlements/batch/:batchId/status',
   {
@@ -1863,11 +1867,11 @@ fastify.get<{ Params: { batchId: string } }>(
     },
   },
   async (request, reply) => {
-    const { batchId } = request.params;
-
-    if (!batchId || !batchId.startsWith('batch_')) {
+    const parsedBatchId = BatchIdParam.safeParse(request.params.batchId);
+    if (!parsedBatchId.success) {
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid batchId format'));
     }
+    const batchId = parsedBatchId.data;
 
     const settlements = await prisma.settlement.findMany({
       where: { batchId },
@@ -1882,18 +1886,26 @@ fastify.get<{ Params: { batchId: string } }>(
     let processing = 0;
     let completed = 0;
     let failed = 0;
+    let superseded = 0;
 
     for (const s of settlements) {
-      if (s.status === 'pending') pending++;
+      // A settlement replaced by a retry is reported under `superseded` only,
+      // so its stale status (typically `failed`) doesn't skew the batch counts.
+      if (s.supersededById != null) superseded++;
+      else if (s.status === 'pending') pending++;
       else if (s.status === 'processing') processing++;
       else if (s.status === 'completed') completed++;
       else if (s.status === 'failed') failed++;
     }
 
+    // Overall status is judged against the settlements that are still live.
+    const active = total - superseded;
     let overallStatus = 'processing';
-    if (completed === total) overallStatus = 'completed';
-    else if (failed === total) overallStatus = 'failed';
-    else if (pending === total) overallStatus = 'pending';
+    if (active > 0) {
+      if (completed === active) overallStatus = 'completed';
+      else if (failed === active) overallStatus = 'failed';
+      else if (pending === active) overallStatus = 'pending';
+    }
 
     return {
       data: {
@@ -1903,6 +1915,7 @@ fastify.get<{ Params: { batchId: string } }>(
         processing,
         completed,
         failed,
+        superseded,
         status: overallStatus,
       },
     };
