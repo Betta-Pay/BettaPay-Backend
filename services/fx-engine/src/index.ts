@@ -103,6 +103,17 @@ let cache: RateCache = {
   rateCachedAt: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialTime])),
 };
 
+/** @internal exported for testing only */
+export function setRateCacheTimestampsForTesting(
+  cachedAt: number,
+  rateCachedAt: Record<string, number>,
+): { cachedAt: number; rateCachedAt: Record<string, number> } {
+  const prev = { cachedAt: cache.cachedAt, rateCachedAt: { ...cache.rateCachedAt } };
+  cache.cachedAt = cachedAt;
+  cache.rateCachedAt = { ...rateCachedAt };
+  return prev;
+}
+
 // ── Computed pair-rate cache (issue #55) ───────────────────────────────────
 // Avoids recomputing the same cross/inverse rate on every request.
 // Keyed by "FROM_TO" (e.g. "USDC_EURT", "NGN_USDC").
@@ -791,6 +802,13 @@ fastify.addHook("onClose", async () => {
   await redis.quit().catch(() => {});
 });
 
+/** @internal exported for testing only */
+export function setRedisClientForTesting(client: any): any {
+  const prev = redis;
+  redis = client;
+  return prev;
+}
+
 // ── Rate history cleanup job ──────────────────────────────────────────────
 // BullMQ repeatable job that runs daily to purge rate history snapshots
 // older than RATE_HISTORY_RETENTION_DAYS.  Re-reads the env var each run
@@ -1332,8 +1350,13 @@ fastify.get(
     }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
-    const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
-    if (stalenessSeconds > env.MAX_STALE_SECONDS) {
+    const oldestPairCachedAt = Math.min(
+      cache.rateCachedAt[from] ?? cache.cachedAt,
+      cache.rateCachedAt[to] ?? cache.cachedAt,
+    );
+    const stalenessSeconds = Math.floor((resolvedAt - oldestPairCachedAt) / 1000);
+    const isStale = stalenessSeconds > env.MAX_STALE_SECONDS;
+    if (isStale) {
       reply.header("X-FX-Stale", "true");
     }
 
@@ -1375,6 +1398,7 @@ fastify.get(
         QUOTE_CLEANUP_TTL_MS,
       );
     } catch (err) {
+      fxQuoteCacheWriteFailuresTotal.inc();
       fastify.log.warn(
         { err },
         "Failed to store quote; quote will not be verifiable",
@@ -1398,7 +1422,7 @@ fastify.get(
       rate: quote.rate,
       slippageBps: quote.slippageBps,
       slippageLimit: quote.slippageLimit,
-      stale:         Math.floor((resolvedAt - Math.min(cache.rateCachedAt[quote.from] ?? cache.cachedAt, cache.rateCachedAt[quote.to] ?? cache.cachedAt)) / 1000) > env.MAX_STALE_SECONDS,
+      stale:         isStale,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(quote.expiresAt).toISOString(),
       rateBatchId:   quote.rateBatchId,
@@ -1482,14 +1506,28 @@ fastify.get(
         );
     }
 
-    const members = await redis.zrevrangebyscore(
-      SNAPSHOT_KEY,
-      atMs,
-      "-inf",
-      "LIMIT",
-      0,
-      1,
-    );
+    let members: string[];
+    try {
+      members = await redis.zrevrangebyscore(
+        SNAPSHOT_KEY,
+        atMs,
+        "-inf",
+        "LIMIT",
+        0,
+        1,
+      );
+    } catch (err) {
+      fastify.log.warn({ err }, "Failed to read rate history from Redis");
+      return reply
+        .code(503)
+        .send(
+          createErrorResponse(
+            "SERVICE_UNAVAILABLE",
+            "Rate history store unavailable",
+          ),
+        );
+    }
+
     if (!members.length) {
       return reply
         .code(404)
@@ -1501,10 +1539,33 @@ fastify.get(
         );
     }
 
-    const snapshot = JSON.parse(members[0]) as {
-      ts: number;
-      rates: Record<string, number>;
-    };
+    let snapshot: { ts: number; rates: Record<string, number> };
+    try {
+      const parsed = JSON.parse(members[0]) as {
+        ts?: unknown;
+        rates?: unknown;
+      };
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.ts !== "number" ||
+        !parsed.rates ||
+        typeof parsed.rates !== "object"
+      ) {
+        throw new Error("Invalid rate snapshot shape");
+      }
+      snapshot = parsed as { ts: number; rates: Record<string, number> };
+    } catch (err) {
+      fastify.log.error({ err }, "Corrupt rate snapshot in Redis");
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(
+            ErrorCodes.INTERNAL_ERROR,
+            "Corrupt rate snapshot data",
+          ),
+        );
+    }
 
     if (!(from in snapshot.rates) || !(to in snapshot.rates)) {
       return reply
@@ -1702,6 +1763,11 @@ const fxQuoteCacheHitsTotal = new promClient.Counter({
 const fxQuoteCacheMissesTotal = new promClient.Counter({
   name: "fx_quote_cache_misses_total",
   help: "Total number of FX quote resolutions that required a live rate computation",
+});
+// Issue #1049 — FX quote cache write failure counter
+export const fxQuoteCacheWriteFailuresTotal = new promClient.Counter({
+  name: "fx_quote_cache_write_failures_total",
+  help: "Total number of failures persisting FX quotes to Redis",
 });
 
 // Served on its own port (see startMetricsServer below), not on the
