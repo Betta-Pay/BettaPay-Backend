@@ -19,6 +19,7 @@ import rateLimit from "@fastify/rate-limit";
 import * as promClient from "prom-client";
 import { randomUUID, randomInt } from "crypto";
 import { z } from "zod";
+import { URL } from "url";
 import type { Redis } from "ioredis";
 import {
   resolveRate,
@@ -54,9 +55,13 @@ import {
 import {
   createHistoryQuerySchema,
   createQuoteQuerySchema,
-  createVerifyQuoteBodySchema,
   resolveFxQuoteBodyLimit,
 } from "./validation.js";
+import {
+  createVerifyQuoteHandler,
+  type StoredQuote,
+  type VerifyQuoteRouteBody,
+} from "./quote-verify.js";
 import {
   createCircuitBreakerRegistry,
   type CircuitBreakerState,
@@ -102,6 +107,17 @@ let cache: RateCache = {
   cachedAt: initialTime,
   rateCachedAt: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialTime])),
 };
+
+/** @internal exported for testing only */
+export function setRateCacheTimestampsForTesting(
+  cachedAt: number,
+  rateCachedAt: Record<string, number>,
+): { cachedAt: number; rateCachedAt: Record<string, number> } {
+  const prev = { cachedAt: cache.cachedAt, rateCachedAt: { ...cache.rateCachedAt } };
+  cache.cachedAt = cachedAt;
+  cache.rateCachedAt = { ...rateCachedAt };
+  return prev;
+}
 
 // ── Computed pair-rate cache (issue #55) ───────────────────────────────────
 // Avoids recomputing the same cross/inverse rate on every request.
@@ -284,6 +300,45 @@ function updateBaseRates(updated: Record<string, number>, batchId: string, newly
   storeRateSnapshot({ ...cache.rates }).catch(() => {}); // Redis errors are non-fatal
 }
 
+// ── SSRF prevention (issue #1047) ──────────────────────────────────────────
+// Private/reserved IP ranges and hosts that must not be fetched from.
+// See https://github.com/nodejs/node-vuln-db and RFC 6724.
+
+const PRIVATE_IP_RANGES = [
+  /^10\./,
+  /^172\.1[6-9]\./,
+  /^172\.2[0-9]\./,
+  /^172\.3[0-1]\./,
+  /^192\.168\./,
+  /^127\./,
+  /^::1$/,
+  /^fe80:/,
+  /^fc00:/,
+];
+
+function isValidRateApiUrl(urlString: string): boolean {
+  try {
+    const parsed = new URL(urlString);
+    const hostname = parsed.hostname.toLowerCase();
+
+    // Reject non-HTTP(S) schemes
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+
+    // Reject private/reserved IP ranges
+    for (const range of PRIVATE_IP_RANGES) {
+      if (range.test(hostname)) {
+        return false;
+      }
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Live rate refresh loop (issue #251) ────────────────────────────────────
 //
 // The external rates API (RATES_API_URL) is polled every RATES_REFRESH_INTERVAL_MS
@@ -295,8 +350,8 @@ function updateBaseRates(updated: Record<string, number>, batchId: string, newly
 //   { "<asset-id>": { "<vs-currency>": <price> } }
 // e.g. { "usd-coin": { "ngn": 1545.5 } }
 //
-// We map the known asset ids to the keys in cache.rates (USDC, EURT, NGN).
-// Any asset id missing from the response is left at its previous value.
+We map the known asset ids to the keys in cache.rates (USDC, EURT, NGN).
+Any asset id missing from the response is left at its previous value.
 
 const RATE_FETCH_TIMEOUT_MS = 10_000;
 const ASSET_ID_TO_KEY: Record<string, string> = {
@@ -368,6 +423,20 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), RATE_FETCH_TIMEOUT_MS);
   const startedAt = Date.now();
+
+  // Issue #1047 — Validate URL against SSRF (private/reserved hosts)
+  if (!isValidRateApiUrl(env.RATES_API_URL)) {
+    const msg = `RATES_API_URL failed SSRF validation: ${env.RATES_API_URL}`;
+    fastify.log.error({ url: env.RATES_API_URL }, msg);
+    lastRefresh = {
+      at: Date.now(),
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      error: msg,
+    };
+    return null;
+  }
+
   try {
     const res = await fetch(env.RATES_API_URL, { signal: controller.signal });
     if (!res.ok) {
@@ -381,6 +450,22 @@ async function fetchBaseRates(): Promise<Record<string, number> | null> {
       };
       return null;
     }
+
+    // Issue #1047 — Cap response body size before parsing JSON (OOM protection)
+    const contentLength = res.headers.get("content-length");
+    const MAX_BODY_BYTES = 1_000_000; // 1MB limit
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_BYTES) {
+      const msg = `RATES_API_URL response too large: ${contentLength} bytes > ${MAX_BODY_BYTES}`;
+      fastify.log.error({ contentLength, url: env.RATES_API_URL }, msg);
+      lastRefresh = {
+        at: Date.now(),
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error: msg,
+      };
+      return null;
+    }
+
     const body = (await res.json()) as Record<string, Record<string, number>>;
     const fetched: Record<string, number> = {};
     for (const [assetId, byVs] of Object.entries(body)) {
@@ -460,6 +545,43 @@ async function releaseRateFetchLock(token: string): Promise<void> {
 async function refreshTick(): Promise<void> {
   pruneExpiredComputedRates();
   try {
+    // ── Issue #1046 — Check Redis snapshot freshness to prevent multi-instance stampede
+    // If Redis already holds a fresher snapshot than our local cache, another
+    // instance already refreshed — skip the upstream fetch and just sync locally.
+    try {
+      const redisMembers = await redis.zrevrangebyscore(
+        SNAPSHOT_KEY,
+        "+inf",
+        "-inf",
+        "LIMIT",
+        0,
+        1,
+      );
+      if (redisMembers.length) {
+        const snapshot = JSON.parse(redisMembers[0]) as { ts: number; rates: Record<string, number> };
+        if (snapshot.ts > cache.cachedAt) {
+          fastify.log.info(
+            { snapshotTs: snapshot.ts, localCachedAt: cache.cachedAt },
+            "Redis has fresher snapshot; skipping upstream fetch (stampede prevention)",
+          );
+          // Warm local cache from Redis snapshot without clearing computed cache
+          const validatedRates: Record<string, number> = {};
+          for (const [currency, rate] of Object.entries(snapshot.rates)) {
+            if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) continue;
+            if (!SUPPORTED_CURRENCIES.includes(currency)) continue;
+            validatedRates[currency] = rate;
+          }
+          if (Object.keys(validatedRates).length > 0) {
+            updateBaseRates(validatedRates, randomUUID());
+            computedRateCache.clear();
+          }
+          return;
+        }
+      }
+    } catch {
+      // Redis errors are non-fatal; continue with normal refresh flow
+    }
+
     // ── Circuit breaker gate ────────────────────────────────────────────────
     const cbState = getCircuitBreakerState(env.CIRCUIT_BREAKER_COOLDOWN_MS);
 
@@ -659,13 +781,24 @@ async function warmupCacheFromRedis(): Promise<void> {
       return;
     }
 
-    warmupStats = {
-      loadedCount,
-      discardedCount,
-      timestamp: new Date(snapshot.ts).toISOString(),
-    };
-    updateBaseRates(validatedRates, randomUUID());
+    // Preserve the original cachedAt from the Redis snapshot instead of
+    // overwriting it with Date.now() (issue #1045).
+    const snapshotCachedAt = snapshot.ts;
+    cache.rates = validatedRates;
+    cache.batchIds = Object.fromEntries(
+      Object.keys(validatedRates).map((c) => [c, randomUUID()]),
+    );
+    // Keep existing rateCachedAt entries for validated currencies; unset others
+    for (const [currency, rate] of Object.entries(validatedRates)) {
+      if (!(currency in cache.rateCachedAt)) {
+        cache.rateCachedAt[currency] = snapshotCachedAt;
+      }
+    }
+    cache.cachedAt = snapshotCachedAt;
     computedRateCache.clear();
+    // Do NOT write the warmed snapshot back to Redis — that would overwrite
+    // the original cachedAt with Date.now(). The Redis snapshot is already
+    // the source of truth; we only warm the in-memory cache.
     fastify.log.info(
       {
         timestamp: new Date(snapshot.ts).toISOString(),
@@ -754,19 +887,6 @@ const QUOTE_TTL_MS = RATE_TTL_MS;
 const QUOTE_CLEANUP_TTL_MS = 10 * 60 * 1000;
 const QUOTE_KEY_PREFIX = "fx:quote:";
 
-interface StoredQuote {
-  quoteId: string;
-  from: string;
-  to: string;
-  amount: string;
-  result: string;
-  rate: string;
-  slippageBps: number;
-  expiresAt:   number; // Unix ms — quote validity cutoff
-  rateBatchId: string;
-  unroundedRate?: number;
-}
-
 export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
   // Explicit 1MB cap — matches api-gateway and settlement-engine so the limit
@@ -790,6 +910,13 @@ redis.on("error", (err: any) =>
 fastify.addHook("onClose", async () => {
   await redis.quit().catch(() => {});
 });
+
+/** @internal exported for testing only */
+export function setRedisClientForTesting(client: any): any {
+  const prev = redis;
+  redis = client;
+  return prev;
+}
 
 // ── Rate history cleanup job ──────────────────────────────────────────────
 // BullMQ repeatable job that runs daily to purge rate history snapshots
@@ -1177,6 +1304,8 @@ fastify.get(
 // ── POST /api/admin/rates/override ───────────────────────────────────────
 // Admin override endpoint: bypasses the deviation guard and forces new rates
 // into the cache. Requires a valid x-service-token.
+// Persists the override to Redis so all replicas observe it, and resets
+// fallbackStartTime when the override sets healthy rates (issue #1048).
 
 fastify.post<{ Body: unknown }>(
   "/api/admin/rates/override",
@@ -1203,7 +1332,34 @@ fastify.post<{ Body: unknown }>(
     }
 
     lastOverrideAt = Date.now();
+
+    // Store the override in Redis so all fx-engine replicas observe it
+    await redis.set(
+      "fx:rate_override",
+      JSON.stringify({ rates: body.rates, overriddenAt: lastOverrideAt }),
+      "PX",
+      24 * 60 * 60 * 1000, // 24h TTL
+    ).catch(() => {}); // Redis errors are non-fatal
+
+    // Update in-memory cache
     updateBaseRates({ ...cache.rates, ...body.rates }, randomUUID());
+
+    // Reset fallbackStartTime when an override sets healthy rates (issue #1048)
+    if (fallbackStartTime !== null && Object.keys(body.rates).length > 0) {
+      // Check if the overridden rates are valid (positive, finite numbers)
+      let allValid = true;
+      for (const [, rate] of Object.entries(body.rates)) {
+        if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+          allValid = false;
+          break;
+        }
+      }
+      if (allValid) {
+        fallbackStartTime = null;
+        fastify.log.warn("Admin override reset fallbackStartTime; rates are now live");
+      }
+    }
+
     fastify.log.warn(
       { rates: body.rates },
       "Admin override: rate deviation guard bypassed",
@@ -1332,8 +1488,13 @@ fastify.get(
     }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
-    const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
-    if (stalenessSeconds > env.MAX_STALE_SECONDS) {
+    const oldestPairCachedAt = Math.min(
+      cache.rateCachedAt[from] ?? cache.cachedAt,
+      cache.rateCachedAt[to] ?? cache.cachedAt,
+    );
+    const stalenessSeconds = Math.floor((resolvedAt - oldestPairCachedAt) / 1000);
+    const isStale = stalenessSeconds > env.MAX_STALE_SECONDS;
+    if (isStale) {
       reply.header("X-FX-Stale", "true");
     }
 
@@ -1375,6 +1536,7 @@ fastify.get(
         QUOTE_CLEANUP_TTL_MS,
       );
     } catch (err) {
+      fxQuoteCacheWriteFailuresTotal.inc();
       fastify.log.warn(
         { err },
         "Failed to store quote; quote will not be verifiable",
@@ -1398,7 +1560,7 @@ fastify.get(
       rate: quote.rate,
       slippageBps: quote.slippageBps,
       slippageLimit: quote.slippageLimit,
-      stale:         Math.floor((resolvedAt - Math.min(cache.rateCachedAt[quote.from] ?? cache.cachedAt, cache.rateCachedAt[quote.to] ?? cache.cachedAt)) / 1000) > env.MAX_STALE_SECONDS,
+      stale:         isStale,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(quote.expiresAt).toISOString(),
       rateBatchId:   quote.rateBatchId,
@@ -1482,14 +1644,28 @@ fastify.get(
         );
     }
 
-    const members = await redis.zrevrangebyscore(
-      SNAPSHOT_KEY,
-      atMs,
-      "-inf",
-      "LIMIT",
-      0,
-      1,
-    );
+    let members: string[];
+    try {
+      members = await redis.zrevrangebyscore(
+        SNAPSHOT_KEY,
+        atMs,
+        "-inf",
+        "LIMIT",
+        0,
+        1,
+      );
+    } catch (err) {
+      fastify.log.warn({ err }, "Failed to read rate history from Redis");
+      return reply
+        .code(503)
+        .send(
+          createErrorResponse(
+            "SERVICE_UNAVAILABLE",
+            "Rate history store unavailable",
+          ),
+        );
+    }
+
     if (!members.length) {
       return reply
         .code(404)
@@ -1501,10 +1677,33 @@ fastify.get(
         );
     }
 
-    const snapshot = JSON.parse(members[0]) as {
-      ts: number;
-      rates: Record<string, number>;
-    };
+    let snapshot: { ts: number; rates: Record<string, number> };
+    try {
+      const parsed = JSON.parse(members[0]) as {
+        ts?: unknown;
+        rates?: unknown;
+      };
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.ts !== "number" ||
+        !parsed.rates ||
+        typeof parsed.rates !== "object"
+      ) {
+        throw new Error("Invalid rate snapshot shape");
+      }
+      snapshot = parsed as { ts: number; rates: Record<string, number> };
+    } catch (err) {
+      fastify.log.error({ err }, "Corrupt rate snapshot in Redis");
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(
+            ErrorCodes.INTERNAL_ERROR,
+            "Corrupt rate snapshot data",
+          ),
+        );
+    }
 
     if (!(from in snapshot.rates) || !(to in snapshot.rates)) {
       return reply
@@ -1530,12 +1729,6 @@ fastify.get(
 
 // ── POST /api/quote/verify (issue #57) ───────────────────────────────────
 
-const VerifyQuoteBody = createVerifyQuoteBodySchema(env.NODE_ENV);
-
-interface VerifyQuoteRouteBody {
-  quoteId?: unknown;
-}
-
 fastify.post<{ Body: VerifyQuoteRouteBody }>(
   "/api/quote/verify",
   {
@@ -1549,79 +1742,19 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       },
     },
   },
-  async (request, reply) => {
-    let body: z.infer<typeof VerifyQuoteBody>;
-    try {
-      body = VerifyQuoteBody.parse(request.body);
-    } catch (err) {
-      if (err instanceof z.ZodError) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_QUERY,
-              "Invalid request body",
-              err.errors,
-            ),
-          );
-      }
-      throw err;
-    }
-
-    const raw = await redis.get(`${QUOTE_KEY_PREFIX}${body.quoteId}`);
-    if (!raw) {
-      return reply
-        .code(404)
-        .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Quote not found"));
-    }
-
-    const stored = JSON.parse(raw) as StoredQuote;
-    const now = Date.now();
-
-    // Quote age validation
-    const createdAt = stored.expiresAt - QUOTE_TTL_MS;
-    const quoteAge = now - createdAt;
-    if (quoteAge < env.QUOTE_MIN_AGE_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_YOUNG, "Quote too young"));
-    }
-    if (quoteAge > env.QUOTE_MAX_LIFETIME_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_OLD, "Quote too old"));
-    }
-
-    const currentRate = getOrComputeRate(stored.from, stored.to);
-    const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
-    const rateBatchId = cache.batchIds[stored.from] ?? '';
-    const quotedRate = stored.unroundedRate ?? parseFloat(stored.rate);
-
-    // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
-    let valid: boolean;
-    if (fallbackStartTime !== null) {
-      valid = now <= stored.expiresAt;
-    } else {
-      const deviation =
-        (Math.abs(currentRate - quotedRate) / quotedRate) * 10000;
-      valid = now <= stored.expiresAt && deviation <= slippageBps;
-    }
-
-    return {
-      valid,
-      stale: !valid,
-      quoteId: stored.quoteId,
-      fallbackAccepted: fallbackStartTime !== null,
-      from: stored.from,
-      to: stored.to,
-      rate: stored.rate,
-      currentRate: currentRate.toFixed(8),
-      slippageBps,
-      slippageLimit: (slippageBps / 10_000).toFixed(4),
-      expiresAt:     new Date(stored.expiresAt).toISOString(),
-      rateBatchId,
-    };
-  },
+  createVerifyQuoteHandler({
+    nodeEnv: env.NODE_ENV,
+    redis,
+    log: fastify.log,
+    quoteKeyPrefix: QUOTE_KEY_PREFIX,
+    quoteTtlMs: QUOTE_TTL_MS,
+    quoteMinAgeMs: env.QUOTE_MIN_AGE_MS,
+    quoteMaxLifetimeMs: env.QUOTE_MAX_LIFETIME_MS,
+    defaultSlippageBps: env.DEFAULT_SLIPPAGE_BPS,
+    getCurrentRate: getOrComputeRate,
+    isFallbackActive: () => fallbackStartTime !== null,
+    getFallbackBatchId: (currency) => cache.batchIds[currency] ?? "",
+  }),
 );
 
 // ── Start ──────────────────────────────────────────────────────────────────
@@ -1702,6 +1835,11 @@ const fxQuoteCacheHitsTotal = new promClient.Counter({
 const fxQuoteCacheMissesTotal = new promClient.Counter({
   name: "fx_quote_cache_misses_total",
   help: "Total number of FX quote resolutions that required a live rate computation",
+});
+// Issue #1049 — FX quote cache write failure counter
+export const fxQuoteCacheWriteFailuresTotal = new promClient.Counter({
+  name: "fx_quote_cache_write_failures_total",
+  help: "Total number of failures persisting FX quotes to Redis",
 });
 
 // Served on its own port (see startMetricsServer below), not on the

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { resolveMetricsPort, startMetricsServer } from './metrics-server.js';
+import { resolveMetricsHost, resolveMetricsPort, startMetricsServer } from './metrics-server.js';
 
 // Issue #864: Unit tests for startMetricsServer scrape-token auth branch and listener behavior.
 
@@ -341,5 +341,119 @@ test('startMetricsServer: logs auth status on startup', async () => {
     assert.ok(infoCall.msg?.includes('auth required'), 'log message should mention auth required');
   } finally {
     await new Promise<void>((resolve) => serverWithAuth.close(() => resolve()));
+  }
+});
+
+// ── Hardening (#1074) ─────────────────────────────────────────────────────────
+
+test('resolveMetricsHost: loopback without a token, all interfaces with one, explicit host wins', () => {
+  assert.equal(resolveMetricsHost(undefined), '127.0.0.1');
+  assert.equal(resolveMetricsHost(''), '127.0.0.1');
+  assert.equal(resolveMetricsHost('some-scrape-token'), '0.0.0.0');
+  assert.equal(resolveMetricsHost(undefined, '0.0.0.0'), '0.0.0.0');
+  assert.equal(resolveMetricsHost('some-scrape-token', '10.0.0.5'), '10.0.0.5');
+});
+
+test('startMetricsServer: binds to 127.0.0.1 when scrapeToken is unset', async () => {
+  const log = createLogSpy();
+  const server = startMetricsServer({
+    appPort: 3000,
+    metricsPort: 0,
+    contentType: 'text/plain',
+    getMetrics: () => 'ok',
+    log,
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    assert.equal((server.address() as AddressInfo).address, '127.0.0.1');
+    assert.equal((log.infoCalls[0].obj as { host?: string }).host, '127.0.0.1');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('startMetricsServer: /metrics with a query string routes to metrics output', async () => {
+  const log = createLogSpy();
+  const scrapeToken = 'query-string-token-123';
+  const server = startMetricsServer({
+    appPort: 3000,
+    metricsPort: 0,
+    contentType: 'text/plain',
+    getMetrics: () => 'metric_with_query 1\n',
+    scrapeToken,
+    host: '127.0.0.1',
+    log,
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    const res = await get(port, '/metrics?foo=bar', { Authorization: `Bearer ${scrapeToken}` });
+    assert.equal(res.status, 200);
+    assert.equal(res.body, 'metric_with_query 1\n');
+
+    const resFormat = await get(port, '/metrics?format=prometheus&x=1', { Authorization: `Bearer ${scrapeToken}` });
+    assert.equal(resFormat.status, 200);
+
+    const resUnauth = await get(port, '/metrics?foo=bar');
+    assert.equal(resUnauth.status, 401, 'query string must not bypass auth');
+
+    const resOther = await get(port, '/metricsfoo?x=1', { Authorization: `Bearer ${scrapeToken}` });
+    assert.equal(resOther.status, 404);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('startMetricsServer: token comparison rejects prefixes and longer tokens', async () => {
+  const log = createLogSpy();
+  const scrapeToken = 'prefix-check-token-xyz';
+  const server = startMetricsServer({
+    appPort: 3000,
+    metricsPort: 0,
+    contentType: 'text/plain',
+    getMetrics: () => 'ok',
+    scrapeToken,
+    host: '127.0.0.1',
+    log,
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    assert.equal((await get(port, '/metrics', { Authorization: 'Bearer prefix-check' })).status, 401);
+    assert.equal((await get(port, '/metrics', { Authorization: `Bearer ${scrapeToken}x` })).status, 401);
+    assert.equal((await get(port, '/metrics', { Authorization: '' })).status, 401);
+    assert.equal((await get(port, '/metrics', { Authorization: `Bearer ${scrapeToken}` })).status, 200);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('startMetricsServer: port bind errors are logged through the error listener instead of crashing', async () => {
+  const blocker = http.createServer();
+  await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+  const takenPort = (blocker.address() as AddressInfo).port;
+
+  const log = createLogSpy();
+  const server = startMetricsServer({
+    appPort: 3000,
+    metricsPort: takenPort,
+    contentType: 'text/plain',
+    getMetrics: () => 'ok',
+    log,
+  });
+
+  try {
+    await new Promise<void>((resolve) => server.once('error', () => resolve()));
+    // The listener registered by startMetricsServer runs before ours.
+    assert.equal(log.errorCalls.length, 1);
+    assert.equal((log.errorCalls[0].obj as { code?: string }).code, 'EADDRINUSE');
+    assert.equal(log.infoCalls.length, 0, 'listening is never logged on bind failure');
+  } finally {
+    await new Promise<void>((resolve) => blocker.close(() => resolve()));
   }
 });
