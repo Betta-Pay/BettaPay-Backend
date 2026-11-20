@@ -675,7 +675,17 @@ function getContractName(contractId: string): string {
 }
 
 // ── Stellar RPC client ────────────────────────────────────────────────────────
-const server = new rpc.Server(env.STELLAR_RPC_URL, { allowHttp: true });
+/** @internal exported for testing only */
+export function createRpcServerOptions(nodeEnv: string | undefined): {
+  allowHttp: boolean;
+} {
+  return { allowHttp: nodeEnv !== "production" };
+}
+
+const server = new rpc.Server(
+  env.STELLAR_RPC_URL,
+  createRpcServerOptions(env.NODE_ENV),
+);
 
 // ── XDR decoding ─────────────────────────────────────────────────────────────
 
