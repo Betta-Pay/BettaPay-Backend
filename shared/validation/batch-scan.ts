@@ -67,6 +67,23 @@ export interface ForEachBatchResult {
 }
 
 /**
+ * Thrown by {@link forEachBatch} when a page's `nextCursor` equals the cursor
+ * that was used to fetch it, which would otherwise loop forever (#1086).
+ */
+export class StalledCursorError extends Error {
+  constructor(
+    readonly cursor: string,
+    readonly batches: number,
+  ) {
+    super(
+      `forEachBatch: cursor did not advance (stuck at ${JSON.stringify(cursor)} after ${batches} batch(es)); ` +
+        "fetchPage must return a nextCursor past the last row of the page",
+    );
+    this.name = "StalledCursorError";
+  }
+}
+
+/**
  * Iterates over a dataset in fixed-size chunks.
  *
  * Stable id ordering contract
@@ -83,6 +100,10 @@ export interface ForEachBatchResult {
  * Termination: the scan stops when a page returns fewer items than the batch
  * size, when `nextCursor` is absent, when a page is empty, when `maxBatches`
  * is reached, or when `onBatch` returns `false` (early termination).
+ *
+ * Stalled cursors: if a full page returns the same `nextCursor` that was used
+ * to fetch it, the fetcher would hand back the same page forever. The scan
+ * throws a {@link StalledCursorError} before re-processing that page (#1086).
  *
  * @example
  * ```ts
@@ -133,6 +154,15 @@ export async function forEachBatch<T>(
     const items = page?.items ?? [];
 
     if (items.length === 0) break;
+    // A full page that hands back the cursor it was fetched with would be
+    // re-fetched forever; fail before handing the duplicate page to onBatch.
+    if (
+      cursor !== undefined &&
+      items.length >= batchSize &&
+      (page.nextCursor ?? undefined) === cursor
+    ) {
+      throw new StalledCursorError(cursor, batches);
+    }
 
     const decision = await onBatch(items, batches);
     batches += 1;

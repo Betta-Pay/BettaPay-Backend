@@ -6,6 +6,10 @@
  */
 
 import type { FastifyInstance } from 'fastify';
+import { flushLogger } from './logger.js';
+
+/** Upper bound on how long a fatal startup exit waits for logs to drain (#1080). */
+export const STARTUP_LOG_FLUSH_TIMEOUT_MS = 500;
 
 export interface StartupCheckResult {
   name: string;
@@ -153,6 +157,9 @@ export async function runStartupChecks(options: RunStartupChecksOptions): Promis
 
   if (hasCriticalFailure) {
     logger.fatal('Critical startup checks failed — exiting');
+    // Pino may buffer asynchronously; exiting immediately drops the fatal
+    // lines above, which are exactly the ones operators need (#1080).
+    await flushLogger(logger, STARTUP_LOG_FLUSH_TIMEOUT_MS);
     process.exit(1);
   }
 
