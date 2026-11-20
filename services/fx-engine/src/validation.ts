@@ -60,6 +60,6 @@ export const createHistoryQuerySchema = (nodeEnv?: string) =>
 export const createVerifyQuoteBodySchema = (nodeEnv?: string) =>
   envAwareSchema(nodeEnv, () =>
     z.object({
-      quoteId: z.string().min(1),
+      quoteId: z.string().uuid(),
     }),
   );

@@ -54,9 +54,13 @@ import {
 import {
   createHistoryQuerySchema,
   createQuoteQuerySchema,
-  createVerifyQuoteBodySchema,
   resolveFxQuoteBodyLimit,
 } from "./validation.js";
+import {
+  createVerifyQuoteHandler,
+  type StoredQuote,
+  type VerifyQuoteRouteBody,
+} from "./quote-verify.js";
 import {
   createCircuitBreakerRegistry,
   type CircuitBreakerState,
@@ -753,19 +757,6 @@ function startRefreshLoop(): void {
 const QUOTE_TTL_MS = RATE_TTL_MS;
 const QUOTE_CLEANUP_TTL_MS = 10 * 60 * 1000;
 const QUOTE_KEY_PREFIX = "fx:quote:";
-
-interface StoredQuote {
-  quoteId: string;
-  from: string;
-  to: string;
-  amount: string;
-  result: string;
-  rate: string;
-  slippageBps: number;
-  expiresAt:   number; // Unix ms — quote validity cutoff
-  rateBatchId: string;
-  unroundedRate?: number;
-}
 
 export const fastify = Fastify({
   logger: createLoggerOptions({ level: env.LOG_LEVEL }),
@@ -1530,12 +1521,6 @@ fastify.get(
 
 // ── POST /api/quote/verify (issue #57) ───────────────────────────────────
 
-const VerifyQuoteBody = createVerifyQuoteBodySchema(env.NODE_ENV);
-
-interface VerifyQuoteRouteBody {
-  quoteId?: unknown;
-}
-
 fastify.post<{ Body: VerifyQuoteRouteBody }>(
   "/api/quote/verify",
   {
@@ -1549,79 +1534,19 @@ fastify.post<{ Body: VerifyQuoteRouteBody }>(
       },
     },
   },
-  async (request, reply) => {
-    let body: z.infer<typeof VerifyQuoteBody>;
-    try {
-      body = VerifyQuoteBody.parse(request.body);
-    } catch (err) {
-      if (err instanceof z.ZodError) {
-        return reply
-          .code(400)
-          .send(
-            createErrorResponse(
-              ErrorCodes.INVALID_QUERY,
-              "Invalid request body",
-              err.errors,
-            ),
-          );
-      }
-      throw err;
-    }
-
-    const raw = await redis.get(`${QUOTE_KEY_PREFIX}${body.quoteId}`);
-    if (!raw) {
-      return reply
-        .code(404)
-        .send(createErrorResponse(ErrorCodes.NOT_FOUND, "Quote not found"));
-    }
-
-    const stored = JSON.parse(raw) as StoredQuote;
-    const now = Date.now();
-
-    // Quote age validation
-    const createdAt = stored.expiresAt - QUOTE_TTL_MS;
-    const quoteAge = now - createdAt;
-    if (quoteAge < env.QUOTE_MIN_AGE_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_YOUNG, "Quote too young"));
-    }
-    if (quoteAge > env.QUOTE_MAX_LIFETIME_MS) {
-      return reply
-        .code(400)
-        .send(createErrorResponse(ErrorCodes.QUOTE_TOO_OLD, "Quote too old"));
-    }
-
-    const currentRate = getOrComputeRate(stored.from, stored.to);
-    const slippageBps = stored.slippageBps ?? env.DEFAULT_SLIPPAGE_BPS;
-    const rateBatchId = cache.batchIds[stored.from] ?? '';
-    const quotedRate = stored.unroundedRate ?? parseFloat(stored.rate);
-
-    // Fail-open: if market rate is unavailable (fallback mode), accept by expiry
-    let valid: boolean;
-    if (fallbackStartTime !== null) {
-      valid = now <= stored.expiresAt;
-    } else {
-      const deviation =
-        (Math.abs(currentRate - quotedRate) / quotedRate) * 10000;
-      valid = now <= stored.expiresAt && deviation <= slippageBps;
-    }
-
-    return {
-      valid,
-      stale: !valid,
-      quoteId: stored.quoteId,
-      fallbackAccepted: fallbackStartTime !== null,
-      from: stored.from,
-      to: stored.to,
-      rate: stored.rate,
-      currentRate: currentRate.toFixed(8),
-      slippageBps,
-      slippageLimit: (slippageBps / 10_000).toFixed(4),
-      expiresAt:     new Date(stored.expiresAt).toISOString(),
-      rateBatchId,
-    };
-  },
+  createVerifyQuoteHandler({
+    nodeEnv: env.NODE_ENV,
+    redis,
+    log: fastify.log,
+    quoteKeyPrefix: QUOTE_KEY_PREFIX,
+    quoteTtlMs: QUOTE_TTL_MS,
+    quoteMinAgeMs: env.QUOTE_MIN_AGE_MS,
+    quoteMaxLifetimeMs: env.QUOTE_MAX_LIFETIME_MS,
+    defaultSlippageBps: env.DEFAULT_SLIPPAGE_BPS,
+    getCurrentRate: getOrComputeRate,
+    isFallbackActive: () => fallbackStartTime !== null,
+    getFallbackBatchId: (currency) => cache.batchIds[currency] ?? "",
+  }),
 );
 
 // ── Start ──────────────────────────────────────────────────────────────────
