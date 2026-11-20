@@ -4,7 +4,30 @@ import Fastify from 'fastify';
 import { auditRouteAuthPolicy, PUBLIC_PATHS } from './route-audit.js';
 
 test('PUBLIC_PATHS is exactly the documented public route allowlist', () => {
-  assert.deepEqual([...PUBLIC_PATHS], ['/api/health', '/api/health/live', '/api/deployments']);
+  assert.deepEqual([...PUBLIC_PATHS].sort(), [
+    '/api/assets',
+    '/api/auth/challenge',
+    '/api/auth/google',
+    '/api/auth/refresh',
+    '/api/auth/verify',
+    '/api/auth/wallet/verify',
+    '/api/currencies',
+    '/api/deployments',
+    '/api/docs/json',
+    '/api/health',
+    '/api/health/all',
+    '/api/health/live',
+    '/api/quote',
+    '/api/quote/verify',
+    '/api/rates',
+    '/api/rates/history',
+  ]);
+});
+
+test('PUBLIC_PATHS contains no admin, merchant, payment or settlement routes', () => {
+  for (const path of PUBLIC_PATHS) {
+    assert.doesNotMatch(path, /^\/api\/(admin|merchants|payments|settlements|webhooks|events)(\/|$)/, path);
+  }
 });
 
 function createLoggerSpy() {
@@ -67,6 +90,17 @@ test('auditRouteAuthPolicy enforces unprotected routes and accepts public config
   );
   assert.doesNotThrow(() =>
     app.get('/api/function-guarded', { preValidation: async () => {} }, async () => ({ ok: true })),
+  );
+  await app.close();
+});
+test('auditRouteAuthPolicy ignores OPTIONS-only (CORS preflight) routes but not mixed-method routes', async () => {
+  const app = Fastify();
+  auditRouteAuthPolicy(app, { mode: 'enforce' });
+
+  assert.doesNotThrow(() => app.options('*', async () => ''));
+  assert.throws(
+    () => app.route({ method: ['OPTIONS', 'POST'], url: '/api/mixed', handler: async () => '' }),
+    /has no preValidation hook/,
   );
   await app.close();
 });

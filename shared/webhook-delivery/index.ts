@@ -236,6 +236,7 @@ export function resolveWebhookConcurrency(defaultValue = WEBHOOK_DEFAULTS.concur
  *  - no insignificant whitespace is emitted
  *  - array element order is preserved (arrays are ordered by definition)
  *  - strings/numbers/booleans/null serialize exactly as JSON.stringify does
+ *  - Date instances serialize as ISO-8601 strings (as JSON.stringify does)
  *
  * Semantically identical payloads therefore always produce byte-identical
  * output, so signer and verifier can always agree on the exact string the
@@ -251,6 +252,12 @@ export function canonicalize(value: unknown): string {
 
 function serializeCanonical(value: unknown): string {
   if (value === null) return 'null';
+  // Dates have no own enumerable keys, so without this they would collapse to
+  // '{}' and silently drop timestamps from signed payloads (#1094). Mirror
+  // JSON.stringify: ISO-8601 string, or null for an invalid date.
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? 'null' : JSON.stringify(value.toISOString());
+  }
   if (Array.isArray(value)) {
     return `[${value.map((v) => serializeCanonical(isJsonValue(v) ? v : null)).join(',')}]`;
   }

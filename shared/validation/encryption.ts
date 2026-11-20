@@ -28,6 +28,32 @@ const IV_LENGTH = 12; // 96 bits (recommended for GCM)
 const AUTH_TAG_LENGTH = 16; // 128 bits
 const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_DIGEST = 'sha256';
+const FIELD_KEY_DERIVATION_SALT = 'bettapay:field-encryption:v1';
+const MAX_DERIVED_KEY_CACHE_SIZE = 64;
+
+// Per-process random key used solely to index the in-memory derived-key cache
+// so raw secret strings are never stored as Map keys (#1066).
+const CACHE_LOOKUP_HMAC_KEY = crypto.randomBytes(32);
+const derivedKeyCache = new Map<string, Buffer>();
+const inFlightKeyDerivations = new Map<string, Promise<Buffer>>();
+
+function pbkdf2Async(
+  secret: crypto.BinaryLike,
+  salt: crypto.BinaryLike,
+  iterations: number,
+  keylen: number,
+  digest: string,
+): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    crypto.pbkdf2(secret, salt, iterations, keylen, digest, (err, derivedKey) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(derivedKey);
+      }
+    });
+  });
+}
 
 /**
  * Encrypts plaintext with a password-derived key.
@@ -135,12 +161,86 @@ export function verifyPassword(encrypted: string, password: string): boolean {
     return false;
   }
 }
+
+/**
+ * Non-blocking equivalent of `encrypt()` that offloads PBKDF2 key derivation
+ * to libuv's thread pool via async `crypto.pbkdf2` (#1066).
+ */
+export async function encryptAsync(plaintext: string, password: string): Promise<string> {
+  const salt = crypto.randomBytes(SALT_LENGTH);
+  const key = await pbkdf2Async(password, salt, PBKDF2_ITERATIONS, KEY_LENGTH, PBKDF2_DIGEST);
+  const iv = crypto.randomBytes(IV_LENGTH);
+
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  let ciphertext = cipher.update(plaintext, 'utf8');
+  ciphertext = Buffer.concat([ciphertext, cipher.final()]);
+
+  const authTag = cipher.getAuthTag();
+  const combined = Buffer.concat([salt, iv, authTag, ciphertext]);
+
+  return combined.toString('base64');
+}
+
+/**
+ * Non-blocking equivalent of `decrypt()` that offloads PBKDF2 key derivation
+ * to libuv's thread pool via async `crypto.pbkdf2` (#1066).
+ */
+export async function decryptAsync(encrypted: string, password: string): Promise<string> {
+  const combined = Buffer.from(encrypted, 'base64');
+
+  const MIN_LENGTH = SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH;
+  if (combined.length < MIN_LENGTH) {
+    throw new Error(
+      `decrypt: invalid payload — expected at least ${MIN_LENGTH} bytes, got ${combined.length}`,
+    );
+  }
+
+  const salt = combined.subarray(0, SALT_LENGTH);
+  const iv = combined.subarray(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+  const authTag = combined.subarray(
+    SALT_LENGTH + IV_LENGTH,
+    SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH,
+  );
+  const ciphertext = combined.subarray(SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH);
+
+  const key = await pbkdf2Async(password, salt, PBKDF2_ITERATIONS, KEY_LENGTH, PBKDF2_DIGEST);
+
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(authTag);
+
+  let plaintext = decipher.update(ciphertext);
+  plaintext = Buffer.concat([plaintext, decipher.final()]);
+
+  return plaintext.toString('utf8');
+}
+
+/**
+ * Non-blocking equivalent of `verifyPassword()` (#1066).
+ */
+export async function verifyPasswordAsync(encrypted: string, password: string): Promise<boolean> {
+  try {
+    await decryptAsync(encrypted, password);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const TAG_LENGTH = 16; // 128-bit authentication tag
 const ENCRYPTED_PREFIX = '$enc$v1$';
 
-export const SENSITIVE_FIELDS = new Set(['secretHash', 'secret', 'privateKey', 'secretKey']);
+export const SENSITIVE_FIELDS = new Set([
+  'secretHash',
+  'secret',
+  'privateKey',
+  'secretKey',
+  // #1067 — webhook signing secrets are credentials like any other: without
+  // this entry encryptSensitiveFields/decryptSensitiveFields skipped them and
+  // the value moved through the system in plaintext.
+  'signingSecret',
+]);
 
-function deriveKey(secretKey?: string): Buffer {
+function resolveFieldSecretKey(secretKey?: string): string {
   const key = secretKey || process.env.FIELD_ENCRYPTION_KEY;
   if (!key) {
     throw new Error('FIELD_ENCRYPTION_KEY environment variable is missing');
@@ -148,7 +248,110 @@ function deriveKey(secretKey?: string): Buffer {
   if (key.length < 32) {
     throw new Error('FIELD_ENCRYPTION_KEY must be at least 32 characters long');
   }
-  return crypto.createHash('sha256').update(key).digest();
+  return key;
+}
+
+function cacheLookupKey(secret: string): string {
+  return crypto.createHmac('sha256', CACHE_LOOKUP_HMAC_KEY).update(secret).digest('hex');
+}
+
+function getCachedDerivedKey(lookupKey: string): Buffer | undefined {
+  const cached = derivedKeyCache.get(lookupKey);
+  if (!cached) {
+    return undefined;
+  }
+  // Refresh LRU recency and return a defensive copy so caller mutations
+  // cannot corrupt cached key material.
+  derivedKeyCache.delete(lookupKey);
+  derivedKeyCache.set(lookupKey, cached);
+  return Buffer.from(cached);
+}
+
+function setCachedDerivedKey(lookupKey: string, derived: Buffer): void {
+  const existing = derivedKeyCache.get(lookupKey);
+  if (existing) {
+    existing.fill(0);
+    derivedKeyCache.delete(lookupKey);
+  } else if (derivedKeyCache.size >= MAX_DERIVED_KEY_CACHE_SIZE) {
+    const oldestKey = derivedKeyCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldestVal = derivedKeyCache.get(oldestKey);
+      oldestVal?.fill(0);
+      derivedKeyCache.delete(oldestKey);
+    }
+  }
+  derivedKeyCache.set(lookupKey, Buffer.from(derived));
+}
+
+/**
+ * Zeroes and clears all cached derived field-encryption keys (#1066).
+ */
+export function clearDerivedKeyCache(): void {
+  for (const buf of derivedKeyCache.values()) {
+    buf.fill(0);
+  }
+  derivedKeyCache.clear();
+}
+
+/**
+ * Derives a 256-bit field-encryption key using PBKDF2-HMAC-SHA256 (100,000
+ * iterations) with a domain-separated salt, replacing the weak single-pass
+ * SHA-256 derivation. Results are cached in a bounded in-memory LRU cache so
+ * repeated encryption/decryption calls avoid blocking the event loop (#1066).
+ */
+export function deriveKey(secretKey?: string): Buffer {
+  const key = resolveFieldSecretKey(secretKey);
+  const lookup = cacheLookupKey(key);
+  const cached = getCachedDerivedKey(lookup);
+  if (cached) {
+    return cached;
+  }
+
+  const derived = crypto.pbkdf2Sync(
+    key,
+    FIELD_KEY_DERIVATION_SALT,
+    PBKDF2_ITERATIONS,
+    KEY_LENGTH,
+    PBKDF2_DIGEST,
+  );
+  setCachedDerivedKey(lookup, derived);
+  return derived;
+}
+
+/**
+ * Asynchronously derives a 256-bit field-encryption key via non-blocking
+ * `crypto.pbkdf2`, sharing the same bounded cache as `deriveKey` (#1066).
+ */
+export async function deriveKeyAsync(secretKey?: string): Promise<Buffer> {
+  const key = resolveFieldSecretKey(secretKey);
+  const lookup = cacheLookupKey(key);
+  const cached = getCachedDerivedKey(lookup);
+  if (cached) {
+    return cached;
+  }
+
+  const pending = inFlightKeyDerivations.get(lookup);
+  if (pending) {
+    return Buffer.from(await pending);
+  }
+
+  const derivation = pbkdf2Async(
+    key,
+    FIELD_KEY_DERIVATION_SALT,
+    PBKDF2_ITERATIONS,
+    KEY_LENGTH,
+    PBKDF2_DIGEST,
+  )
+    .then((derived) => {
+      setCachedDerivedKey(lookup, derived);
+      return derived;
+    })
+    .finally(() => {
+      inFlightKeyDerivations.delete(lookup);
+    });
+
+  inFlightKeyDerivations.set(lookup, derivation);
+  return Buffer.from(await derivation);
 }
 
 export function isEncrypted(value: string): boolean {
@@ -188,6 +391,25 @@ export function decryptField(ciphertext: string, secretKey?: string): string {
   }
 
   const [ivHex, tagHex, encryptedHex] = parts;
+
+  // #1067 — Buffer.from(x, 'hex') does not throw on malformed input: it stops
+  // at the first invalid character (or drops a trailing nibble for odd-length
+  // strings) and silently returns a shorter buffer, which then fails later as
+  // a confusing "authentication tag mismatch". Reject bad hex up front with a
+  // clear error instead.
+  const hexSegments: Array<[string, string]> = [
+    ['iv', ivHex],
+    ['auth tag', tagHex],
+    ['ciphertext', encryptedHex],
+  ];
+  for (const [segment, value] of hexSegments) {
+    if (value.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(value)) {
+      throw new Error(
+        `Invalid hex encoding in encrypted payload segment: ${segment}`,
+      );
+    }
+  }
+
   const iv = Buffer.from(ivHex, 'hex');
   const tag = Buffer.from(tagHex, 'hex');
   const encrypted = Buffer.from(encryptedHex, 'hex');

@@ -22,48 +22,67 @@ export function parseTrustedProxyCount(raw: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+/** Split an X-Forwarded-For value (string or repeated header) into trimmed, non-empty hops. */
+function parseForwardedFor(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value.join(',') : value;
+  if (typeof raw !== 'string') return [];
+  return raw
+    .split(',')
+    .map((hop) => hop.trim())
+    .filter(Boolean);
+}
+
+/** First non-empty value of a single-address header such as X-Real-IP. */
+function parseRealIp(value: unknown): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return '';
+  // X-Real-IP should carry one address; tolerate a misconfigured proxy that
+  // sends a list by taking the first entry rather than the whole string.
+  return raw.split(',')[0].trim();
+}
+
 /**
  * Extract the real client IP from a request, honoring a configured number of
- * trusted reverse-proxy hops (#621).
+ * trusted reverse-proxy hops (#621, #1073).
  *
  * X-Forwarded-For (and X-Real-IP) are entirely attacker-controlled unless
  * something in front of this process is known to overwrite/append to them
  * honestly. With trustedProxyCount = 0 (the default), neither header is
  * consulted — the request's own transport-layer address (request.ip) is
- * used, which the client cannot spoof. With trustedProxyCount = N, the
- * X-Forwarded-For chain is combined with request.ip into one hop list
- * [xff-entries..., request.ip] and the client is taken to be the entry N
- * positions in from the right — i.e. the entries a chain of N trusted
- * proxies would have appended are stripped off, mirroring Express's/
- * Fastify's `trust proxy: N` semantics.
+ * used, which the client cannot spoof. With trustedProxyCount = N:
+ *
+ *  1. X-Forwarded-For — the chain is combined with request.ip into one hop
+ *     list [xff-entries..., request.ip] and the client is taken to be the
+ *     entry N positions in from the right, mirroring Express's/Fastify's
+ *     `trust proxy: N` semantics. A chain shorter than N (e.g. a single-entry
+ *     header behind 2 configured proxies) resolves to its leftmost entry —
+ *     the furthest hop any proxy reported — rather than an out-of-range index.
+ *  2. X-Real-IP — used when X-Forwarded-For is absent or contains no usable
+ *     entries (e.g. nginx `proxy_set_header X-Real-IP $remote_addr` only).
+ *  3. request.ip — the transport-layer peer address.
+ *
+ * Always returns a string; an empty string means no address was available.
  */
 export function getClientIp(
   request: AuditLogRequestLike,
   trustedProxyCount: number = parseTrustedProxyCount(process.env.TRUSTED_PROXY_COUNT),
 ): string {
-  const fallback = request.ip ?? '';
-  if (trustedProxyCount <= 0) return fallback;
+  const peerIp = typeof request.ip === 'string' ? request.ip.trim() : '';
+  if (trustedProxyCount <= 0) return peerIp;
 
-  const forwardedFor = request.headers?.['x-forwarded-for'];
-  const rawForwardedFor = Array.isArray(forwardedFor) ? forwardedFor.join(',') : forwardedFor;
+  const realIp = parseRealIp(request.headers?.['x-real-ip']);
+  const hops = parseForwardedFor(request.headers?.['x-forwarded-for']);
 
-  if (typeof rawForwardedFor === 'string' && rawForwardedFor.trim()) {
-    const hops = rawForwardedFor
-      .split(',')
-      .map((hop) => hop.trim())
-      .filter(Boolean);
-    const chain = [...hops, fallback];
+  if (hops.length > 0) {
+    // The peer slot is kept even when request.ip is unknown so the trusted-hop
+    // count still lines up with the proxies that appended to the chain.
+    const chain = [...hops, peerIp];
     const clientIndex = Math.max(0, chain.length - 1 - trustedProxyCount);
-    return chain[clientIndex] || fallback;
+    const candidate = chain[clientIndex];
+    if (candidate) return candidate;
   }
 
-  const realIp = request.headers?.['x-real-ip'];
-  const rawRealIp = Array.isArray(realIp) ? realIp[0] : realIp;
-  if (typeof rawRealIp === 'string' && rawRealIp.trim()) {
-    return rawRealIp.trim();
-  }
-
-  return fallback;
+  return realIp || peerIp;
 }
 
 function getRequestIp(request?: AuditLogRequestLike | null): string | null {

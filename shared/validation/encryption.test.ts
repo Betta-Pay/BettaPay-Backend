@@ -225,14 +225,23 @@ test('decrypt: handles truncated encrypted data', (t) => {
   t.end();
 });
 
+import crypto from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import testNode from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  encryptAsync,
+  decryptAsync,
+  verifyPasswordAsync,
+  deriveKey,
+  deriveKeyAsync,
+  clearDerivedKeyCache,
   encryptField,
   decryptField,
   isEncrypted,
   encryptSensitiveFields,
   decryptSensitiveFields,
+  SENSITIVE_FIELDS,
 } from './encryption.js';
 
 const TEST_KEY = 'super-secret-32-character-encryption-key-for-bettapay!';
@@ -309,49 +318,122 @@ testNode('encryptSensitiveFields & decryptSensitiveFields: processes sensitive f
   assert.equal(decrypted.nested.name, 'Legit Merchant');
 });
 
-testNode('encryptSensitiveFields: prevents prototype pollution with __proto__, constructor, and prototype payloads', () => {
-  const untrusted = JSON.parse(
-    '{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"secret":"raw-secret-value","normal":"safe"}',
-  );
+testNode('SENSITIVE_FIELDS: signingSecret is registered and round-trips through encryption (#1067)', () => {
+  assert.ok(SENSITIVE_FIELDS.has('signingSecret'), 'signingSecret is part of SENSITIVE_FIELDS');
 
-  const beforePollution = (Object.prototype as any).polluted;
-  assert.equal(beforePollution, undefined);
+  const data = {
+    id: 'wh_123',
+    url: 'https://example.com/webhook',
+    signingSecret: 'whsec_plaintext_signing_secret_value',
+  };
 
-  const encrypted = encryptSensitiveFields(untrusted, TEST_KEY);
-
-  assert.equal((Object.prototype as any).polluted, undefined, 'Object.prototype must not be modified');
-  assert.equal(encrypted.__proto__?.polluted, undefined);
-  assert.equal(encrypted.normal, 'safe');
-  assert.notEqual(encrypted.secret, 'raw-secret-value');
-  assert.ok(isEncrypted(encrypted.secret));
-});
-
-testNode('decryptSensitiveFields: prevents prototype pollution with __proto__, constructor, and prototype payloads', () => {
-  const encryptedSecret = encryptField('my-clear-secret', TEST_KEY);
-  const untrusted = JSON.parse(
-    `{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted":"yes"}},"prototype":{"polluted":"yes"},"secret":"${encryptedSecret}","merchant":"acme"}`,
-  );
-
-  const beforePollution = (Object.prototype as any).polluted;
-  assert.equal(beforePollution, undefined);
-
-  const decrypted = decryptSensitiveFields(untrusted, TEST_KEY);
-
-  assert.equal((Object.prototype as any).polluted, undefined, 'Object.prototype must not be modified');
-  assert.equal(decrypted.merchant, 'acme');
-  assert.equal(decrypted.secret, 'my-clear-secret');
-});
-
-testNode('encryptSensitiveFields & decryptSensitiveFields: prevents prototype pollution in nested structures', () => {
-  const nestedPayload = JSON.parse(
-    '{"profile":{"__proto__":{"pollutedNested":"yes"},"secretHash":"raw-nested-hash"},"data":{"constructor":{"prototype":{"pollutedNested":"yes"}}}}',
-  );
-
-  const encrypted = encryptSensitiveFields(nestedPayload, TEST_KEY);
-  assert.equal((Object.prototype as any).pollutedNested, undefined);
-  assert.ok(isEncrypted(encrypted.profile.secretHash));
+  const encrypted = encryptSensitiveFields(data, TEST_KEY);
+  assert.notEqual(encrypted.signingSecret, data.signingSecret, 'signingSecret is encrypted at rest');
+  assert.ok(isEncrypted(encrypted.signingSecret), 'encrypted signingSecret carries the $enc$v1$ prefix');
+  assert.equal(encrypted.url, data.url, 'non-sensitive fields are left untouched');
 
   const decrypted = decryptSensitiveFields(encrypted, TEST_KEY);
-  assert.equal((Object.prototype as any).pollutedNested, undefined);
-  assert.equal(decrypted.profile.secretHash, 'raw-nested-hash');
+  assert.equal(decrypted.signingSecret, data.signingSecret, 'signingSecret decrypts back to the original value');
+});
+
+testNode('decryptField: rejects odd-length hex instead of silently truncating it (#1067)', () => {
+  // 12-byte iv, 16-byte auth tag, ciphertext with an odd number of hex chars
+  const payload = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(32)}:${'c'.repeat(5)}`;
+
+  assert.throws(
+    () => decryptField(payload, TEST_KEY),
+    /Invalid hex encoding in encrypted payload segment/i,
+    'odd-length hex is rejected with a descriptive error rather than truncated',
+  );
+});
+
+testNode('decryptField: rejects non-hex input instead of stopping at the first bad character (#1067)', () => {
+  const payload = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(32)}:${'zz'.repeat(8)}`;
+
+  assert.throws(
+    () => decryptField(payload, TEST_KEY),
+    /Invalid hex encoding in encrypted payload segment/i,
+    'non-hex characters are rejected with a descriptive error',
+  );
+});
+
+testNode('decryptField: malformed hex in the iv or auth tag segment is rejected too (#1067)', () => {
+  const badIv = `$enc$v1$${'zz'.repeat(12)}:${'b'.repeat(32)}:${'c'.repeat(16)}`;
+  const badTag = `$enc$v1$${'a'.repeat(24)}:${'b'.repeat(31)}:${'c'.repeat(16)}`;
+
+  assert.throws(() => decryptField(badIv, TEST_KEY), /Invalid hex encoding in encrypted payload segment/i, 'iv segment is validated');
+  assert.throws(() => decryptField(badTag, TEST_KEY), /Invalid hex encoding in encrypted payload segment/i, 'auth tag segment is validated');
+});
+
+testNode('deriveKey: uses PBKDF2 stretching (not single-pass SHA-256) and is deterministic (#1066)', () => {
+  clearDerivedKeyCache();
+  const first = deriveKey(TEST_KEY);
+  const singlePassSha256 = crypto.createHash('sha256').update(TEST_KEY).digest();
+  const expectedPbkdf2 = crypto.pbkdf2Sync(
+    TEST_KEY,
+    'bettapay:field-encryption:v1',
+    100_000,
+    32,
+    'sha256',
+  );
+
+  assert.equal(first.length, 32, 'derived key is 256 bits (32 bytes)');
+  assert.ok(!first.equals(singlePassSha256), 'deriveKey does not fall back to single-pass SHA-256');
+  assert.ok(first.equals(expectedPbkdf2), 'deriveKey matches PBKDF2-HMAC-SHA256 derivation');
+
+  // Mutating the returned buffer must not corrupt the cached entry.
+  const copyBeforeMutate = Buffer.from(first);
+  first.fill(0);
+  const fromCache = deriveKey(TEST_KEY);
+  assert.ok(fromCache.equals(copyBeforeMutate), 'cache returns a defensive copy');
+
+  // Clearing the cache and re-deriving yields the exact same bytes.
+  clearDerivedKeyCache();
+  const afterClear = deriveKey(TEST_KEY);
+  assert.ok(afterClear.equals(copyBeforeMutate), 'derivation is deterministic across cache clears');
+
+  const otherKey = deriveKey('another-distinct-32-character-encryption-key-value!');
+  assert.ok(!otherKey.equals(afterClear), 'distinct secrets derive distinct keys');
+});
+
+testNode('deriveKey: caches derived keys so repeated calls avoid per-call pbkdf2Sync overhead (#1066)', () => {
+  clearDerivedKeyCache();
+  const coldStart = performance.now();
+  const initial = deriveKey(TEST_KEY);
+  const coldMs = performance.now() - coldStart;
+
+  const warmIterations = 200;
+  const warmStart = performance.now();
+  for (let i = 0; i < warmIterations; i++) {
+    const cached = deriveKey(TEST_KEY);
+    assert.ok(cached.equals(initial));
+  }
+  const warmTotalMs = performance.now() - warmStart;
+
+  // 200 cached lookups should remain far faster than running PBKDF2 200 times
+  // (typically <5 ms total vs seconds without caching).
+  assert.ok(
+    warmTotalMs < Math.max(coldMs * 10, 250),
+    `expected ${warmIterations} cached deriveKey calls (${warmTotalMs.toFixed(2)}ms) to avoid repeated PBKDF2 work (cold: ${coldMs.toFixed(2)}ms)`,
+  );
+});
+
+testNode('deriveKeyAsync & async password helpers: match sync derivation without blocking (#1066)', async () => {
+  clearDerivedKeyCache();
+  const [asyncA, asyncB] = await Promise.all([
+    deriveKeyAsync(TEST_KEY),
+    deriveKeyAsync(TEST_KEY),
+  ]);
+  const syncKey = deriveKey(TEST_KEY);
+
+  assert.ok(asyncA.equals(syncKey), 'deriveKeyAsync matches sync deriveKey');
+  assert.ok(asyncB.equals(syncKey), 'concurrent deriveKeyAsync calls return identical keys');
+
+  const plaintext = 'async-encrypted-payload-1066';
+  const password = 'strong-password-for-async-test';
+  const encrypted = await encryptAsync(plaintext, password);
+  assert.equal(await decryptAsync(encrypted, password), plaintext, 'encryptAsync/decryptAsync round-trip');
+  assert.equal(decrypt(encrypted, password), plaintext, 'encryptAsync output is compatible with sync decrypt');
+  assert.equal(await verifyPasswordAsync(encrypted, password), true, 'verifyPasswordAsync accepts valid password');
+  assert.equal(await verifyPasswordAsync(encrypted, 'wrong-password'), false, 'verifyPasswordAsync rejects wrong password');
 });

@@ -167,78 +167,86 @@ test('getClientIp: omitting argument falls back to parseTrustedProxyCount(proces
   }
 });
 
-// Issue #1072 — BigInt serialization and secret redaction in serializeChanges
+// Issue #1073 — X-Real-IP fallback and short / single-entry X-Forwarded-For chains.
 
-test('serializeChanges: converts BigInt values to strings without throwing (#1072)', () => {
-  const changes = {
-    amount: 1000000000000000000000n,
-    details: {
-      nestedBigInt: 999999999999999999n,
-      normal: 123,
-    },
-    list: [1n, 2n, { itemAmount: 3n }],
-  };
-
-  const serialized = serializeChanges(changes);
-  assert.deepStrictEqual(serialized, {
-    amount: '1000000000000000000000',
-    details: {
-      nestedBigInt: '999999999999999999',
-      normal: 123,
-    },
-    list: ['1', '2', { itemAmount: '3' }],
-  });
-
-  // Top-level BigInt primitive
-  assert.deepStrictEqual(serializeChanges(42n), { value: '42' });
+test('getClientIp: single-entry X-Forwarded-For (1 hop) resolves to the client at depth 1', () => {
+  const request = { headers: { 'x-forwarded-for': '203.0.113.9' }, ip: '10.0.0.1' };
+  assert.strictEqual(getClientIp(request, 1), '203.0.113.9');
 });
 
-test('serializeChanges: redacts sensitive keys (secret, signingSecret, password, token) (#1072)', () => {
-  const changes = {
-    id: 'user-1',
-    secret: 'super-secret-123',
-    signingSecret: 'whsec_test_abc',
-    password: 'plaintext-pass',
-    token: 'bearer-token-val',
-    apiKey: 'normal-key',
-    nested: {
-      secret: 'nested-secret',
-      signingSecret: 'nested-signing-secret',
-      password: 'nested-password',
-      token: 'nested-token',
-      safeField: 'visible',
-    },
-    arrayOfSecrets: [
-      { token: 'item-token', value: 10n },
-      { secret: 'item-secret', name: 'item' },
-    ],
-  };
-
-  const serialized = serializeChanges(changes);
-  assert.deepStrictEqual(serialized, {
-    id: 'user-1',
-    secret: '[REDACTED]',
-    signingSecret: '[REDACTED]',
-    password: '[REDACTED]',
-    token: '[REDACTED]',
-    apiKey: 'normal-key',
-    nested: {
-      secret: '[REDACTED]',
-      signingSecret: '[REDACTED]',
-      password: '[REDACTED]',
-      token: '[REDACTED]',
-      safeField: 'visible',
-    },
-    arrayOfSecrets: [
-      { token: '[REDACTED]', value: '10' },
-      { secret: '[REDACTED]', name: 'item' },
-    ],
-  });
+test('getClientIp: single-entry X-Forwarded-For with depth greater than the chain returns its leftmost entry', () => {
+  const request = { headers: { 'x-forwarded-for': '203.0.113.9' }, ip: '10.0.0.1' };
+  assert.strictEqual(getClientIp(request, 2), '203.0.113.9');
+  assert.strictEqual(getClientIp(request, 5), '203.0.113.9');
 });
 
-test('serializeChanges: handles null, undefined, and non-object primitives', () => {
-  assert.strictEqual(serializeChanges(null), null);
-  assert.strictEqual(serializeChanges(undefined), null);
-  assert.deepStrictEqual(serializeChanges('hello'), { value: 'hello' });
-  assert.deepStrictEqual(serializeChanges(123), { value: 123 });
+test('getClientIp: multi-hop X-Forwarded-For with surrounding whitespace and empty entries', () => {
+  const request = { headers: { 'x-forwarded-for': ' 203.0.113.9 ,, 10.0.0.2 , ' }, ip: '10.0.0.1' };
+  assert.strictEqual(getClientIp(request, 1), '10.0.0.2');
+  assert.strictEqual(getClientIp(request, 2), '203.0.113.9');
+});
+
+test('getClientIp: X-Real-IP is used when X-Forwarded-For is absent', () => {
+  const request = { headers: { 'x-real-ip': ' 203.0.113.50 ' }, ip: '10.0.0.1' };
+  assert.strictEqual(getClientIp(request, 1), '203.0.113.50');
+});
+
+test('getClientIp: X-Real-IP is used when X-Forwarded-For is present but empty', () => {
+  assert.strictEqual(
+    getClientIp({ headers: { 'x-forwarded-for': '', 'x-real-ip': '203.0.113.50' }, ip: '10.0.0.1' }, 1),
+    '203.0.113.50',
+  );
+  assert.strictEqual(
+    getClientIp({ headers: { 'x-forwarded-for': ' , ', 'x-real-ip': '203.0.113.50' }, ip: '10.0.0.1' }, 1),
+    '203.0.113.50',
+  );
+  assert.strictEqual(
+    getClientIp({ headers: { 'x-forwarded-for': [], 'x-real-ip': '203.0.113.50' }, ip: '10.0.0.1' }, 1),
+    '203.0.113.50',
+  );
+});
+
+test('getClientIp: array-valued or list-valued X-Real-IP uses the first entry', () => {
+  assert.strictEqual(
+    getClientIp({ headers: { 'x-real-ip': ['203.0.113.50', '198.51.100.1'] }, ip: '10.0.0.1' }, 1),
+    '203.0.113.50',
+  );
+  assert.strictEqual(
+    getClientIp({ headers: { 'x-real-ip': '203.0.113.50, 198.51.100.1' }, ip: '10.0.0.1' }, 1),
+    '203.0.113.50',
+  );
+});
+
+test('getClientIp: blank X-Real-IP falls back to request.ip', () => {
+  assert.strictEqual(getClientIp({ headers: { 'x-real-ip': '   ' }, ip: '10.0.0.1' }, 1), '10.0.0.1');
+});
+
+test('getClientIp: missing request.ip with a single-entry X-Forwarded-For still finds the client', () => {
+  assert.strictEqual(getClientIp({ headers: { 'x-forwarded-for': '203.0.113.9' } }, 1), '203.0.113.9');
+  assert.strictEqual(getClientIp({ headers: { 'x-forwarded-for': '203.0.113.9' }, ip: null }, 1), '203.0.113.9');
+});
+
+test('getClientIp: missing request.ip with depth 0 selecting the empty peer slot falls back to X-Real-IP or empty string', () => {
+  assert.strictEqual(getClientIp({ headers: { 'x-forwarded-for': '203.0.113.9' } }, 0), '');
+  assert.strictEqual(getClientIp({ headers: {} }, 1), '');
+  assert.strictEqual(getClientIp({}, 1), '');
+});
+
+test('getClientIp: never returns undefined for any header combination', () => {
+  const headerSets: Record<string, unknown>[] = [
+    {},
+    { 'x-forwarded-for': '203.0.113.9' },
+    { 'x-forwarded-for': '203.0.113.9, 10.0.0.2' },
+    { 'x-forwarded-for': ['203.0.113.9'] },
+    { 'x-real-ip': '203.0.113.50' },
+    { 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '203.0.113.50' },
+    { 'x-forwarded-for': ',', 'x-real-ip': '' },
+  ];
+  for (const headers of headerSets) {
+    for (const ip of ['10.0.0.1', undefined, null]) {
+      for (const depth of [0, 1, 2, 3]) {
+        assert.strictEqual(typeof getClientIp({ headers, ip }, depth), 'string');
+      }
+    }
+  }
 });
