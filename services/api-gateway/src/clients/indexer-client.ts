@@ -57,6 +57,12 @@ export const DEFAULT_INDEXER_TIMEOUT_MS = 2_000;
 /** Event type identifying a completed payment on-chain. */
 export const PAYMENT_COMPLETED_TYPE: EventType = 'PaymentCompleted';
 
+export interface IndexerPaginationParams {
+  page?: number;
+  limit?: number;
+  cursor?: string;
+}
+
 export interface IndexerClient {
   /**
    * Fetch on-chain `PaymentCompleted` events related to a merchant.
@@ -64,10 +70,19 @@ export interface IndexerClient {
    * @param merchantId      merchant whose events to fetch
    * @param incomingHeaders inbound request headers; tracing headers
    *                        (x-request-id / x-trace-id) are propagated downstream (#118)
+   * @param pagination      optional pagination parameters (page, limit, cursor)
    * @returns the matching events on success (possibly empty), or `null` when the
    *          indexer is unavailable so the caller can degrade gracefully.
    */
-  getPaymentEvents(merchantId: string, incomingHeaders?: IncomingHeaders): Promise<IndexerEvent[] | null>;
+  getPaymentEvents(
+    merchantId: string,
+    incomingHeaders?: IncomingHeaders,
+    pagination?: IndexerPaginationParams,
+  ): Promise<IndexerEvent[] | null>;
+  getPaymentEvents(
+    merchantId: string,
+    pagination?: IndexerPaginationParams,
+  ): Promise<IndexerEvent[] | null>;
 
   /**
    * Triggers a synthetic test event for a webhook subscription via the indexer.
@@ -104,17 +119,43 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
 
   async function getPaymentEvents(
     merchantId: string,
-    incomingHeaders: IncomingHeaders = {},
+    incomingHeadersOrPagination?: IncomingHeaders | IndexerPaginationParams,
+    pagination?: IndexerPaginationParams,
   ): Promise<IndexerEvent[] | null> {
+    let incomingHeaders: IncomingHeaders = {};
+    let paginationParams: IndexerPaginationParams | undefined = pagination;
+
+    if (incomingHeadersOrPagination) {
+      if (
+        pagination === undefined &&
+        ('page' in incomingHeadersOrPagination ||
+          'limit' in incomingHeadersOrPagination ||
+          'cursor' in incomingHeadersOrPagination)
+      ) {
+        paginationParams = incomingHeadersOrPagination as IndexerPaginationParams;
+      } else {
+        incomingHeaders = incomingHeadersOrPagination as IncomingHeaders;
+      }
+    }
+
     // Auth (#117) + tracing (#118) headers for this inter-service call.
     const headers = propagateTracingHeaders(incomingHeaders, { ...authHeaders });
     // The indexer filters by `?type=` server-side; `merchantId` is forwarded for
     // forward-compatibility (ignored until the indexer decodes it). We still
     // filter by the typed `event.type` client-side as a defensive backstop.
-    const url =
-      `${root}/api/events` +
-      `?type=${encodeURIComponent(PAYMENT_COMPLETED_TYPE)}` +
-      `&merchantId=${encodeURIComponent(merchantId)}`;
+    const query = new URLSearchParams();
+    query.set('type', PAYMENT_COMPLETED_TYPE);
+    query.set('merchantId', merchantId);
+    if (paginationParams?.page !== undefined) {
+      query.set('page', String(paginationParams.page));
+    }
+    if (paginationParams?.limit !== undefined) {
+      query.set('limit', String(paginationParams.limit));
+    }
+    if (paginationParams?.cursor !== undefined) {
+      query.set('cursor', String(paginationParams.cursor));
+    }
+    const url = `${root}/api/events?${query.toString()}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -209,6 +250,19 @@ export function createIndexerClient(options: IndexerClientOptions): IndexerClien
         // We could return null or bubble up the error. We return the JSON error if it conforms, else null.
         if (errorData?.error && typeof errorData.error === 'object' && errorData.error.code === 'NOT_FOUND') {
             throw new Error('NOT_FOUND');
+        }
+        if (res.status === 400 || res.status === 403) {
+          const errorMsg =
+            (typeof errorData?.error === 'string'
+              ? errorData.error
+              : errorData?.error?.message) ??
+            errorData?.message ??
+            (res.status === 403 ? 'Forbidden' : 'Bad Request');
+          return {
+            success: false,
+            statusCode: res.status,
+            error: errorMsg,
+          };
         }
         return null;
       }

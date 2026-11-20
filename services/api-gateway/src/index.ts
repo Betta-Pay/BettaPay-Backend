@@ -2383,6 +2383,9 @@ fastify.get('/api/admin/auth/ip-score', {
             .code(503)
             .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
         }
+        if (testResult.statusCode && (testResult.statusCode === 400 || testResult.statusCode === 403)) {
+          return reply.code(testResult.statusCode).send(testResult);
+        }
         return reply.send(testResult);
       } catch (err) {
         if (err instanceof Error && err.message === 'NOT_FOUND') {
@@ -4388,6 +4391,7 @@ const start = async () => {
         app.log,
         env.PAYMENT_ABANDONMENT_HOURS,
         webhookQueue,
+        redis,
       );
       startIdempotencyKeyCleanupCron(prisma, app.log, { redis });
     }

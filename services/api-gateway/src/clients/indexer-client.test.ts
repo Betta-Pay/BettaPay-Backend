@@ -188,3 +188,90 @@ test('getPaymentEvents returns null on malformed JSON body', async (t) => {
   t.equal(events, null, 'parse failure degrades to null');
   t.end();
 });
+
+test('getPaymentEvents forwards pagination query params (page and limit) to indexer', async (t) => {
+  let calledUrl = '';
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async (url) => {
+      calledUrl = String(url);
+      return jsonResponse(eventsBody(PAYMENT_COMPLETED_TYPE));
+    },
+  });
+
+  await client.getPaymentEvents('merchant_1', { page: 3, limit: 25 });
+  t.ok(calledUrl.includes('page=3'), 'forwards page parameter');
+  t.ok(calledUrl.includes('limit=25'), 'forwards limit parameter');
+  t.ok(calledUrl.includes('merchantId=merchant_1'), 'still forwards merchantId');
+
+  // Also test with incomingHeaders and pagination params as 3rd arg
+  calledUrl = '';
+  await client.getPaymentEvents('merchant_1', { 'x-request-id': 'req-99' }, { page: 4, limit: 10 });
+  t.ok(calledUrl.includes('page=4'), 'forwards page parameter when passed with headers');
+  t.ok(calledUrl.includes('limit=10'), 'forwards limit parameter when passed with headers');
+  t.end();
+});
+
+test('getPaymentEvents forwards cursor parameter to indexer', async (t) => {
+  let calledUrl = '';
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async (url) => {
+      calledUrl = String(url);
+      return jsonResponse(eventsBody(PAYMENT_COMPLETED_TYPE));
+    },
+  });
+
+  await client.getPaymentEvents('merchant_1', { cursor: 'cursor_12345' });
+  t.ok(calledUrl.includes('cursor=cursor_12345'), 'forwards cursor parameter');
+  t.end();
+});
+
+test('testWebhook preserves 400 error response from upstream', async (t) => {
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async () =>
+      jsonResponse(
+        { error: { code: 'VALIDATION_ERROR', message: 'Target host is not allowed' } },
+        false,
+        400,
+      ),
+  });
+
+  const result = await client.testWebhook('wh_1', 'mch_1');
+  t.ok(result, 'returns result instead of null');
+  t.equal(result?.success, false, 'marked as failure');
+  t.equal(result?.statusCode, 400, 'preserves 400 status code');
+  t.equal(result?.error, 'Target host is not allowed', 'preserves upstream error message');
+  t.end();
+});
+
+test('testWebhook preserves 403 error response from upstream', async (t) => {
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async () =>
+      jsonResponse(
+        { error: { code: 'FORBIDDEN', message: 'Cannot test webhook owned by another merchant' } },
+        false,
+        403,
+      ),
+  });
+
+  const result = await client.testWebhook('wh_1', 'mch_1');
+  t.ok(result, 'returns result instead of null');
+  t.equal(result?.success, false, 'marked as failure');
+  t.equal(result?.statusCode, 403, 'preserves 403 status code');
+  t.equal(result?.error, 'Cannot test webhook owned by another merchant', 'preserves upstream error message');
+  t.end();
+});
+
+test('testWebhook degrades to null on 500 or upstream failure', async (t) => {
+  const client = createIndexerClient({
+    baseUrl: BASE,
+    fetchImpl: async () => jsonResponse({}, false, 500),
+  });
+
+  const result = await client.testWebhook('wh_1', 'mch_1');
+  t.equal(result, null, 'returns null on 500 upstream server error');
+  t.end();
+});

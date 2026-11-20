@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import { Asset, Operation } from '@stellar/stellar-sdk';
-import { buildPaymentOperation, buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
+import { buildPaymentOperation, buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount, formatAmount } from './index.js';
 
 const VALID_KEY = 'GCCTLHSAZTFDGPG4IT4HHGOUFHSX6K4VUEKXCGWP2ZWG2U3FUO4HOAZO';
 
