@@ -103,6 +103,17 @@ let cache: RateCache = {
   rateCachedAt: Object.fromEntries(Object.keys(FALLBACK_RATES).map((c) => [c, initialTime])),
 };
 
+/** @internal exported for testing only */
+export function setRateCacheTimestampsForTesting(
+  cachedAt: number,
+  rateCachedAt: Record<string, number>,
+): { cachedAt: number; rateCachedAt: Record<string, number> } {
+  const prev = { cachedAt: cache.cachedAt, rateCachedAt: { ...cache.rateCachedAt } };
+  cache.cachedAt = cachedAt;
+  cache.rateCachedAt = { ...rateCachedAt };
+  return prev;
+}
+
 // ── Computed pair-rate cache (issue #55) ───────────────────────────────────
 // Avoids recomputing the same cross/inverse rate on every request.
 // Keyed by "FROM_TO" (e.g. "USDC_EURT", "NGN_USDC").
@@ -1339,8 +1350,13 @@ fastify.get(
     }
     logRateStalenessIfStale(fastify.log, `${from}_${to}`);
 
-    const stalenessSeconds = Math.floor((resolvedAt - cache.cachedAt) / 1000);
-    if (stalenessSeconds > env.MAX_STALE_SECONDS) {
+    const oldestPairCachedAt = Math.min(
+      cache.rateCachedAt[from] ?? cache.cachedAt,
+      cache.rateCachedAt[to] ?? cache.cachedAt,
+    );
+    const stalenessSeconds = Math.floor((resolvedAt - oldestPairCachedAt) / 1000);
+    const isStale = stalenessSeconds > env.MAX_STALE_SECONDS;
+    if (isStale) {
       reply.header("X-FX-Stale", "true");
     }
 
@@ -1382,6 +1398,7 @@ fastify.get(
         QUOTE_CLEANUP_TTL_MS,
       );
     } catch (err) {
+      fxQuoteCacheWriteFailuresTotal.inc();
       fastify.log.warn(
         { err },
         "Failed to store quote; quote will not be verifiable",
@@ -1405,7 +1422,7 @@ fastify.get(
       rate: quote.rate,
       slippageBps: quote.slippageBps,
       slippageLimit: quote.slippageLimit,
-      stale:         Math.floor((resolvedAt - Math.min(cache.rateCachedAt[quote.from] ?? cache.cachedAt, cache.rateCachedAt[quote.to] ?? cache.cachedAt)) / 1000) > env.MAX_STALE_SECONDS,
+      stale:         isStale,
       cachedAt:      new Date(cache.cachedAt).toISOString(),
       expiresAt:     new Date(quote.expiresAt).toISOString(),
       rateBatchId:   quote.rateBatchId,
@@ -1746,6 +1763,11 @@ const fxQuoteCacheHitsTotal = new promClient.Counter({
 const fxQuoteCacheMissesTotal = new promClient.Counter({
   name: "fx_quote_cache_misses_total",
   help: "Total number of FX quote resolutions that required a live rate computation",
+});
+// Issue #1049 — FX quote cache write failure counter
+export const fxQuoteCacheWriteFailuresTotal = new promClient.Counter({
+  name: "fx_quote_cache_write_failures_total",
+  help: "Total number of failures persisting FX quotes to Redis",
 });
 
 // Served on its own port (see startMetricsServer below), not on the

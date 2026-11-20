@@ -7,26 +7,96 @@ process.env.LOG_LEVEL = 'silent';
 
 import test from 'tape';
 
-const { fastify } = await import('./index.js');
+const {
+  fastify,
+  fxQuoteCacheWriteFailuresTotal,
+  setRateCacheTimestampsForTesting,
+  setRedisClientForTesting,
+} = await import('./index.js');
 
-test('GET /api/quote returns X-FX-Stale header when stale', async (t) => {
+test('#1049: GET /api/quote aligns X-FX-Stale header with body stale flag when pair rate is stale', async (t) => {
   await fastify.ready();
-  
-  // We cannot easily manipulate the internal cache date, but we can verify it doesn't crash
-  // and check the header logic. We'll simulate a request.
-  
-  // In a real test environment, the mock cache is stale if Date.now() is much larger than cachedAt.
-  const res = await fastify.inject({
-    method: 'GET',
-    url: '/api/quote?from=USDC&to=NGN&amount=100',
+  const now = Date.now();
+  const prevCache = setRateCacheTimestampsForTesting(now, {
+    USDC: now - 600_000, // stale (> 300s), even though cache.cachedAt is fresh
+    NGN: now,
   });
-  
-  t.equal(res.statusCode, 200, 'returns 200 OK');
-  
-  // Depending on how fastify initialized, it might or might not be stale. 
-  // We just want to ensure no crashes occurred.
-  t.pass('Header logic executed successfully');
-  
+  const prevRedis = setRedisClientForTesting({
+    set: async () => 'OK',
+  });
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/quote?from=USDC&to=NGN&amount=100',
+    });
+
+    t.equal(res.statusCode, 200, 'returns 200 OK');
+    const body = res.json();
+    t.equal(body.stale, true, 'body stale flag is true');
+    t.equal(res.headers['x-fx-stale'], 'true', 'X-FX-Stale header matches body stale=true');
+  } finally {
+    setRateCacheTimestampsForTesting(prevCache.cachedAt, prevCache.rateCachedAt);
+    setRedisClientForTesting(prevRedis);
+  }
+  t.end();
+});
+
+test('#1049: GET /api/quote omits X-FX-Stale header when body stale flag is false', async (t) => {
+  await fastify.ready();
+  const now = Date.now();
+  const prevCache = setRateCacheTimestampsForTesting(now, {
+    USDC: now,
+    NGN: now,
+  });
+  const prevRedis = setRedisClientForTesting({
+    set: async () => 'OK',
+  });
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/quote?from=USDC&to=NGN&amount=100',
+    });
+
+    t.equal(res.statusCode, 200, 'returns 200 OK');
+    const body = res.json();
+    t.equal(body.stale, false, 'body stale flag is false');
+    t.equal(res.headers['x-fx-stale'], undefined, 'X-FX-Stale header omitted when stale=false');
+  } finally {
+    setRateCacheTimestampsForTesting(prevCache.cachedAt, prevCache.rateCachedAt);
+    setRedisClientForTesting(prevRedis);
+  }
+  t.end();
+});
+
+test('#1049: GET /api/quote increments fx_quote_cache_write_failures_total when Redis set fails', async (t) => {
+  await fastify.ready();
+  const prevRedis = setRedisClientForTesting({
+    set: async () => {
+      throw new Error('Redis write failed');
+    },
+  });
+
+  const beforeMetric = await fxQuoteCacheWriteFailuresTotal.get();
+  const beforeValue = beforeMetric.values[0]?.value ?? 0;
+
+  try {
+    const res = await fastify.inject({
+      method: 'GET',
+      url: '/api/quote?from=USDC&to=NGN&amount=100',
+    });
+
+    t.equal(res.statusCode, 200, 'still returns 200 OK when Redis set fails');
+    const body = res.json();
+    t.equal(body.quoteId, null, 'quoteId is null when Redis set fails');
+
+    const afterMetric = await fxQuoteCacheWriteFailuresTotal.get();
+    const afterValue = afterMetric.values[0]?.value ?? 0;
+    t.equal(afterValue, beforeValue + 1, 'fx_quote_cache_write_failures_total incremented by 1');
+  } finally {
+    setRedisClientForTesting(prevRedis);
+  }
   t.end();
   process.exit(0);
 });
