@@ -3,7 +3,7 @@
  * Provides helpers for interacting with the Stellar blockchain
  */
 
-import { StrKey, Keypair } from '@stellar/stellar-sdk';
+import { StrKey, Keypair, Asset, Operation, xdr, type OperationType } from '@stellar/stellar-sdk';
 
 type Amount = string;
 type Stroops = string;
@@ -111,18 +111,89 @@ export function formatAmount(amount: Stroops, decimals: number = 7): Amount {
   return fromStellarAmount(amount, decimals);
 }
 
-export function buildPaymentOperation(params: { source?: string; destination: string; asset: string; amount: Amount }){
-  // Placeholder: return normalized operation object
-  return {
-    type: 'payment',
-    source: params.source || null,
-    destination: params.destination,
-    asset: params.asset,
-    amount: params.amount
-  };
+/** Max amount representable on Stellar: int64 stroops. */
+const MAX_INT64_STROOPS = (2n ** 63n) - 1n;
+
+function isValidAccountId(address: string): boolean {
+  // Payments accept both G… accounts and M… muxed accounts.
+  return StrKey.isValidEd25519PublicKey(address) || StrKey.isValidMed25519PublicKey(address);
 }
 
-export function buildSetOptionsOp(params: any) {
+/**
+ * Resolves an asset given either as an `Asset` instance or as a string:
+ * `'native'` / `'XLM'` for lumens, or `'CODE:ISSUER'` for issued assets.
+ */
+function resolveAsset(asset: Asset | string): Asset {
+  if (asset instanceof Asset) return asset;
+  if (typeof asset !== 'string') throw new Error('asset must be an Asset or a string');
+  if (asset === 'native' || asset === 'XLM') return Asset.native();
+
+  const [code, issuer, ...rest] = asset.split(':');
+  if (rest.length > 0 || !code || !issuer) {
+    throw new Error("asset must be 'native', 'XLM', or 'CODE:ISSUER'");
+  }
+  if (!/^[a-zA-Z0-9]{1,12}$/.test(code)) throw new Error('asset code must be 1-12 alphanumeric characters');
+  if (!validateStellarAddress(issuer)) throw new Error('asset issuer must be a valid Stellar address');
+  return new Asset(code, issuer);
+}
+
+/**
+ * Builds a validated Stellar payment operation (#1089).
+ *
+ * Inputs are checked up front so bad addresses or amounts fail here with a
+ * clear error rather than late at transaction submission.
+ *
+ * @throws {Error} If source/destination are not valid Stellar addresses, the
+ *   asset is malformed, or the amount is not a positive decimal with at most
+ *   7 fractional digits.
+ */
+export function buildPaymentOperation(params: {
+  source?: string;
+  destination: string;
+  asset: Asset | string;
+  amount: Amount;
+}): xdr.Operation<Operation.Payment> {
+  if (params.source !== undefined && !isValidAccountId(params.source)) {
+    throw new Error('source must be a valid Stellar address');
+  }
+  if (typeof params.destination !== 'string' || !isValidAccountId(params.destination)) {
+    throw new Error('destination must be a valid Stellar address');
+  }
+  if (typeof params.amount !== 'string' || !/^\d+(\.\d{1,7})?$/.test(params.amount)) {
+    throw new Error('amount must be a decimal string with at most 7 fractional digits');
+  }
+  const stroops = BigInt(toStellarAmount(params.amount));
+  if (stroops <= 0n) throw new Error('amount must be greater than zero');
+  if (stroops > MAX_INT64_STROOPS) throw new Error('amount exceeds the maximum Stellar amount');
+
+  return Operation.payment({
+    destination: params.destination,
+    asset: resolveAsset(params.asset),
+    amount: params.amount,
+    ...(params.source !== undefined ? { source: params.source } : {}),
+  });
+}
+
+/** Input accepted by buildSetOptionsOp — thresholds/weights are integers 0–255. */
+export interface SetOptionsParams {
+  masterWeight?: number;
+  lowThreshold?: number;
+  medThreshold?: number;
+  highThreshold?: number;
+  signer?: { key: string; weight: number };
+}
+
+/** Normalized setOptions operation returned by buildSetOptionsOp. */
+export interface SetOptionsOperation {
+  type: OperationType.SetOptions;
+  masterWeight: number | null;
+  lowThreshold: number | null;
+  medThreshold: number | null;
+  highThreshold: number | null;
+  signer: { key: string; weight: number } | null;
+}
+
+export function buildSetOptionsOp(params: SetOptionsParams): SetOptionsOperation {
   if (params.masterWeight !== undefined) {
     if (!Number.isInteger(params.masterWeight) || params.masterWeight < 0 || params.masterWeight > 255) throw new Error('masterWeight must be an integer between 0 and 255');
   }

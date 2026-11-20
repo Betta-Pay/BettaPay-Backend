@@ -4,7 +4,8 @@
  * A single shared Pino configuration used by every service so log level,
  * PII redaction, serialization, and formatting are consistent across the mesh:
  *  - level from `LOG_LEVEL` (default `info`)
- *  - redaction of sensitive fields (secret, token, secretHash, password, authorization)
+ *  - redaction of sensitive fields (secret, token, secretHash, password, authorization,
+ *    signingSecret, apiKey, cookie, set-cookie)
  *  - compact `req`/`res` serializers
  *  - pretty-printing in development, JSON in production
  */
@@ -19,14 +20,31 @@ const REDACT_PATHS = [
   'secretHash',
   'password',
   'authorization',
+  // Webhook signing secrets, API keys and HTTP cookies (#1081).
+  'signingSecret',
+  'apiKey',
+  'cookie',
+  '["set-cookie"]',
   '*.secret',
   '*.token',
   '*.secretHash',
   '*.password',
+  '*.signingSecret',
+  '*.apiKey',
+  '*.cookie',
+  '*["set-cookie"]',
+  '*.*.signingSecret',
+  '*.*.apiKey',
   'req.headers.authorization',
   'req.headers["x-service-token"]',
+  'req.headers.cookie',
+  'req.headers["x-api-key"]',
+  'res.headers["set-cookie"]',
   'headers.authorization',
   'headers["x-service-token"]',
+  'headers.cookie',
+  'headers["set-cookie"]',
+  'headers["x-api-key"]',
 ];
 
 export interface LoggerConfigOptions {

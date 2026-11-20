@@ -14,6 +14,7 @@
  * Prerequisites:
  *   - FIELD_ENCRYPTION_KEY environment variable must be set (min 32 chars)
  *   - Database connection configured via DATABASE_URL
+ *   - Optional ENCRYPT_BATCH_SIZE (default 500) controls rows fetched per batch
  *
  * Safety:
  *   - Backs up secrets before encryption
@@ -21,14 +22,24 @@
  *   - Atomic updates per row (no partial failures)
  */
 
+import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import pg from "pg";
 import {
   encryptField,
   decryptField,
   isEncrypted,
 } from "@bettapay/validation";
 
-const prisma = new PrismaClient();
+// Prisma 7 with prisma.config.ts requires an explicit driver adapter (#1099)
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
+
+// Rows are fetched in bounded, id-ordered cursor batches so memory stays flat
+// regardless of table size (#1099)
+const BATCH_SIZE = Number(process.env.ENCRYPT_BATCH_SIZE) || 500;
 
 interface Stats {
   webhookSubscriptions: {
@@ -46,47 +57,55 @@ interface Stats {
 async function encryptWebhookSubscriptions(
   dryRun: boolean,
 ): Promise<Stats["webhookSubscriptions"]> {
-  const subscriptions = await prisma.webhookSubscription.findMany({
-    where: { signingSecret: { not: null } },
-    select: { id: true, signingSecret: true },
-  });
+  const stats = { total: 0, encrypted: 0, alreadyEncrypted: 0 };
+  let cursor: string | undefined;
 
-  const stats = {
-    total: subscriptions.length,
-    encrypted: 0,
-    alreadyEncrypted: 0,
-  };
+  for (;;) {
+    const subscriptions = await prisma.webhookSubscription.findMany({
+      where: { signingSecret: { not: null } },
+      select: { id: true, signingSecret: true },
+      orderBy: { id: "asc" },
+      take: BATCH_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (subscriptions.length === 0) break;
 
-  for (const sub of subscriptions) {
-    if (!sub.signingSecret) continue;
+    stats.total += subscriptions.length;
+    cursor = subscriptions[subscriptions.length - 1].id;
 
-    if (isEncrypted(sub.signingSecret)) {
-      stats.alreadyEncrypted++;
-      console.log(`[SKIP] WebhookSubscription ${sub.id} already encrypted`);
-      continue;
+    for (const sub of subscriptions) {
+      if (!sub.signingSecret) continue;
+
+      if (isEncrypted(sub.signingSecret)) {
+        stats.alreadyEncrypted++;
+        console.log(`[SKIP] WebhookSubscription ${sub.id} already encrypted`);
+        continue;
+      }
+
+      const encrypted = encryptField(sub.signingSecret);
+
+      // Validate encryption by decrypting
+      const decrypted = decryptField(encrypted);
+      if (decrypted !== sub.signingSecret) {
+        throw new Error(
+          `Encryption validation failed for WebhookSubscription ${sub.id}`,
+        );
+      }
+
+      if (dryRun) {
+        console.log(`[DRY-RUN] Would encrypt WebhookSubscription ${sub.id}`);
+      } else {
+        await prisma.webhookSubscription.update({
+          where: { id: sub.id },
+          data: { signingSecret: encrypted },
+        });
+        console.log(`[ENCRYPTED] WebhookSubscription ${sub.id}`);
+      }
+
+      stats.encrypted++;
     }
 
-    const encrypted = encryptField(sub.signingSecret);
-
-    // Validate encryption by decrypting
-    const decrypted = decryptField(encrypted);
-    if (decrypted !== sub.signingSecret) {
-      throw new Error(
-        `Encryption validation failed for WebhookSubscription ${sub.id}`,
-      );
-    }
-
-    if (dryRun) {
-      console.log(`[DRY-RUN] Would encrypt WebhookSubscription ${sub.id}`);
-    } else {
-      await prisma.webhookSubscription.update({
-        where: { id: sub.id },
-        data: { signingSecret: encrypted },
-      });
-      console.log(`[ENCRYPTED] WebhookSubscription ${sub.id}`);
-    }
-
-    stats.encrypted++;
+    if (subscriptions.length < BATCH_SIZE) break;
   }
 
   return stats;
@@ -95,49 +114,59 @@ async function encryptWebhookSubscriptions(
 async function encryptWebhookDeliveries(
   dryRun: boolean,
 ): Promise<Stats["webhookDeliveries"]> {
-  const deliveries = await (prisma as any).indexedEventWebhookDelivery.findMany(
-    {
+  const stats = { total: 0, encrypted: 0, alreadyEncrypted: 0 };
+  let cursor: string | undefined;
+
+  for (;;) {
+    const deliveries = await prisma.indexedEventWebhookDelivery.findMany({
       where: { signingSecret: { not: null } },
       select: { id: true, signingSecret: true },
-    },
-  );
+      orderBy: { id: "asc" },
+      take: BATCH_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (deliveries.length === 0) break;
 
-  const stats = { total: deliveries.length, encrypted: 0, alreadyEncrypted: 0 };
+    stats.total += deliveries.length;
+    cursor = deliveries[deliveries.length - 1].id;
 
-  for (const delivery of deliveries) {
-    if (!delivery.signingSecret) continue;
+    for (const delivery of deliveries) {
+      if (!delivery.signingSecret) continue;
 
-    if (isEncrypted(delivery.signingSecret)) {
-      stats.alreadyEncrypted++;
-      console.log(
-        `[SKIP] IndexedEventWebhookDelivery ${delivery.id} already encrypted`,
-      );
-      continue;
+      if (isEncrypted(delivery.signingSecret)) {
+        stats.alreadyEncrypted++;
+        console.log(
+          `[SKIP] IndexedEventWebhookDelivery ${delivery.id} already encrypted`,
+        );
+        continue;
+      }
+
+      const encrypted = encryptField(delivery.signingSecret);
+
+      // Validate encryption by decrypting
+      const decrypted = decryptField(encrypted);
+      if (decrypted !== delivery.signingSecret) {
+        throw new Error(
+          `Encryption validation failed for IndexedEventWebhookDelivery ${delivery.id}`,
+        );
+      }
+
+      if (dryRun) {
+        console.log(
+          `[DRY-RUN] Would encrypt IndexedEventWebhookDelivery ${delivery.id}`,
+        );
+      } else {
+        await prisma.indexedEventWebhookDelivery.update({
+          where: { id: delivery.id },
+          data: { signingSecret: encrypted },
+        });
+        console.log(`[ENCRYPTED] IndexedEventWebhookDelivery ${delivery.id}`);
+      }
+
+      stats.encrypted++;
     }
 
-    const encrypted = encryptField(delivery.signingSecret);
-
-    // Validate encryption by decrypting
-    const decrypted = decryptField(encrypted);
-    if (decrypted !== delivery.signingSecret) {
-      throw new Error(
-        `Encryption validation failed for IndexedEventWebhookDelivery ${delivery.id}`,
-      );
-    }
-
-    if (dryRun) {
-      console.log(
-        `[DRY-RUN] Would encrypt IndexedEventWebhookDelivery ${delivery.id}`,
-      );
-    } else {
-      await (prisma as any).indexedEventWebhookDelivery.update({
-        where: { id: delivery.id },
-        data: { signingSecret: encrypted },
-      });
-      console.log(`[ENCRYPTED] IndexedEventWebhookDelivery ${delivery.id}`);
-    }
-
-    stats.encrypted++;
+    if (deliveries.length < BATCH_SIZE) break;
   }
 
   return stats;
@@ -189,4 +218,7 @@ main()
     console.error("❌ Migration failed:", err);
     process.exit(1);
   })
-  .finally(() => prisma.$disconnect());
+  .finally(async () => {
+    await prisma.$disconnect();
+    await pool.end();
+  });

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount, formatAmount } from './index.js';
+import { Asset, Operation } from '@stellar/stellar-sdk';
+import { buildPaymentOperation, buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
 
 const VALID_KEY = 'GCCTLHSAZTFDGPG4IT4HHGOUFHSX6K4VUEKXCGWP2ZWG2U3FUO4HOAZO';
 
@@ -402,5 +403,72 @@ test('buildSetOptionsOp', async (t) => {
     assert.strictEqual(op.medThreshold, 2);
     assert.strictEqual(op.highThreshold, 3);
     assert.deepStrictEqual(op.signer, { key: VALID_KEY, weight: 1 });
+  });
+});
+
+test('buildPaymentOperation (#1089)', async (t) => {
+  const ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+
+  await t.test('builds a native payment operation', () => {
+    const op = buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '10.5' });
+    const decoded = Operation.fromXDRObject(op);
+    assert.strictEqual(decoded.type, 'payment');
+    if (decoded.type !== 'payment') return;
+    assert.strictEqual(decoded.destination, VALID_KEY);
+    assert.ok(decoded.asset.isNative());
+    assert.strictEqual(decoded.amount, '10.5000000');
+  });
+
+  await t.test('builds an issued-asset payment from CODE:ISSUER and Asset instances', () => {
+    for (const asset of [`USDC:${ISSUER}`, new Asset('USDC', ISSUER)]) {
+      const decoded = Operation.fromXDRObject(buildPaymentOperation({ destination: VALID_KEY, asset, amount: '1' }));
+      if (decoded.type !== 'payment') return assert.fail('expected payment');
+      assert.strictEqual(decoded.asset.getCode(), 'USDC');
+      assert.strictEqual(decoded.asset.getIssuer(), ISSUER);
+    }
+  });
+
+  await t.test('sets the source account when provided', () => {
+    const decoded = Operation.fromXDRObject(buildPaymentOperation({ source: ISSUER, destination: VALID_KEY, asset: 'XLM', amount: '1' }));
+    assert.strictEqual(decoded.source, ISSUER);
+  });
+
+  await t.test('rejects an invalid destination', () => {
+    assert.throws(
+      () => buildPaymentOperation({ destination: 'NOTAKEY', asset: 'native', amount: '1' }),
+      /destination must be a valid Stellar address/,
+    );
+  });
+
+  await t.test('rejects an invalid source', () => {
+    assert.throws(
+      () => buildPaymentOperation({ source: 'GBAD', destination: VALID_KEY, asset: 'native', amount: '1' }),
+      /source must be a valid Stellar address/,
+    );
+  });
+
+  await t.test('rejects zero and negative amounts', () => {
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '0' }), /greater than zero/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '0.0000000' }), /greater than zero/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '-5' }), /decimal string/);
+  });
+
+  await t.test('rejects malformed amounts and excess precision', () => {
+    for (const amount of ['', 'abc', '1e5', '1.', '.5', '1.12345678']) {
+      assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount }), /decimal string/, amount);
+    }
+  });
+
+  await t.test('rejects amounts above the int64 stroop limit', () => {
+    assert.throws(
+      () => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '922337203685.4775808' }),
+      /exceeds the maximum/,
+    );
+  });
+
+  await t.test('rejects malformed assets', () => {
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'USDC', amount: '1' }), /CODE:ISSUER/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'USDC:NOTAKEY', amount: '1' }), /issuer must be a valid/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: `TOOLONGASSETCODE:${ISSUER}`, amount: '1' }), /1-12 alphanumeric/);
   });
 });
