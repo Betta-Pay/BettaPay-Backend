@@ -369,7 +369,7 @@ webhookQueue.on("error", (err) => {
 
 // ── Replay queue & worker ─────────────────────────────────────────────────────
 
-const replayQueue = new Queue("indexer-replays", {
+export const replayQueue = new Queue("indexer-replays", {
   connection: sharedRedis,
   defaultJobOptions: {
     attempts: 2,
@@ -380,7 +380,7 @@ const replayQueue = new Queue("indexer-replays", {
 });
 
 // #386 — exponential backoff retry strategy
-const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
+export const replayProgressRedis = createRedisClient(env.REDIS_URL, fastify.log);
 replayProgressRedis.on("error", (err) =>
   fastify.log.warn(
     { err: err.message },
@@ -1181,7 +1181,23 @@ fastify.post(
       );
     }
 
-    const job = await replayQueue.add("replay", { fromLedger, toLedger });
+    let job;
+    try {
+      job = await replayQueue.add("replay", { fromLedger, toLedger });
+    } catch (err) {
+      fastify.log.error(
+        { err, fromLedger, toLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1272,12 +1288,28 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
       );
     }
 
-    const job = await replayQueue.add("replay-contract", {
-      contractId,
-      fromLedger: startLedger,
-      toLedger: endLedger,
-      force,
-    });
+    let job;
+    try {
+      job = await replayQueue.add("replay-contract", {
+        contractId,
+        fromLedger: startLedger,
+        toLedger: endLedger,
+        force,
+      });
+    } catch (err) {
+      fastify.log.error(
+        { err, contractId, fromLedger: startLedger, toLedger: endLedger, reqId: request.id },
+        "[Indexer] Failed to enqueue per-contract replay job",
+      );
+      return reply.code(503).send(
+        createErrorResponse(
+          "SERVICE_UNAVAILABLE",
+          "Replay queue is temporarily unavailable",
+          undefined,
+          request.id,
+        ),
+      );
+    }
 
     return reply.code(202).send({
       jobId: job.id,
@@ -1293,6 +1325,8 @@ fastify.post<{ Params: { contractId: string }; Body: unknown }>(
   },
 );
 
+const REPLAY_JOB_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+
 // Issue #229 — replay job progress status
 // Internal endpoint — job introspection leaks worker activity to anonymous
 // callers, so it requires a valid x-service-token like the other replay
@@ -1302,6 +1336,16 @@ fastify.get<{ Params: { jobId: string } }>(
   { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { jobId } = request.params;
+    if (!REPLAY_JOB_ID_REGEX.test(jobId)) {
+      return reply.code(400).send(
+        createErrorResponse(
+          ErrorCodes.VALIDATION_ERROR,
+          "Invalid jobId format",
+          { jobId },
+          request.id,
+        ),
+      );
+    }
     try {
       const raw = await replayProgressRedis.get(
         `${PROGRESS_KEY_PREFIX}${jobId}`,
