@@ -8,6 +8,7 @@ import {
   isPositiveFiniteAmount,
   POSITIVE_AMOUNT_MESSAGE,
   resolveFxQuoteBodyLimit,
+  SAME_CURRENCY_MESSAGE,
 } from "./validation.js";
 
 test("quote query validation applies the production slippage ceiling", () => {
@@ -37,6 +38,38 @@ test("quote amount validation accepts a positive finite amount", () => {
   const parsed = schema.parse({ amount: "250.75" });
   assert.equal(parsed.amount, "250.75");
   assert.equal(isPositiveFiniteAmount("0.0001"), true);
+});
+
+test("quote query rejects identical from/to currencies (#1042)", () => {
+  for (const nodeEnv of ["production", "development"]) {
+    const schema = createQuoteQuerySchema(nodeEnv);
+
+    for (const currency of ["USDC", "EURT", "NGN"]) {
+      const result = schema.safeParse({ from: currency, to: currency });
+      assert.equal(result.success, false, `${currency} -> ${currency} is rejected in ${nodeEnv}`);
+      if (!result.success) {
+        assert.equal(result.error.errors[0].message, SAME_CURRENCY_MESSAGE);
+        assert.deepEqual(result.error.errors[0].path, ["to"]);
+      }
+    }
+  }
+});
+
+test("quote query rejects a same-currency pair that only matches via the defaults (#1042)", () => {
+  const schema = createQuoteQuerySchema("development");
+
+  // `to` defaults to NGN, so an explicit from=NGN collapses to NGN -> NGN
+  assert.equal(schema.safeParse({ from: "NGN" }).success, false);
+  // `from` defaults to USDC, so an explicit to=USDC collapses to USDC -> USDC
+  assert.equal(schema.safeParse({ to: "USDC" }).success, false);
+});
+
+test("quote query still accepts valid currency pairs (#1042)", () => {
+  const schema = createQuoteQuerySchema("development");
+
+  assert.deepEqual(schema.parse({}), { from: "USDC", to: "NGN", amount: "1" });
+  assert.equal(schema.parse({ from: "USDC", to: "EURT" }).to, "EURT");
+  assert.equal(schema.parse({ from: "EURT", to: "NGN", amount: "10" }).from, "EURT");
 });
 
 test("quote body limit is configurable and falls back safely", () => {

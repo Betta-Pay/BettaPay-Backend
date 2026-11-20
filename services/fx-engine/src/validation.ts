@@ -27,25 +27,33 @@ export function isPositiveFiniteAmount(value: string): boolean {
 export const POSITIVE_AMOUNT_MESSAGE =
   "amount must be a positive finite number";
 
+export const SAME_CURRENCY_MESSAGE = "from and to must be different currencies";
+
 export const createQuoteQuerySchema = (nodeEnv?: string) =>
   envAwareSchema(nodeEnv, ({ isProduction }) =>
-    z.object({
-      from: CurrencyCode.default("USDC"),
-      to: CurrencyCode.default("NGN"),
-      amount: z
-        .string()
-        .refine(isPositiveFiniteAmount, { message: POSITIVE_AMOUNT_MESSAGE })
-        .default("1"),
-      slippageBps: z
-        .string()
-        .regex(/^\d+$/, "slippageBps must be a non-negative integer")
-        .refine((value) => parseInt(value, 10) <= (isProduction ? 1000 : 5000), {
-          message: isProduction
-            ? "slippageBps must be between 0 and 1000"
-            : "slippageBps must be between 0 and 5000",
-        })
-        .optional(),
-    }),
+    z
+      .object({
+        from: CurrencyCode.default("USDC"),
+        to: CurrencyCode.default("NGN"),
+        amount: z
+          .string()
+          .refine(isPositiveFiniteAmount, { message: POSITIVE_AMOUNT_MESSAGE })
+          .default("1"),
+        slippageBps: z
+          .string()
+          .regex(/^\d+$/, "slippageBps must be a non-negative integer")
+          .refine((value) => parseInt(value, 10) <= (isProduction ? 1000 : 5000), {
+            message: isProduction
+              ? "slippageBps must be between 0 and 1000"
+              : "slippageBps must be between 0 and 5000",
+          })
+          .optional(),
+      })
+      // #1042 — a same-currency quote is meaningless; reject it at validation time.
+      .refine((q) => q.from.toUpperCase() !== q.to.toUpperCase(), {
+        message: SAME_CURRENCY_MESSAGE,
+        path: ["to"],
+      }),
   );
 
 export const createHistoryQuerySchema = (nodeEnv?: string) =>
