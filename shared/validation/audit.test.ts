@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { getClientIp, parseTrustedProxyCount } from './audit.js';
+import { getClientIp, parseTrustedProxyCount, serializeChanges } from './audit.js';
 
 // Issue #621 & #866 — getClientIp trusted proxy depth and spoofed header rejection.
 

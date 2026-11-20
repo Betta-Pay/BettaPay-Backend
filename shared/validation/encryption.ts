@@ -439,6 +439,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+function isPrototypePollutionKey(key: string): boolean {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
 export function encryptSensitiveFields<T>(data: T, secretKey?: string): T {
   if (!data || typeof data !== 'object') {
     return data;
@@ -452,14 +456,20 @@ export function encryptSensitiveFields<T>(data: T, secretKey?: string): T {
     return data;
   }
 
-  const result: Record<string, any> = { ...(data as Record<string, any>) };
+  const proto = Object.getPrototypeOf(data);
+  const result: Record<string, any> = proto === null ? Object.create(null) : {};
 
-  for (const key of Object.keys(result)) {
-    const val = result[key];
+  for (const key of Object.keys(data as Record<string, any>)) {
+    if (!Object.hasOwn(data, key) || isPrototypePollutionKey(key)) {
+      continue;
+    }
+    const val = (data as Record<string, any>)[key];
     if (SENSITIVE_FIELDS.has(key) && typeof val === 'string') {
       result[key] = encryptField(val, secretKey);
     } else if (val && typeof val === 'object') {
       result[key] = encryptSensitiveFields(val, secretKey);
+    } else {
+      result[key] = val;
     }
   }
 
@@ -479,14 +489,20 @@ export function decryptSensitiveFields<T>(data: T, secretKey?: string): T {
     return data;
   }
 
-  const result: Record<string, any> = { ...(data as Record<string, any>) };
+  const proto = Object.getPrototypeOf(data);
+  const result: Record<string, any> = proto === null ? Object.create(null) : {};
 
-  for (const key of Object.keys(result)) {
-    const val = result[key];
+  for (const key of Object.keys(data as Record<string, any>)) {
+    if (!Object.hasOwn(data, key) || isPrototypePollutionKey(key)) {
+      continue;
+    }
+    const val = (data as Record<string, any>)[key];
     if (SENSITIVE_FIELDS.has(key) && typeof val === 'string' && isEncrypted(val)) {
       result[key] = decryptField(val, secretKey);
     } else if (val && typeof val === 'object') {
       result[key] = decryptSensitiveFields(val, secretKey);
+    } else {
+      result[key] = val;
     }
   }
 

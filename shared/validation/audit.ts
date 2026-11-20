@@ -116,11 +116,58 @@ function getActorFromRequest(request?: AuditLogRequestLike | null): {
   return { actorId: null, actorType: null };
 }
 
-function serializeChanges(changes: unknown): Record<string, unknown> | null {
+const SENSITIVE_AUDIT_KEYS = new Set([
+  'secret',
+  'signingsecret',
+  'signing_secret',
+  'password',
+  'token',
+]);
+
+function isSensitiveAuditKey(key: string): boolean {
+  return SENSITIVE_AUDIT_KEYS.has(key.toLowerCase());
+}
+
+function redactSensitiveAudit(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveAudit(item));
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (isSensitiveAuditKey(key)) {
+      result[key] = '[REDACTED]';
+    } else {
+      result[key] = redactSensitiveAudit(val);
+    }
+  }
+  return result;
+}
+
+function bigintJsonReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  return value;
+}
+
+export function serializeChanges(changes: unknown): Record<string, unknown> | null {
   if (changes === undefined || changes === null) return null;
 
+  if (typeof changes === 'bigint') {
+    return { value: changes.toString() };
+  }
+
   if (typeof changes === 'object') {
-    return JSON.parse(JSON.stringify(changes)) as Record<string, unknown>;
+    const redacted = redactSensitiveAudit(changes);
+    return JSON.parse(JSON.stringify(redacted, bigintJsonReplacer)) as Record<string, unknown>;
   }
 
   return { value: changes };
