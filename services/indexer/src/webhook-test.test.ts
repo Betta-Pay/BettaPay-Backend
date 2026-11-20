@@ -11,7 +11,8 @@ process.env.FIELD_ENCRYPTION_KEY = 'b'.repeat(32);
 
 import test from 'tape';
 
-const { fastify, prisma, webhookQueue } = await import('./index.js');
+const { fastify, prisma, webhookQueue, webhookQueueEvents } = await import('./index.js');
+const { encryptField } = await import('@bettapay/validation');
 
 test('webhook test succeeds and stores result when mock server returns 200', async (t) => {
   let payload: any;
@@ -281,6 +282,68 @@ test('webhook test blocks loopback and metadata address ranges (#900)', async (t
     t.equal(res.statusCode, 400, 'loopback target returns 400');
     const body = JSON.parse(res.body);
     t.equal(body.error?.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
+  } finally {
+    t.end();
+  }
+});
+
+test('webhook test decrypts signingSecret and reuses the shared QueueEvents (#1059)', async (t) => {
+  await fastify.ready();
+
+  const plaintextSecret = 'whsec_plaintext_signing_secret_value';
+  const id = 'wh_encrypted_secret';
+  prisma.webhookSubscription.findUnique = async () => ({
+    id,
+    url: 'https://example.com/webhook',
+    // Signing secrets are stored encrypted (#617); the worker must receive
+    // the plaintext to produce a verifiable HMAC signature.
+    signingSecret: encryptField(plaintextSecret),
+  }) as any;
+  prisma.webhookSubscription.update = async () => ({}) as any;
+
+  let enqueued: any;
+  const seenQueueEvents: unknown[] = [];
+  webhookQueue.add = async (_name: string, data: any) => {
+    enqueued = data;
+    return {
+      waitUntilFinished: async (queueEvents: unknown) => {
+        seenQueueEvents.push(queueEvents);
+        return { statusCode: 200 };
+      },
+    } as any;
+  };
+
+  try {
+    const first = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+    t.equal(first.statusCode, 200, 'first test delivery completes');
+    t.equal(
+      enqueued.signingSecret,
+      plaintextSecret,
+      'encrypted signingSecret is decrypted before enqueueing (#1059)',
+    );
+
+    const second = await fastify.inject({
+      method: 'POST',
+      url: `/api/webhooks/${id}/test`,
+      headers: { 'x-service-token': 'test-service-secret-value' },
+    });
+    t.equal(second.statusCode, 200, 'second test delivery completes');
+
+    t.equal(seenQueueEvents.length, 2, 'both requests passed a QueueEvents to waitUntilFinished');
+    t.equal(
+      seenQueueEvents[0],
+      seenQueueEvents[1],
+      'the same QueueEvents instance is reused across requests (#1059)',
+    );
+    t.equal(
+      seenQueueEvents[0],
+      webhookQueueEvents,
+      'the module-scope shared QueueEvents instance is the one used (#1059)',
+    );
   } finally {
     t.end();
   }

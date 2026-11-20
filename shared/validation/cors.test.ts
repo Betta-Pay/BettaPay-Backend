@@ -56,3 +56,17 @@ test('resolveAllowedOrigins accepts valid production origins', () => {
   assert.strictEqual(error, undefined);
   assert.deepStrictEqual(origins, ['https://app.example.com']);
 });
+
+test('resolveAllowedOrigins rejects malformed production origins like https:// or paths', () => {
+  const malformed = resolveAllowedOrigins({
+    NODE_ENV: 'production',
+    ALLOWED_ORIGINS: 'https://',
+  });
+  assert.notStrictEqual(malformed.error, undefined);
+
+  const withPath = resolveAllowedOrigins({
+    NODE_ENV: 'production',
+    ALLOWED_ORIGINS: 'https://app.example.com/api',
+  });
+  assert.notStrictEqual(withPath.error, undefined);
+});

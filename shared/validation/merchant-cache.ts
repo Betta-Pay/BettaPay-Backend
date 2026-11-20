@@ -13,6 +13,12 @@
  */
 
 const DEFAULT_TTL_MS = 30_000;
+const DEFAULT_MAX_ENTRIES = 1_000;
+
+export interface MerchantCacheOptions {
+  ttlMs?: number;
+  maxEntries?: number;
+}
 
 interface CacheEntry<T> {
   value: T;
@@ -22,9 +28,29 @@ interface CacheEntry<T> {
 export class MerchantCache<T = Record<string, unknown>> {
   private store = new Map<string, CacheEntry<T>>();
   private ttlMs: number;
+  private maxEntriesLimit: number;
 
-  constructor(ttlMs: number = DEFAULT_TTL_MS) {
-    this.ttlMs = ttlMs;
+  constructor(
+    ttlMsOrOptions: number | MerchantCacheOptions = DEFAULT_TTL_MS,
+    maxEntries: number = DEFAULT_MAX_ENTRIES,
+  ) {
+    if (typeof ttlMsOrOptions === 'object' && ttlMsOrOptions !== null) {
+      this.ttlMs = ttlMsOrOptions.ttlMs ?? DEFAULT_TTL_MS;
+      this.maxEntriesLimit =
+        typeof ttlMsOrOptions.maxEntries === 'number' && ttlMsOrOptions.maxEntries > 0
+          ? ttlMsOrOptions.maxEntries
+          : DEFAULT_MAX_ENTRIES;
+    } else {
+      this.ttlMs = typeof ttlMsOrOptions === 'number' ? ttlMsOrOptions : DEFAULT_TTL_MS;
+      this.maxEntriesLimit =
+        typeof maxEntries === 'number' && maxEntries > 0
+          ? maxEntries
+          : DEFAULT_MAX_ENTRIES;
+    }
+  }
+
+  get maxEntries(): number {
+    return this.maxEntriesLimit;
   }
 
   get(id: string): T | undefined {
@@ -34,10 +60,21 @@ export class MerchantCache<T = Record<string, unknown>> {
       this.store.delete(id);
       return undefined;
     }
+    // Refresh insertion order for LRU eviction
+    this.store.delete(id);
+    this.store.set(id, entry);
     return entry.value;
   }
 
   set(id: string, value: T): void {
+    if (this.store.has(id)) {
+      this.store.delete(id);
+    } else if (this.store.size >= this.maxEntriesLimit) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.store.delete(oldestKey);
+      }
+    }
     this.store.set(id, { value, expiresAt: Date.now() + this.ttlMs });
   }
 
