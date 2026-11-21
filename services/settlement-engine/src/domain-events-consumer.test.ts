@@ -8,6 +8,7 @@ const silentLog = {
   },
   info() {},
   debug() {},
+  error() {},
 };
 
 const job = (data: unknown) => ({ data }) as Job<any>;
@@ -61,6 +62,32 @@ test('upsert failure never crashes the worker', async (t) => {
   const process = createDomainEventProcessor(() => mirror, silentLog);
   await process(job(paymentCreated));
   t.pass('upsert rejection is swallowed');
+  t.end();
+});
+
+test('upsert failure is logged with event id/type context', async (t) => {
+  const errors: Array<[Record<string, unknown>, string]> = [];
+  const log = {
+    ...silentLog,
+    child() {
+      return log;
+    },
+    error(obj: Record<string, unknown>, msg: string) {
+      errors.push([obj, msg]);
+    },
+  };
+  const failure = new Error('db down');
+  const mirror: MirrorDelegate = {
+    async upsert() {
+      throw failure;
+    },
+  };
+  const process = createDomainEventProcessor(() => mirror, log);
+  await process(job(paymentCreated));
+  t.equal(errors.length, 1, 'logger.error called once');
+  t.equal(errors[0][0].eventId, 'pay_1', 'includes event id');
+  t.equal(errors[0][0].eventType, 'payment.created', 'includes event type');
+  t.equal(errors[0][0].err, failure, 'includes the error');
   t.end();
 });
 
