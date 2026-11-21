@@ -622,6 +622,13 @@ export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT
   }
 }
 
+/** True when a merchant is suspended or soft-deleted and must not get payouts. */
+export function isMerchantBlocked(
+  merchant: { status?: string | null; deletedAt?: Date | string | null } | null | undefined,
+): boolean {
+  return !!merchant && (merchant.status === 'suspended' || merchant.deletedAt != null);
+}
+
 async function getSettlementRetryCount(settlementId: string): Promise<number> {
   const visited = new Set<string>();
   let currentId = settlementId;
@@ -769,6 +776,11 @@ fastify.post<{ Params: { id: string } }>(
         'Only failed settlements can be retried',
         { currentStatus: original.status }
       ));
+    }
+
+    const retryMerchant = await prisma.merchant.findUnique({ where: { id: original.merchantId } });
+    if (isMerchantBlocked(retryMerchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const totalRetries = await getSettlementRetryCount(id);
@@ -1478,8 +1490,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
       return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
@@ -1703,8 +1715,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     if (!merchant) {
       return rejectBulk(404, createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return rejectBulk(422, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
       return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
