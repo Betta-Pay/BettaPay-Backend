@@ -137,6 +137,9 @@ export function resolveVolumeDiscount(
   monthlyVolume: number,
   tiers: DiscountTier[],
 ): number {
+  if (tiers.some((tier) => !Number.isFinite(tier.discountBps) || tier.discountBps < 0)) {
+    throw new SettlementAmountError('discountBps must be finite and non-negative');
+  }
   if (tiers.length === 0 || monthlyVolume <= 0) return 0;
 
   // Sort descending by volumeUsd so the highest applicable tier wins
@@ -184,6 +187,9 @@ export function computeSettlementAmounts(
   feeCaps: FeeCaps = {},
 ): SettlementAmounts {
   const gross = new BigNumber(grossAmountStr);
+  if (!gross.isFinite() || !gross.isGreaterThan(0)) {
+    throw new SettlementAmountError('Settlement amount must be finite and greater than zero');
+  }
 
   // Guard: reject amounts that exceed the maximum allowed settlement amount (#481).
   // Per-asset cap is derived from the asset's decimal precision.

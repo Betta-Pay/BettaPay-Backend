@@ -71,21 +71,29 @@ import { getMerchantMaxConcurrency } from './settlement-properties.js';
  * log aggregators never store payment-level PII.
  */
 function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
-  const out = { ...obj } as Record<string, unknown>;
-  for (const key of Object.keys(out)) {
-    const lk = key.toLowerCase();
-    if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
-      const v = out[key];
-      // Keep a stable prefix for cross-entry correlation without exposing the full id.
-      out[key] = typeof v === 'string' ? `${v.slice(0, 4)}***` : '[REDACTED]';
-    } else if (
-      lk.includes('amount') || lk.includes('diff') || lk.includes('gross') ||
-      lk.includes('fee') || lk.includes('net')
-    ) {
-      out[key] = '[REDACTED]';
+  const seen = new WeakMap<object, unknown>();
+  const visit = (value: unknown): unknown => {
+    if (value === null || typeof value !== 'object') return value;
+    if (seen.has(value)) return seen.get(value);
+    const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
+    seen.set(value, result);
+    if (Array.isArray(value)) {
+      for (const item of value) (result as unknown[]).push(visit(item));
+    } else {
+      for (const [key, child] of Object.entries(value)) {
+        const lk = key.toLowerCase();
+        if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
+          (result as Record<string, unknown>)[key] = typeof child === 'string' ? `${child.slice(0, 4)}***` : '[REDACTED]';
+        } else if (['amount', 'diff', 'gross', 'fee', 'net'].some((token) => lk.includes(token))) {
+          (result as Record<string, unknown>)[key] = '[REDACTED]';
+        } else {
+          (result as Record<string, unknown>)[key] = visit(child);
+        }
+      }
     }
-  }
-  return out as T;
+    return result;
+  };
+  return visit(obj) as T;
 }
 import {
   computeSettlementPayloadHash,
@@ -2019,6 +2027,7 @@ const batchWorker = new Worker(
           minCount: env.BATCH_MIN_COUNT,
           volumeThreshold: env.BATCH_VOLUME_THRESHOLD,
           maxBatchSize: env.BATCH_MAX_SIZE,
+          redis,
         },
         lastBatchCompletedAt,
         fastify.log,
