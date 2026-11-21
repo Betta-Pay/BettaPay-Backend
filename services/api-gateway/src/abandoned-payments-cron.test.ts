@@ -67,6 +67,7 @@ test('autoExpireAbandonedPayments - expires payments older than cutoff', async (
   t.equal(count, 5, 'should return the count of expired payments');
   t.ok(lastUpdateManyArgs, 'updateMany should have been called');
   t.equal(lastUpdateManyArgs?.where.id.in.length, 5, 'updateMany should target the fetched page');
+  t.equal(lastUpdateManyArgs?.where.status, 'initiated', 'updateMany should require status: initiated');
   t.equal(lastFindManyArgs[0].where.status, 'initiated', 'should only fetch initiated payments');
   t.ok(lastFindManyArgs[0].where.createdAt.lt instanceof Date, 'createdAt filter should be a Date');
   t.equal(lastUpdateManyArgs?.data.status, 'cancelled', 'should set status to cancelled');
@@ -122,5 +123,68 @@ test('autoExpireAbandonedPayments - handles zero expired payments', async (t) =>
   t.equal(count, 0, 'should return 0');
   t.equal(lastUpdateManyArgs, null, 'updateMany should not be called when no payments are found');
 
+  t.end();
+});
+
+test('autoExpireAbandonedPayments - skips execution when Redis lock is held', async (t) => {
+  resetMockCalls();
+  const mockPrisma = createMockPrisma(5);
+  const mockLogger = createMockLogger();
+  const mockRedisLocked = { set: async () => null };
+
+  const count = await autoExpireAbandonedPayments(
+    mockPrisma as any,
+    mockLogger as any,
+    24,
+    undefined,
+    mockRedisLocked,
+  );
+
+  t.equal(count, 0, 'should return 0 when lock is unavailable');
+  t.equal(lastUpdateManyArgs, null, 'updateMany should not be called when lock is held');
+  t.end();
+});
+
+test('autoExpireAbandonedPayments - releases Redis lock on completion', async (t) => {
+  resetMockCalls();
+  const mockPrisma = createMockPrisma(2);
+  const mockLogger = createMockLogger();
+  let setCalled = false;
+  let evalCalled = false;
+  const mockRedis = {
+    set: async () => {
+      setCalled = true;
+      return 'OK';
+    },
+    eval: async () => {
+      evalCalled = true;
+      return 1;
+    },
+  };
+
+  const count = await autoExpireAbandonedPayments(
+    mockPrisma as any,
+    mockLogger as any,
+    24,
+    undefined,
+    mockRedis,
+  );
+
+  t.equal(count, 2, 'should expire payments normally');
+  t.ok(setCalled, 'should have attempted to acquire lock');
+  t.ok(evalCalled, 'should have released lock via Lua eval');
+  t.end();
+});
+
+test('autoExpireAbandonedPayments - validates abandonmentHours against NaN and falls back safely', async (t) => {
+  resetMockCalls();
+  const mockPrisma = createMockPrisma(1);
+  const mockLogger = createMockLogger();
+
+  const count = await autoExpireAbandonedPayments(mockPrisma as any, mockLogger as any, Number.NaN);
+
+  t.equal(count, 1, 'should safely expire payments using default hours fallback');
+  t.ok(lastFindManyArgs[0].where.createdAt.lt instanceof Date, 'cutoff date should be a valid Date, not Invalid Date');
+  t.notOk(Number.isNaN(lastFindManyArgs[0].where.createdAt.lt.getTime()), 'cutoff timestamp is not NaN');
   t.end();
 });

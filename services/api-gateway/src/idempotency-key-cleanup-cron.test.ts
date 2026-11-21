@@ -131,6 +131,73 @@ test('reclaimExpiredIdempotencyKeys - skips execution when Redis lock cannot be 
   t.end();
 });
 
+test('reclaimExpiredIdempotencyKeys - aborts sweep when Redis lock acquisition errors', async (t) => {
+  lastPaymentArgs = null;
+  const mockPrisma = createMockPrisma(3, 3);
+  const mockLogger = createMockLogger();
+
+  const mockRedisError = {
+    set: async () => {
+      throw new Error('REDIS_CONNECTION_REFUSED');
+    },
+  };
+
+  const total = await reclaimExpiredIdempotencyKeys(mockPrisma as any, mockLogger as any, mockRedisError);
+
+  t.equal(total, 0, 'returns 0 when lock acquisition throws error');
+  t.equal(lastPaymentArgs, null, 'Payment.updateMany is not called when lock throws');
+
+  t.end();
+});
+
+test('reclaimExpiredIdempotencyKeys - bounds each sweep to configured batch size', async (t) => {
+  let paymentFindManyArgs: any = null;
+  let paymentUpdateManyArgs: any = null;
+  let settlementFindManyArgs: any = null;
+  let settlementUpdateManyArgs: any = null;
+
+  const mockPrismaBatched = {
+    payment: {
+      findMany: async (args: any) => {
+        paymentFindManyArgs = args;
+        return Array.from({ length: args.take }, (_, i) => ({ id: `pay_${i}` }));
+      },
+      updateMany: async (args: any) => {
+        paymentUpdateManyArgs = args;
+        return { count: args.where.id.in.length };
+      },
+    },
+    settlement: {
+      findMany: async (args: any) => {
+        settlementFindManyArgs = args;
+        return Array.from({ length: args.take }, (_, i) => ({ id: `set_${i}` }));
+      },
+      updateMany: async (args: any) => {
+        settlementUpdateManyArgs = args;
+        return { count: args.where.id.in.length };
+      },
+    },
+  };
+
+  const mockLogger = createMockLogger();
+  const configuredBatchSize = 15;
+
+  const total = await reclaimExpiredIdempotencyKeys(
+    mockPrismaBatched as any,
+    mockLogger as any,
+    undefined,
+    configuredBatchSize,
+  );
+
+  t.equal(paymentFindManyArgs.take, 15, 'payment findMany called with batch size');
+  t.equal(paymentUpdateManyArgs.where.id.in.length, 15, 'payment updateMany bounded to 15 IDs');
+  t.equal(settlementFindManyArgs.take, 15, 'settlement findMany called with batch size');
+  t.equal(settlementUpdateManyArgs.where.id.in.length, 15, 'settlement updateMany bounded to 15 IDs');
+  t.equal(total, 30, 'returns combined reclaimed count bounded by batch sizes');
+
+  t.end();
+});
+
 test('getCronIntervalMs - reads options or environment variable', (t) => {
   t.equal(getCronIntervalMs({ intervalMs: 30000 }), 30000, 'reads intervalMs option');
 
