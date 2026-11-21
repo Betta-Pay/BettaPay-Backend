@@ -159,6 +159,7 @@ import { PrismaClient } from '@prisma/client';
 import {
   createSettlementWithUniqueGuard,
   updateSettlementWithOptimisticLock,
+  transitionSettlementStatus,
   VersionConflictError,
   UniqueConstraintError,
 } from './prisma-adapter.js';
@@ -535,5 +536,50 @@ test('prisma-adapter (#543): updateSettlementWithOptimisticLock throws VersionCo
   } catch (err) {
     t.ok(err instanceof VersionConflictError, 'throws VersionConflictError');
   }
+  t.end();
+});
+
+// ── Atomic status transitions ────────────────────────────────────────────────
+// In-memory fake whose updateMany evaluates the WHERE status guard and applies
+// the write in one synchronous step, like a single SQL UPDATE.
+function makeStatusPrisma(initial: string) {
+  const row = { id: 'set_1', status: initial };
+  return {
+    row,
+    settlement: {
+      async updateMany({ where, data }: any) {
+        await Promise.resolve();
+        if (where.id !== row.id || !where.status.in.includes(row.status)) return { count: 0 };
+        row.status = data.status;
+        return { count: 1 };
+      },
+      async findUnique() {
+        return { ...row };
+      },
+    },
+  };
+}
+
+test('prisma-adapter: conflicting concurrent transitions cannot both succeed', async (t) => {
+  const fake = makeStatusPrisma('processing');
+  const results = await Promise.allSettled([
+    transitionSettlementStatus(fake as any, 'set_1', 'completed'),
+    transitionSettlementStatus(fake as any, 'set_1', 'failed'),
+  ]);
+  t.equal(results.filter((r) => r.status === 'fulfilled').length, 1, 'exactly one transition wins');
+  const loser = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+  t.ok(/Invalid status transition/.test(String(loser.reason)), 'loser is rejected as invalid transition');
+  t.end();
+});
+
+test('prisma-adapter: invalid transition is rejected atomically and leaves status unchanged', async (t) => {
+  const fake = makeStatusPrisma('pending');
+  try {
+    await transitionSettlementStatus(fake as any, 'set_1', 'completed');
+    t.fail('should have thrown');
+  } catch (err) {
+    t.ok(/Invalid status transition from pending to completed/.test(String(err)), 'throws invalid transition');
+  }
+  t.equal(fake.row.status, 'pending', 'status unchanged');
   t.end();
 });

@@ -212,6 +212,33 @@ test('renewSemaphore: returns false once the slot has been released', async (t) 
   t.end();
 });
 
+test('acquireSemaphore: tokens are unique UUIDs', async (t) => {
+  const redis = createMockRedis() as any;
+  const tokens = await Promise.all(
+    Array.from({ length: 50 }, () => acquireSemaphore(redis, 'm', { maxConcurrent: 100 })),
+  );
+  t.equal(new Set(tokens).size, 50, 'all tokens are unique');
+  t.ok(
+    tokens.every((tok) => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(tok!)),
+    'tokens are v4 UUIDs',
+  );
+  t.end();
+});
+
+test('semaphore options: NaN, zero and negative TTL are rejected', async (t) => {
+  const redis = createMockRedis() as any;
+  for (const ttlSeconds of [NaN, 0, -5, Infinity]) {
+    try {
+      await acquireSemaphore(redis, 'm', { ttlSeconds });
+      t.fail(`ttlSeconds=${ttlSeconds} should throw`);
+    } catch (err) {
+      t.ok(err instanceof RangeError, `ttlSeconds=${ttlSeconds} throws RangeError`);
+    }
+  }
+  t.equal(redis.store['semaphore:settlement:m'], undefined, 'no slot acquired on invalid TTL');
+  t.end();
+});
+
 test('getActiveCount: reflects acquires and releases', async (t) => {
   const redis = createMockRedis() as any;
   t.equal(await getActiveCount(redis, 'm'), 0, 'zero initially');

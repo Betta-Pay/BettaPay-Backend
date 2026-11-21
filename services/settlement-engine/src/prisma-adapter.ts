@@ -16,6 +16,7 @@
  */
 
 import type { PrismaClient, Prisma, Settlement } from '@prisma/client';
+import { SETTLEMENT_STATUS_TRANSITIONS } from '@bettapay/validation';
 import { SETTLEMENT_QUERY_TIMEOUT_MS } from './settlement-properties.js';
 
 type PrismaLike = PrismaClient | Prisma.TransactionClient;
@@ -157,6 +158,45 @@ export async function createSettlementWithUniqueGuard(
       throw err;
     }
   });
+}
+
+/**
+ * Atomically transition a settlement's status.
+ *
+ * The valid source statuses (derived from SETTLEMENT_STATUS_TRANSITIONS, plus
+ * the target itself for idempotent writes) are enforced in the UPDATE's WHERE
+ * clause, so the check and the write are a single statement. Two workers racing
+ * with conflicting transitions cannot both succeed: the loser matches 0 rows and
+ * receives an "Invalid status transition" error.
+ */
+export async function transitionSettlementStatus(
+  prisma: PrismaLike,
+  id: string,
+  next: string,
+  data: Prisma.SettlementUncheckedUpdateManyInput = {},
+): Promise<Settlement> {
+  const allowedFrom = Object.entries(SETTLEMENT_STATUS_TRANSITIONS)
+    .filter(([, targets]) => targets.includes(next))
+    .map(([from]) => from)
+    .concat(next);
+
+  const result = await prisma.settlement.updateMany({
+    where: { id, status: { in: allowedFrom as any } },
+    data: { ...data, status: next as any },
+  });
+
+  if (result.count === 0) {
+    const current = await prisma.settlement.findUnique({
+      where: { id },
+      select: { status: true },
+    });
+    if (!current) throw new Error(`Settlement ${id} not found`);
+    throw new Error(`Invalid status transition from ${current.status} to ${next}`);
+  }
+
+  const updated = await prisma.settlement.findUnique({ where: { id } });
+  if (!updated) throw new Error(`Settlement ${id} not found`);
+  return updated;
 }
 
 /**

@@ -14,6 +14,7 @@
  *   keeps its slot reserved and `maxConcurrent` stays enforced.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { Redis } from 'ioredis';
 
 const DEFAULT_MAX_CONCURRENT = 3;
@@ -84,9 +85,14 @@ function resolve(opts: SemaphoreOptions) {
   const parsedEnv = envVal ? parseInt(envVal, 10) : NaN;
   const defaultLimit = Number.isFinite(parsedEnv) && parsedEnv > 0 ? parsedEnv : DEFAULT_MAX_CONCURRENT;
 
+  const ttlSeconds = opts.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+  if (!(Number.isFinite(ttlSeconds) && ttlSeconds > 0)) {
+    throw new RangeError(`Semaphore ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+  }
+
   return {
     maxConcurrent: opts.maxConcurrent ?? defaultLimit,
-    ttlSeconds: opts.ttlSeconds ?? DEFAULT_TTL_SECONDS,
+    ttlSeconds,
     prefix: opts.prefix ?? 'semaphore:settlement',
   };
 }
@@ -105,7 +111,7 @@ export async function acquireSemaphore(
   const key = `${prefix}:${merchantId}`;
   const now = Date.now();
   const windowMs = ttlSeconds * 1000;
-  const member = `${now}:${Math.random().toString(36).slice(2)}`;
+  const member = randomUUID();
 
   const acquired = await redis.eval(
     acquireScript,

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { PrismaClient } from '@prisma/client';
-import { assertRetryLimit } from './index.js';
+import { assertRetryLimit, isMerchantBlocked } from './index.js';
 
 const prisma = new PrismaClient();
 
@@ -99,6 +99,12 @@ describe('Settlement Retry', () => {
   it('should reject when retry count reaches max allowed', () => {
     expect(() => assertRetryLimit(3, 3)).toThrow(/Maximum retry limit/i);
     expect(() => assertRetryLimit(0, 3)).not.toThrow();
+  });
+
+  it('blocks suspended and soft-deleted merchants from create/retry, allows active', () => {
+    expect(isMerchantBlocked({ status: 'suspended', deletedAt: null })).toBe(true);
+    expect(isMerchantBlocked({ status: 'active', deletedAt: new Date() })).toBe(true);
+    expect(isMerchantBlocked({ status: 'active', deletedAt: null })).toBe(false);
   });
 
   it('should enforce max 3 retries', async () => {
