@@ -556,6 +556,7 @@ const CLIENT_TIMEOUT_HEADER = "x-client-timeout-ms";
 // --- App Factory & Configuration Options ------------------------------------
 export interface AppOptions {
   prisma?: PrismaClient;
+  merchantCache?: MerchantCache;
   indexerClient?: ReturnType<typeof createIndexerClient>;
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
@@ -602,7 +603,7 @@ export function getDefaultPrisma(): PrismaClient {
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single payment creation request (#740).
-const merchantCache = new MerchantCache();
+export const merchantCache = new MerchantCache();
 
 // Set by buildApp() when it creates the app's Redis client — shutdown()/start()
 // (defined after buildApp, at module scope) need it but don't have their own
@@ -800,6 +801,7 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   const prisma = opts.prisma ?? getDefaultPrisma();
+  const activeMerchantCache = opts.merchantCache ?? merchantCache;
   const indexerClient =
     opts.indexerClient ??
     createIndexerClient({
@@ -2493,34 +2495,51 @@ fastify.get('/api/admin/auth/ip-score', {
       const d = CreateMerchantBody.parse(request.body);
       const secret = d.secret || crypto.randomBytes(24).toString("hex");
       const secretHash = encryptField(hashSecret(secret));
-      const merchant = await prisma.$transaction(async (tx) => {
-        const created = await tx.merchant.create({
-          data: {
-            id: d.id,
-            name: d.name,
-            ownerId: d.ownerId,
-            settings: (d.settings as any) ?? {},
-            secretHash,
-          },
+      try {
+        const merchant = await prisma.$transaction(async (tx) => {
+          const created = await tx.merchant.create({
+            data: {
+              id: d.id,
+              name: d.name,
+              ownerId: d.ownerId,
+              settings: (d.settings as any) ?? {},
+              secretHash,
+            },
+          });
+          await logAuditEvent(
+            "merchant.created",
+            "merchant",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "merchant.created",
-          "merchant",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
-      if (!d.secret) {
-        fastify.log.warn(
-          { merchantId: merchant.id },
-          "Auto-generated merchant secret returned in response. This will only be shown once.",
-        );
+        if (!d.secret) {
+          fastify.log.warn(
+            { merchantId: merchant.id },
+            "Auto-generated merchant secret returned in response. This will only be shown once.",
+          );
+        }
+        const { secretHash: _hash, ...safeMerchant } = merchant;
+        return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
+      } catch (err: any) {
+        if (
+          err?.code === "P2002" ||
+          (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")
+        ) {
+          return reply
+            .code(409)
+            .send(
+              createErrorResponse(
+                ErrorCodes.CONFLICT,
+                "Merchant already exists",
+              ),
+            );
+        }
+        throw err;
       }
-      const { secretHash: _hash, ...safeMerchant } = merchant;
-      return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
     },
   );
 
@@ -2723,7 +2742,7 @@ fastify.get('/api/admin/auth/ip-score', {
         tx as unknown as Parameters<typeof logAuditEvent>[5],
       );
     });
-    merchantCache.invalidate(id);
+    activeMerchantCache.invalidate(id);
 
     // #744 — Invalidate cached merchant data so the suspended/unsuspended
     // status is visible to read paths immediately.
@@ -2822,7 +2841,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         return merchantUpdate;
       });
-      merchantCache.invalidate(id);
+      activeMerchantCache.invalidate(id);
 
       // #744 — Invalidate cached merchant data so updated settings are
       // visible to read paths immediately.
@@ -2878,6 +2897,13 @@ fastify.get('/api/admin/auth/ip-score', {
         return merchantUpdate;
       });
 
+      activeMerchantCache.invalidate(id);
+
+      // Invalidate cached merchant data so the updated KYC status is visible immediately
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
+      });
+
       return reply.code(200).send({ data: { merchant: updated } });
     },
   );
@@ -2918,7 +2944,7 @@ fastify.get('/api/admin/auth/ip-score', {
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
       const merchant = await getCachedMerchant(
         d.merchantId,
-        merchantCache,
+        activeMerchantCache,
         (id) => prisma.merchant.findFirst({ where: { id, deletedAt: null } }),
       );
       if (!merchant) {
@@ -3555,7 +3581,13 @@ fastify.get('/api/admin/auth/ip-score', {
   }>(
     "/api/settlements/:id/status",
     {
-      preValidation: [fastify.authenticate],
+      preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+        if (request.headers["x-service-token"]) {
+          await fastify.serviceAuth(request, reply);
+          return;
+        }
+        await fastify.authenticate(request, reply);
+      },
       preHandler: [logRequestBody],
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
@@ -3589,6 +3621,25 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Settlement not found"),
           );
+
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isServiceAuth && !isAdmin) {
+        if (!callerMerchantId || callerMerchantId !== settlement.merchantId) {
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.FORBIDDEN,
+                "You do not have access to this settlement",
+              ),
+            );
+        }
+      }
 
       const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
       if (
@@ -3718,6 +3769,22 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const d = CreateSettlementBody.parse(request.body);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isAdmin && (!callerMerchantId || callerMerchantId !== d.merchantId)) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "You do not have access to create settlements for this merchant",
+            ),
+          );
+      }
+
       const merchant = await prisma.merchant.findUnique({
         where: { id: d.merchantId },
       });
@@ -3783,12 +3850,12 @@ fastify.get('/api/admin/auth/ip-score', {
 
       // Validate each settlement item against merchant limits
       for (const item of items) {
-        const amount = parseFloat(item.amount);
+        const amount = new Prisma.Decimal(item.amount);
 
         // Check minimum settlement amount
         if (settings?.minSettlementAmount) {
-          const minAmount = parseFloat(settings.minSettlementAmount);
-          if (amount < minAmount) {
+          const minAmount = new Prisma.Decimal(settings.minSettlementAmount);
+          if (amount.lt(minAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3804,8 +3871,8 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Check maximum settlement amount
         if (settings?.maxSettlementAmount) {
-          const maxAmount = parseFloat(settings.maxSettlementAmount);
-          if (amount > maxAmount) {
+          const maxAmount = new Prisma.Decimal(settings.maxSettlementAmount);
+          if (amount.gt(maxAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3835,12 +3902,14 @@ fastify.get('/api/admin/auth/ip-score', {
         SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
         FROM "Settlement"
         WHERE "merchantId" = ${d.merchantId}
+        AND "status"::text NOT IN ('failed', 'cancelled', 'superseded')
+        AND "supersededById" IS NULL
         AND "initiatedAt" >= date_trunc('day', now())
       `;
 
-        const currentDailyTotal = aggregateResult?.[0]?.sum
-          ? parseFloat(aggregateResult[0].sum)
-          : 0;
+        const currentDailyTotal = new Prisma.Decimal(
+          aggregateResult?.[0]?.sum || "0",
+        );
         const queryDurationMs = Date.now() - startTimeMs;
         request.log.debug(
           { queryDurationMs, merchantId: d.merchantId },
@@ -3848,17 +3917,18 @@ fastify.get('/api/admin/auth/ip-score', {
         );
 
         const requestTotal = items.reduce(
-          (sum: number, item: any) => sum + parseFloat(item.amount),
-          0,
+          (sum: Prisma.Decimal, item: any) =>
+            sum.plus(new Prisma.Decimal(item.amount)),
+          new Prisma.Decimal(0),
         );
-        const newDailyTotal = currentDailyTotal + requestTotal;
-        const dailyLimit = parseFloat(settings.dailySettlementLimit);
+        const newDailyTotal = currentDailyTotal.plus(requestTotal);
+        const dailyLimit = new Prisma.Decimal(settings.dailySettlementLimit);
 
-        if (newDailyTotal > dailyLimit) {
+        if (newDailyTotal.gt(dailyLimit)) {
           return reply.code(422).send(
             createErrorResponse(
               "QUOTA_EXCEEDED",
-              `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
+              `Daily settlement limit exceeded. Current: ${currentDailyTotal.toString()}, Requested: ${requestTotal.toString()}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
                 requestedAmount: requestTotal.toString(),
