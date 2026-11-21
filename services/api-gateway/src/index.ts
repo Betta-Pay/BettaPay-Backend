@@ -63,6 +63,7 @@ import {
   createValidationContext,
   auditRouteAuthPolicy,
   installCrashHandlers,
+  GoogleAuthBody,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -1198,7 +1199,7 @@ export function buildApp(opts: AppOptions = {}) {
         typeof result.max === "number"
           ? result.max
           : typeof routeConfig.rateLimit === "object" &&
-              typeof (routeConfig.rateLimit as any).max === "number"
+            typeof (routeConfig.rateLimit as any).max === "number"
             ? (routeConfig.rateLimit as any).max
             : 1000;
       const windowStr =
@@ -1401,7 +1402,7 @@ export function buildApp(opts: AppOptions = {}) {
 
   fastify.addHook(
     "onResponse",
-    async (request: FastifyRequest, _reply: FastifyReply) => {
+    async (request: FastifyRequest) => {
       const merchantId = (request.user as any)?.merchantId;
       if (!merchantId) return;
 
@@ -2182,10 +2183,6 @@ fastify.get('/api/admin/auth/ip-score', {
     token?: unknown;
   }
 
-  const GoogleAuthBody = z.object({
-    token: z.string().min(1, "token is required"),
-  });
-
   fastify.post<{ Body: GoogleAuthRouteBody }>(
     "/api/auth/google",
     async (request, reply) => {
@@ -2425,6 +2422,9 @@ fastify.get('/api/admin/auth/ip-score', {
           return reply
             .code(503)
             .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
+        }
+        if (testResult.statusCode && (testResult.statusCode === 400 || testResult.statusCode === 403)) {
+          return reply.code(testResult.statusCode).send(testResult);
         }
         return reply.send(testResult);
       } catch (err) {
@@ -4132,9 +4132,8 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   fastify.get("/api/rates", async (request, reply) => {
-    const result = await proxyFxUpstream(request, reply, "/api/rates");
     reply.header("Cache-Control", "public, max-age=60");
-    return result;
+    return proxyFxUpstream(request, reply, "/api/rates");
   });
   fastify.get("/api/currencies", async (request, reply) =>
     proxyFxUpstream(request, reply, "/api/currencies"),
@@ -4152,7 +4151,15 @@ fastify.get('/api/admin/auth/ip-score', {
       // database on cache miss or Redis failure.
       const cached = await redis.get("supported-assets").catch(() => null);
       if (cached) {
-        return { data: JSON.parse(cached) };
+        try {
+          return { data: JSON.parse(cached) };
+        } catch (error) {
+          request.log.warn(
+            { error, key: "supported-assets" },
+            "Evicting corrupt supported-assets Redis cache entry",
+          );
+          await redis.del("supported-assets").catch(() => {});
+        }
       }
 
       const assets = await prisma.supportedAsset.findMany({
@@ -4242,9 +4249,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
       const body = UpdateSupportedAssetBody.parse(request.body);
 
       try {
@@ -4296,9 +4313,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
 
       try {
         const before = await prisma.supportedAsset.delete({
@@ -4339,13 +4366,30 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
-  fastify.get("/api/quote", async (request, reply) => {
-    const query = new URLSearchParams(
-      request.query as Record<string, string>,
-    ).toString();
-    const path = query ? `/api/quote?${query}` : "/api/quote";
-    return proxyFxUpstream(request, reply, path);
-  });
+  fastify.get(
+    "/api/quote",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          properties: {
+            from: { type: "string" },
+            to: { type: "string" },
+            amount: { type: "string" },
+            slippageBps: { type: "string" },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const query = new URLSearchParams(
+        request.query as Record<string, string>,
+      ).toString();
+      const path = query ? `/api/quote?${query}` : "/api/quote";
+      return proxyFxUpstream(request, reply, path);
+    },
+  );
 
   return fastify;
 }
@@ -4562,6 +4606,7 @@ const start = async () => {
         app.log,
         env.PAYMENT_ABANDONMENT_HOURS,
         webhookQueue,
+        redis,
       );
       startIdempotencyKeyCleanupCron(prisma, app.log, { redis });
     }

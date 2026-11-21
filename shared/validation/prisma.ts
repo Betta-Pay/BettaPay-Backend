@@ -141,9 +141,11 @@ export async function connectWithRetry(
  * pooled connection request. Without explicit values Prisma defaults to an
  * unbounded pool — a recipe for connection exhaustion under load.
  *
- * The function safely detects whether the URL already carries a query string
- * (i.e. contains "?") and uses "&" instead of "?" to avoid clobbering any
- * pre-existing parameters such as sslmode, schema, or application_name.
+ * The URL is parsed with `new URL()` so a malformed DATABASE_URL fails fast
+ * with a clear error, and the pool parameters are written with
+ * `searchParams.set()` so values already present in the URL are replaced
+ * rather than duplicated (#1076). Unrelated parameters such as sslmode,
+ * schema, or application_name are preserved.
  *
  * @param rawUrl   - The base DATABASE_URL (e.g. postgresql://user:pass@host:5432/db).
  * @param poolSize - Max connections in the Prisma pool (default: 10).
@@ -163,8 +165,19 @@ export function buildPrismaConnectionUrl(
   validatePrismaPoolSetting('DATABASE_POOL_SIZE', poolSize, 1, 10000);
   validatePrismaPoolSetting('DATABASE_POOL_TIMEOUT', timeout, 1, 3600);
 
-  const sep = rawUrl.includes('?') ? '&' : '?';
-  return `${rawUrl}${sep}connection_limit=${poolSize}&pool_timeout=${timeout}`;
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error('DATABASE_URL is not a valid URL');
+  }
+  if (!url.host) {
+    throw new Error('DATABASE_URL must include a host');
+  }
+
+  url.searchParams.set('connection_limit', String(poolSize));
+  url.searchParams.set('pool_timeout', String(timeout));
+  return url.toString();
 }
 
 export interface ConnectWithRotationOptions extends ConnectWithRetryOptions {

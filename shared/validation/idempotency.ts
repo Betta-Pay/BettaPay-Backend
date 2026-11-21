@@ -25,6 +25,7 @@ export interface IdempotencyRedis {
     value: string,
     ...args: Array<string | number>
   ): Promise<string | null>;
+  del?(key: string): Promise<number>;
 }
 
 export type IdempotencySource =
@@ -143,6 +144,7 @@ export async function withIdempotency<T>(
   }
 
   // Stage 2 — settlement NX-claim dialect (with bulk-hash comparison).
+  let claimedKey: string | null = null;
   if (redis) {
     const claimKey = `${redisKeyPrefix}${key}`;
     const value = claimValue ?? payloadHash ?? key;
@@ -181,6 +183,7 @@ export async function withIdempotency<T>(
           "Idempotency key is currently being processed",
         );
       }
+      claimedKey = claimKey;
     } catch (err) {
       if (err instanceof IdempotencyConflictError) throw err;
       // Redis-down fallback: continue to the DB-guarded create. The @unique
@@ -197,6 +200,13 @@ export async function withIdempotency<T>(
       if (winner !== null && winner !== undefined) {
         return { result: winner, deduped: true, source: "p2002-winner" };
       }
+    }
+    // Release the Redis claim key so transient create() failures do not block
+    // callers from retrying with the same Idempotency-Key until TTL expiry (#1069).
+    if (claimedKey && redis?.del) {
+      await redis.del(claimedKey).catch(() => {
+        // Best-effort cleanup: never mask the original create() error.
+      });
     }
     throw err;
   }

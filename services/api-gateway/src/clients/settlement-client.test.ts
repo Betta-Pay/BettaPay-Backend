@@ -80,3 +80,27 @@ test('createSettlement throws SettlementEngineUnavailableError on timeout', asyn
   }
   t.end();
 });
+
+test('createSettlement handles HTML 502 error responses safely without SyntaxError', async (t) => {
+  const htmlBody = '<html><body>502 Bad Gateway</body></html>';
+  const client = createSettlementClient({
+    baseUrl: BASE,
+    fetchImpl: async () =>
+      ({
+        ok: false,
+        status: 502,
+        headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+        json: async () => {
+          throw new SyntaxError('Unexpected token < in JSON at position 0');
+        },
+        text: async () => htmlBody,
+      }) as unknown as Response,
+  });
+
+  const result = await client.createSettlement({ merchantId: 'merchant_1' });
+  t.equal(result.status, 502, 'preserves 502 status code');
+  t.ok(result.body && typeof result.body === 'object', 'produces a structured error body');
+  t.equal((result.body as any)?.error?.code, 'UPSTREAM_ERROR', 'structured error code');
+  t.equal((result.body as any)?.error?.message, htmlBody, 'includes error text in structured error');
+  t.end();
+});

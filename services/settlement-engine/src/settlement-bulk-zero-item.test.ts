@@ -18,6 +18,7 @@ function resetMocks() {
   prisma.merchant.findUnique = async () => MOCK_MERCHANT_STANDARD as any;
   prisma.$queryRaw = async () => [{ sum: null }];
   prisma.$transaction = async (cb: any) => cb(prisma);
+  prisma.settlementBatch.create = async (args: any) => args.data;
   prisma.settlement.create = async (args: any) => args.data;
   prisma.settlement.findMany = async () => [];
   settlementQueue.add = async () => ({} as any);

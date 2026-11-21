@@ -87,12 +87,49 @@ export function createSettlementClient(options: SettlementClientOptions): Settle
         metrics.failures.inc({ target_service: TARGET, endpoint: ENDPOINT, status_code: statusCode });
       }
 
-      const contentType = response.headers.get('content-type') ?? 'application/json';
-      const body = contentType.includes('application/json')
-        ? await response.json()
-        : await response.text();
+      const contentType = response.headers.get('content-type') ?? '';
+      let body: unknown;
+      let effectiveContentType = contentType || 'application/json';
 
-      return { status: response.status, body, contentType };
+      if (contentType.includes('application/json')) {
+        try {
+          body = typeof response.json === 'function' ? await response.json() : JSON.parse(await response.text());
+        } catch {
+          let rawText = '';
+          try {
+            rawText = typeof response.text === 'function' ? await response.text() : '';
+          } catch {
+            rawText = '';
+          }
+          body = {
+            error: {
+              code: 'UPSTREAM_ERROR',
+              message: rawText || `Upstream returned status ${response.status}`,
+            },
+          };
+          effectiveContentType = 'application/json';
+        }
+      } else {
+        let rawText = '';
+        try {
+          rawText = typeof response.text === 'function' ? await response.text() : '';
+        } catch {
+          rawText = '';
+        }
+        if (!response.ok) {
+          body = {
+            error: {
+              code: 'UPSTREAM_ERROR',
+              message: rawText || `Upstream returned status ${response.status}`,
+            },
+          };
+          effectiveContentType = 'application/json';
+        } else {
+          body = rawText;
+        }
+      }
+
+      return { status: response.status, body, contentType: effectiveContentType };
     } catch (err) {
       const durationSeconds = (Date.now() - startedAt) / 1000;
       const isTimeout = err instanceof Error && err.name === 'AbortError';

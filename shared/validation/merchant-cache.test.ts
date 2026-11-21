@@ -57,3 +57,60 @@ test('getCachedMerchant: null loader result is not cached and returns null', asy
   assert.equal(loaderCalls, 2, 'null results must not be cached');
   assert.equal(cache.size, 0);
 });
+
+test('MerchantCache: enforces maxEntries cap and evicts oldest entries (FIFO/LRU)', () => {
+  const cache = new MerchantCache<string>(30_000, 3);
+  assert.equal(cache.maxEntries, 3);
+
+  cache.set('m-1', 'alpha');
+  cache.set('m-2', 'beta');
+  cache.set('m-3', 'gamma');
+  assert.equal(cache.size, 3);
+
+  // Inserting 4th item when max is 3 should evict the oldest entry ('m-1')
+  cache.set('m-4', 'delta');
+  assert.equal(cache.size, 3, 'cache size must not exceed maxEntries');
+  assert.equal(cache.get('m-1'), undefined, 'oldest entry m-1 should be evicted');
+  assert.equal(cache.get('m-2'), 'beta');
+  assert.equal(cache.get('m-3'), 'gamma');
+  assert.equal(cache.get('m-4'), 'delta');
+});
+
+test('MerchantCache: get() refreshes LRU recency to avoid eviction', () => {
+  const cache = new MerchantCache<string>({ ttlMs: 30_000, maxEntries: 3 });
+
+  cache.set('m-1', 'alpha');
+  cache.set('m-2', 'beta');
+  cache.set('m-3', 'gamma');
+
+  // Access m-1 to refresh its recency
+  assert.equal(cache.get('m-1'), 'alpha');
+
+  // Now inserting m-4 should evict m-2 (least recently used), not m-1
+  cache.set('m-4', 'delta');
+  assert.equal(cache.size, 3);
+  assert.equal(cache.get('m-2'), undefined, 'LRU entry m-2 should be evicted');
+  assert.equal(cache.get('m-1'), 'alpha', 'recently accessed m-1 should remain cached');
+  assert.equal(cache.get('m-3'), 'gamma');
+  assert.equal(cache.get('m-4'), 'delta');
+});
+
+test('MerchantCache: re-setting existing key updates value and recency without exceeding cap', () => {
+  const cache = new MerchantCache<string>(30_000, 2);
+
+  cache.set('m-1', 'initial');
+  cache.set('m-2', 'beta');
+  assert.equal(cache.size, 2);
+
+  // Update m-1
+  cache.set('m-1', 'updated');
+  assert.equal(cache.size, 2);
+  assert.equal(cache.get('m-1'), 'updated');
+
+  // Insert m-3 -> m-2 was least recently updated/accessed, so m-2 is evicted
+  cache.set('m-3', 'gamma');
+  assert.equal(cache.size, 2);
+  assert.equal(cache.get('m-2'), undefined);
+  assert.equal(cache.get('m-1'), 'updated');
+  assert.equal(cache.get('m-3'), 'gamma');
+});

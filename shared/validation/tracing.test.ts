@@ -10,6 +10,8 @@ import {
   TRACE_ID_HEADER,
   resolveTraceSampleRate,
   shouldSampleTrace,
+  sanitizeTraceId,
+  MAX_TRACE_ID_LENGTH,
 } from './tracing.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -41,6 +43,38 @@ test('extractTraceContext generates separate ids when absent', () => {
   assert.match(ctx.requestId, UUID_RE);
   assert.match(ctx.traceId, UUID_RE);
   assert.notStrictEqual(ctx.requestId, ctx.traceId, 'request id and trace id are distinct');
+});
+
+test('extractTraceContext preserves valid ids up to the length cap (#1078)', () => {
+  const maxLen = 'a'.repeat(MAX_TRACE_ID_LENGTH);
+  const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
+  const ctx = extractTraceContext({ [REQUEST_ID_HEADER]: maxLen, [TRACE_ID_HEADER]: uuid });
+  assert.strictEqual(ctx.requestId, maxLen);
+  assert.strictEqual(ctx.traceId, uuid);
+});
+
+test('extractTraceContext replaces oversized ids with a generated UUID (#1078)', () => {
+  const ctx = extractTraceContext({
+    [REQUEST_ID_HEADER]: 'r'.repeat(MAX_TRACE_ID_LENGTH + 1),
+    [TRACE_ID_HEADER]: 't'.repeat(10_000),
+  });
+  assert.match(ctx.requestId, UUID_RE);
+  assert.match(ctx.traceId, UUID_RE);
+});
+
+test('extractTraceContext replaces ids with control or unsafe characters (#1078)', () => {
+  for (const bad of ['req-1\nINFO forged log line', 'trace\r\nx-evil: 1', 'a\u0000b', 'has space', 'tab\there', 'caf\u00e9', '\u007f']) {
+    const ctx = extractTraceContext({ [REQUEST_ID_HEADER]: bad, [TRACE_ID_HEADER]: bad });
+    assert.match(ctx.requestId, UUID_RE, `request id ${JSON.stringify(bad)} is replaced`);
+    assert.match(ctx.traceId, UUID_RE, `trace id ${JSON.stringify(bad)} is replaced`);
+  }
+});
+
+test('sanitizeTraceId uses the first value of a repeated header (#1078)', () => {
+  assert.strictEqual(sanitizeTraceId(['trace-1', 'trace-2']), 'trace-1');
+  assert.strictEqual(sanitizeTraceId(['x'.repeat(MAX_TRACE_ID_LENGTH + 1), 'trace-2']), undefined);
+  assert.strictEqual(sanitizeTraceId(''), undefined);
+  assert.strictEqual(sanitizeTraceId(undefined), undefined);
 });
 
 test('propagateTracingHeaders forwards both tracing headers and preserves others', () => {
@@ -112,4 +146,19 @@ test('registerTracing uses TRACE_SAMPLE_RATE from the environment', async () => 
     else process.env.TRACE_SAMPLE_RATE = previousRate;
     await app.close();
   }
+});
+
+test('registerTracing replaces an oversized incoming trace id with a UUID (#1078)', async () => {
+  const app = Fastify({ logger: false });
+  registerTracing(app);
+  app.get('/', async (request) => ({ requestId: request.headers[REQUEST_ID_HEADER] }));
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/',
+    headers: { [TRACE_ID_HEADER]: 'x'.repeat(MAX_TRACE_ID_LENGTH + 1) },
+  });
+
+  assert.match(String(res.headers[TRACE_ID_HEADER]), UUID_RE, 'oversized trace id is replaced');
+  await app.close();
 });

@@ -32,13 +32,18 @@ function row(i: number, asset = 'USDC'): Row {
 
 // In-memory prisma double that honours orderBy/take on findMany.
 function setup(rows: Row[]) {
-  const batches: { id: string; asset: string; ids: string[] }[] = [];
+  const batches: { id: string; asset: string; ids: string[]; totalGross?: string; totalFees?: string; totalNet?: string }[] = [];
   const findManyArgs: any[] = [];
   const prisma = {
+    $transaction: async (cb: any) => cb(prisma),
     settlement: {
       findMany: async (args: any) => {
         findManyArgs.push(args);
-        let found = rows.filter((r) => r.status === args.where.status);
+        let found = rows.filter((r) => {
+          if (args.where.status && r.status !== args.where.status) return false;
+          if (args.where.batchId === null && (r as any).batchId !== undefined && (r as any).batchId !== null) return false;
+          return true;
+        });
         for (const order of [...(args.orderBy ?? [])].reverse()) {
           const [field, dir] = Object.entries(order)[0] as [keyof Row, string];
           found = [...found].sort((a, b) => {
@@ -51,16 +56,37 @@ function setup(rows: Row[]) {
       },
       updateMany: async (args: any) => {
         const ids: string[] = args.where.id.in;
-        for (const r of rows) if (ids.includes(r.id)) r.status = args.data.status;
-        batches[batches.length - 1].ids.push(...ids);
-        return { count: ids.length };
+        let count = 0;
+        for (const r of rows) {
+          if (ids.includes(r.id)) {
+            if (args.where.status && r.status !== args.where.status) continue;
+            if (args.where.batchId === null && (r as any).batchId !== undefined && (r as any).batchId !== null) continue;
+            r.status = args.data.status;
+            (r as any).batchId = args.data.batchId;
+            count++;
+          }
+        }
+        if (batches.length > 0) {
+          batches[batches.length - 1].ids.push(...ids);
+        }
+        return { count };
       },
     },
     settlementBatch: {
       create: async (args: any) => {
-        const batch = { id: `b${batches.length + 1}`, asset: args.data.asset, ids: [] as string[] };
+        const batch = {
+          id: `b${batches.length + 1}`,
+          asset: args.data.asset,
+          ids: [] as string[],
+          totalGross: args.data.totalGross,
+          totalFees: args.data.totalFees,
+          totalNet: args.data.totalNet,
+        };
         batches.push(batch);
         return batch;
+      },
+      updateMany: async (args: any) => {
+        return { count: 1 };
       },
     },
   };
@@ -183,26 +209,145 @@ test('assets below the count and volume thresholds are left pending', async (t) 
   t.end();
 });
 
-test('claimBatchForProcessing throws BatchAlreadyProcessedError on a duplicate claim', async (t) => {
+test('claimBatchForProcessing returns null when updateMany.count === 0', async (t) => {
   let claimed = false;
+  let findUniqueCalls = 0;
   const prisma = {
-    $executeRaw: async () => {
-      if (claimed) return 0;
-      claimed = true;
-      return 1;
-    },
     settlementBatch: {
-      findUnique: async () => ({ processedAt: new Date(T0) }),
+      updateMany: async () => {
+        if (claimed) return { count: 0 };
+        claimed = true;
+        return { count: 1 };
+      },
+      findUnique: async () => {
+        findUniqueCalls++;
+        return { processedAt: new Date(T0) };
+      },
     },
   } as any;
 
   t.equal(await claimBatchForProcessing(prisma, 'batch_1'), true, 'first claim succeeds');
-  try {
-    await claimBatchForProcessing(prisma, 'batch_1');
-    t.fail('duplicate claim should throw');
-  } catch (err) {
-    t.ok(err instanceof BatchAlreadyProcessedError, 'duplicate claim raises BatchAlreadyProcessedError');
-    t.match((err as Error).message, /batch_1/, 'message names the batch');
-  }
+  const secondClaim = await claimBatchForProcessing(prisma, 'batch_1');
+  t.equal(secondClaim, null, 'second claim returns null immediately without throwing');
+  t.equal(findUniqueCalls, 0, 'did not call findUnique when count === 0');
+  t.end();
+});
+
+test('claimBatchForProcessing concurrency: two concurrent callers never receive the same claimed batch', async (t) => {
+  let claimed = false;
+  const prisma = {
+    settlementBatch: {
+      updateMany: async () => {
+        // Atomic check-and-set: only one caller wins
+        if (claimed) return { count: 0 };
+        claimed = true;
+        return { count: 1 };
+      },
+    },
+  } as any;
+
+  const [resA, resB] = await Promise.all([
+    claimBatchForProcessing(prisma, 'batch_concurrent'),
+    claimBatchForProcessing(prisma, 'batch_concurrent'),
+  ]);
+
+  const successCount = [resA, resB].filter((r) => r === true).length;
+  const nullCount = [resA, resB].filter((r) => r === null).length;
+
+  t.equal(successCount, 1, 'exactly one worker receives the claimed batch');
+  t.equal(nullCount, 1, 'the other worker receives null');
+  t.end();
+});
+
+test('concurrent runSettlementBatching invocations cannot double-assign settlements with Redis lock', async (t) => {
+  const rows = [row(1, 'USDC'), row(2, 'USDC')];
+  const { prisma, batches } = setup(rows);
+
+  let lockHolder: string | null = null;
+  const mockRedis = {
+    set: async (_key: string, val: string, _px: string, _ttl: number, _nx: string) => {
+      if (lockHolder !== null) {
+        return null; // lock already held
+      }
+      lockHolder = val;
+      return 'OK';
+    },
+    eval: async (_script: string, _keysCount: number, _key: string, val: string) => {
+      if (lockHolder === val) {
+        lockHolder = null;
+        return 1;
+      }
+      return 0;
+    },
+  };
+
+  // Run two invocations concurrently
+  const [res1, res2] = await Promise.all([
+    runSettlementBatching(prisma, { ...config, redis: mockRedis }, T0, log, T0),
+    runSettlementBatching(prisma, { ...config, redis: mockRedis }, T0, log, T0),
+  ]);
+
+  const batchedCounts = [res1.batched, res2.batched].sort((a, b) => b - a);
+  t.deepEqual(batchedCounts, [2, 0], 'one invocation batched all 2, the locked invocation batched 0');
+  t.equal(batches.length, 1, 'only one batch created');
+  t.end();
+});
+
+test('runSettlementBatching never attaches non-pending or already-batched settlements to a batch', async (t) => {
+  const pendingRow = row(1, 'USDC');
+  const alreadyBatchedRow = { ...row(2, 'USDC'), batchId: 'batch-existing' };
+  const processingRow = { ...row(3, 'USDC'), status: 'processing' };
+  const completedRow = { ...row(4, 'USDC'), status: 'completed' };
+
+  const rows = [pendingRow, alreadyBatchedRow, processingRow, completedRow];
+  const { prisma, batches } = setup(rows);
+
+  const result = await runSettlementBatching(
+    prisma,
+    { ...config, minCount: 1 },
+    T0,
+    log,
+    T0,
+  );
+
+  t.equal(result.batched, 1, 'only the truly pending settlement without batchId was batched');
+  t.equal(batches.length, 1, 'one batch created');
+  t.deepEqual(batches[0].ids, ['s001'], 'only s001 attached to batch');
+  t.equal(alreadyBatchedRow.batchId, 'batch-existing', 'already batched settlement left untouched');
+  t.end();
+});
+
+test('runSettlementBatching formats aggregated batch totals with fixed-decimal without scientific notation', async (t) => {
+  // Very small fractional amounts and large amounts that would trigger scientific notation with .toString()
+  const microRow: Row = {
+    id: 'micro-1',
+    asset: 'USDC',
+    status: 'pending',
+    initiatedAt: new Date(T0),
+    grossAmount: '0.00000001',
+    feeAmount: '0.000000001',
+    netAmount: '0.000000009',
+  };
+  const microRow2: Row = {
+    id: 'micro-2',
+    asset: 'USDC',
+    status: 'pending',
+    initiatedAt: new Date(T0 + 1000),
+    grossAmount: '0.00000002',
+    feeAmount: '0.000000002',
+    netAmount: '0.000000018',
+  };
+
+  const rows = [microRow, microRow2];
+  const { prisma, batches } = setup(rows);
+
+  await runSettlementBatching(prisma, { ...config, minCount: 2 }, T0, log, T0);
+
+  t.equal(batches.length, 1, 'batch created');
+  const batch = batches[0];
+  t.notOk(batch.totalGross?.includes('e'), 'totalGross does not contain scientific notation');
+  t.notOk(batch.totalFees?.includes('e'), 'totalFees does not contain scientific notation');
+  t.notOk(batch.totalNet?.includes('e'), 'totalNet does not contain scientific notation');
+  t.equal(batch.totalGross, '0.00000003', 'totalGross formatted as exact decimal string');
   t.end();
 });
