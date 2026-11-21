@@ -1,3 +1,4 @@
+import { redactReconcileLog } from './reconcile-redaction.js';
 /**
  * Settlement Engine — BettaPay Backend
  *
@@ -69,23 +70,7 @@ import { getMerchantMaxConcurrency } from './settlement-properties.js';
  * Replaces merchant identifiers and raw amounts with redacted placeholders so
  * log aggregators never store payment-level PII.
  */
-function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
-  const out = { ...obj } as Record<string, unknown>;
-  for (const key of Object.keys(out)) {
-    const lk = key.toLowerCase();
-    if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
-      const v = out[key];
-      // Keep a stable prefix for cross-entry correlation without exposing the full id.
-      out[key] = typeof v === 'string' ? `${v.slice(0, 4)}***` : '[REDACTED]';
-    } else if (
-      lk.includes('amount') || lk.includes('diff') || lk.includes('gross') ||
-      lk.includes('fee') || lk.includes('net')
-    ) {
-      out[key] = '[REDACTED]';
-    }
-  }
-  return out as T;
-}
+
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
 import {
