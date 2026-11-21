@@ -242,6 +242,42 @@ test('response shape is stable across calls in each mode', async (t) => {
   t.end();
 });
 
+test('real run skips redundant dry-run count, findFirst, and raw size queries (#1065)', async (t) => {
+  installFakes();
+  let countCalls = 0;
+  let findFirstCalls = 0;
+  let queryRawCalls = 0;
+  const origFakeCount = prisma.indexedEvent.count;
+  const origFakeFindFirst = prisma.indexedEvent.findFirst;
+  const origFakeQueryRaw = prisma.$queryRawUnsafe;
+
+  prisma.indexedEvent.count = (async (...args: any[]) => {
+    countCalls += 1;
+    return (origFakeCount as any)(...args);
+  }) as any;
+  prisma.indexedEvent.findFirst = (async (...args: any[]) => {
+    findFirstCalls += 1;
+    return (origFakeFindFirst as any)(...args);
+  }) as any;
+  prisma.$queryRawUnsafe = (async (...args: any[]) => {
+    queryRawCalls += 1;
+    return (origFakeQueryRaw as any)(...args);
+  }) as any;
+
+  try {
+    const { status, body } = await cleanup();
+    t.equal(status, 200, 'real run responds 200');
+    t.equal(body.status, 'completed', 'real run status is completed');
+    t.equal(body.deletedCount, 2, 'real run deletes expired rows');
+    t.equal(countCalls, 0, 'real run does not execute redundant count query');
+    t.equal(findFirstCalls, 0, 'real run does not execute redundant findFirst query');
+    t.equal(queryRawCalls, 0, 'real run does not execute redundant size raw query');
+  } finally {
+    restoreFakes();
+  }
+  t.end();
+});
+
 test.onFinish(() => {
   // The indexer module opens Redis/queue connections at import time.
   process.exit(0);

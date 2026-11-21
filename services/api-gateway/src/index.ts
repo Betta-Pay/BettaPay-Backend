@@ -63,6 +63,7 @@ import {
   createValidationContext,
   auditRouteAuthPolicy,
   installCrashHandlers,
+  GoogleAuthBody,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -2165,10 +2166,6 @@ fastify.get('/api/admin/auth/ip-score', {
   interface GoogleAuthRouteBody {
     token?: unknown;
   }
-
-  const GoogleAuthBody = z.object({
-    token: z.string().min(1, "token is required"),
-  });
 
   fastify.post<{ Body: GoogleAuthRouteBody }>(
     "/api/auth/google",

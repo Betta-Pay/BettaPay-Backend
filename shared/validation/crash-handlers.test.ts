@@ -156,3 +156,43 @@ test('installCrashHandlers: handles unhandledRejection by logging once and calli
     _resetCrashHandlersForTesting();
   }
 });
+
+// #1080 — single implementation, re-exported from logger.ts, prefers fatal.
+test('installCrashHandlers: logger.ts re-exports the crash-handlers implementation', async () => {
+  const fromLogger = await import('./logger.js');
+  assert.equal(fromLogger.installCrashHandlers, installCrashHandlers);
+});
+
+test('installCrashHandlers: uses logger.fatal when available', () => {
+  const originalOn = process.on;
+  const originalExit = process.exit;
+  const registered: Record<string, ((...args: any[]) => void)[]> = {};
+
+  process.on = function (event: string | symbol, listener: (...args: any[]) => void) {
+    const key = String(event);
+    (registered[key] ??= []).push(listener);
+    return process;
+  } as any;
+  process.exit = function () {
+    return undefined as never;
+  } as any;
+
+  _resetCrashHandlersForTesting();
+
+  try {
+    const logger = { ...createLoggerSpy(), fatalCalls: [] as { obj: object; msg?: string }[] };
+    (logger as any).fatal = (obj: object, msg?: string) => logger.fatalCalls.push({ obj, msg });
+    installCrashHandlers(logger);
+
+    const err = new Error('boom');
+    registered['uncaughtException'][0](err);
+
+    assert.equal(logger.fatalCalls.length, 1);
+    assert.equal(logger.errorCalls.length, 0);
+    assert.deepEqual(logger.fatalCalls[0], { obj: { err }, msg: 'Uncaught exception — exiting' });
+  } finally {
+    process.on = originalOn;
+    process.exit = originalExit;
+    _resetCrashHandlersForTesting();
+  }
+});

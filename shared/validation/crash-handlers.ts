@@ -1,5 +1,14 @@
 import type { MinimalLogger } from './redis.js';
 
+/**
+ * Logger accepted by installCrashHandlers. Fastify/Pino loggers satisfy this;
+ * when `fatal` is available it is preferred over `error` so crash lines land
+ * at the highest severity.
+ */
+export interface CrashHandlerLogger extends MinimalLogger {
+  fatal?: (obj: object, msg?: string) => void;
+}
+
 let installed = false;
 
 /**
@@ -10,20 +19,25 @@ let installed = false;
  *
  * Registration is idempotent (#862) — calling installCrashHandlers more than
  * once within the same process will not register duplicate handlers.
+ *
+ * This is the single implementation; `logger.ts` re-exports it (#1080).
  */
-export function installCrashHandlers(logger: MinimalLogger): void {
+export function installCrashHandlers(logger: CrashHandlerLogger): void {
   if (installed) {
     return;
   }
   installed = true;
 
+  const logFatal = (obj: object, msg: string) =>
+    logger.fatal ? logger.fatal(obj, msg) : logger.error(obj, msg);
+
   process.on('uncaughtException', (err) => {
-    logger.error({ err }, 'Uncaught exception — exiting');
+    logFatal({ err }, 'Uncaught exception — exiting');
     process.exit(1);
   });
 
   process.on('unhandledRejection', (reason) => {
-    logger.error({ err: reason }, 'Unhandled rejection — exiting');
+    logFatal({ err: reason }, 'Unhandled rejection — exiting');
     process.exit(1);
   });
 }

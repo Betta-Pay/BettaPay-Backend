@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
+import { Asset, Operation } from '@stellar/stellar-sdk';
+import { buildPaymentOperation, buildSetOptionsOp, validateStellarAddress, toStellarAmount, fromStellarAmount } from './index.js';
 
 const VALID_KEY = 'GCCTLHSAZTFDGPG4IT4HHGOUFHSX6K4VUEKXCGWP2ZWG2U3FUO4HOAZO';
 
@@ -25,9 +26,42 @@ test('toStellarAmount', async (t) => {
     assert.strictEqual(toStellarAmount('100.50'), '1005000000');
   });
 
-  await t.test('truncates excess decimal places instead of rounding', () => {
-    // 8 decimal digits provided but decimals=7; the 8th digit is dropped
-    assert.strictEqual(toStellarAmount('1.00000009'), '10000000');
+  await t.test('throws RangeError for excess decimal places instead of truncating', () => {
+    // 8 decimal digits provided but decimals=7; silently dropping the 8th would underpay
+    assert.throws(
+      () => toStellarAmount('1.00000009'),
+      (err: unknown) => err instanceof RangeError && /8 fractional digits but at most 7/.test((err as RangeError).message),
+    );
+    assert.throws(() => toStellarAmount('1.000', 2), RangeError);
+  });
+
+  await t.test('accepts exactly `decimals` fractional digits', () => {
+    assert.strictEqual(toStellarAmount('1.1234567'), '11234567');
+    assert.strictEqual(toStellarAmount('1.12', 2), '112');
+  });
+
+  await t.test('converts amounts beyond Number.MAX_SAFE_INTEGER exactly', () => {
+    assert.strictEqual(toStellarAmount('922337203685.4775807'), '9223372036854775807');
+    assert.strictEqual(
+      toStellarAmount('123456789012345678901234567890.1234567'),
+      '1234567890123456789012345678901234567',
+    );
+  });
+
+  await t.test('scales exactly for large decimals values where 10 ** decimals is imprecise', () => {
+    // 10 ** 23 === 9.999999999999999e22 in floating point
+    assert.strictEqual(toStellarAmount('1', 23), '1' + '0'.repeat(23));
+    assert.strictEqual(toStellarAmount('0.' + '0'.repeat(29) + '1', 30), '1');
+  });
+
+  await t.test('supports decimals = 0', () => {
+    assert.strictEqual(toStellarAmount('42', 0), '42');
+    assert.throws(() => toStellarAmount('42.1', 0), RangeError);
+  });
+
+  await t.test('throws RangeError for an invalid decimals parameter', () => {
+    assert.throws(() => toStellarAmount('1', -1), RangeError);
+    assert.throws(() => toStellarAmount('1', 1.5), RangeError);
   });
 
   await t.test('respects a custom decimals parameter', () => {
@@ -98,6 +132,27 @@ test('toStellarAmount', async (t) => {
   });
 });
 
+test('formatAmount', async (t) => {
+  await t.test('formats a valid stroops string', () => {
+    assert.strictEqual(formatAmount('15000000'), '1.5');
+    assert.strictEqual(formatAmount('100', 2), '1');
+  });
+
+  for (const bad of ['', 'abc-corrupted-payload', '1.5', '-1', '1e10', ' 1', 'NaN']) {
+    await t.test(`throws TypeError instead of falling back for ${JSON.stringify(bad)}`, () => {
+      assert.throws(
+        () => formatAmount(bad),
+        (err: unknown) => err instanceof TypeError && /formatAmount: invalid stroops amount/.test((err as TypeError).message),
+      );
+    });
+  }
+
+  await t.test('throws TypeError for non-string input', () => {
+    assert.throws(() => formatAmount(15000000 as unknown as string), TypeError);
+    assert.throws(() => formatAmount(null as unknown as string), TypeError);
+  });
+});
+
 test('fromStellarAmount', async (t) => {
   await t.test('converts a stroops string to a decimal amount', () => {
     assert.strictEqual(fromStellarAmount('15000000'), '1.5');
@@ -115,6 +170,34 @@ test('fromStellarAmount', async (t) => {
 
   await t.test('handles a large stroops value', () => {
     assert.strictEqual(fromStellarAmount('1000000000000000'), '100000000');
+  });
+
+  await t.test('converts values beyond Number.MAX_SAFE_INTEGER exactly', () => {
+    assert.strictEqual(fromStellarAmount('9223372036854775807'), '922337203685.4775807');
+    assert.strictEqual(
+      fromStellarAmount('1234567890123456789012345678901234567'),
+      '123456789012345678901234567890.1234567',
+    );
+  });
+
+  await t.test('scales exactly for large decimals values where 10 ** decimals is imprecise', () => {
+    assert.strictEqual(fromStellarAmount('1' + '0'.repeat(23), 23), '1');
+    assert.strictEqual(fromStellarAmount('1', 30), '0.' + '0'.repeat(29) + '1');
+  });
+
+  await t.test('supports decimals = 0', () => {
+    assert.strictEqual(fromStellarAmount('0042', 0), '42');
+  });
+
+  await t.test('round-trips with toStellarAmount', () => {
+    for (const amount of ['0', '1', '0.0000001', '100.5', '922337203685.4775807', '98765432109876543210.0000001']) {
+      assert.strictEqual(fromStellarAmount(toStellarAmount(amount)), amount);
+    }
+  });
+
+  await t.test('throws RangeError for an invalid decimals parameter', () => {
+    assert.throws(() => fromStellarAmount('1', -1), RangeError);
+    assert.throws(() => fromStellarAmount('1', Number.NaN), RangeError);
   });
 
   await t.test('throws TypeError for an empty string', () => {
@@ -320,5 +403,72 @@ test('buildSetOptionsOp', async (t) => {
     assert.strictEqual(op.medThreshold, 2);
     assert.strictEqual(op.highThreshold, 3);
     assert.deepStrictEqual(op.signer, { key: VALID_KEY, weight: 1 });
+  });
+});
+
+test('buildPaymentOperation (#1089)', async (t) => {
+  const ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+
+  await t.test('builds a native payment operation', () => {
+    const op = buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '10.5' });
+    const decoded = Operation.fromXDRObject(op);
+    assert.strictEqual(decoded.type, 'payment');
+    if (decoded.type !== 'payment') return;
+    assert.strictEqual(decoded.destination, VALID_KEY);
+    assert.ok(decoded.asset.isNative());
+    assert.strictEqual(decoded.amount, '10.5000000');
+  });
+
+  await t.test('builds an issued-asset payment from CODE:ISSUER and Asset instances', () => {
+    for (const asset of [`USDC:${ISSUER}`, new Asset('USDC', ISSUER)]) {
+      const decoded = Operation.fromXDRObject(buildPaymentOperation({ destination: VALID_KEY, asset, amount: '1' }));
+      if (decoded.type !== 'payment') return assert.fail('expected payment');
+      assert.strictEqual(decoded.asset.getCode(), 'USDC');
+      assert.strictEqual(decoded.asset.getIssuer(), ISSUER);
+    }
+  });
+
+  await t.test('sets the source account when provided', () => {
+    const decoded = Operation.fromXDRObject(buildPaymentOperation({ source: ISSUER, destination: VALID_KEY, asset: 'XLM', amount: '1' }));
+    assert.strictEqual(decoded.source, ISSUER);
+  });
+
+  await t.test('rejects an invalid destination', () => {
+    assert.throws(
+      () => buildPaymentOperation({ destination: 'NOTAKEY', asset: 'native', amount: '1' }),
+      /destination must be a valid Stellar address/,
+    );
+  });
+
+  await t.test('rejects an invalid source', () => {
+    assert.throws(
+      () => buildPaymentOperation({ source: 'GBAD', destination: VALID_KEY, asset: 'native', amount: '1' }),
+      /source must be a valid Stellar address/,
+    );
+  });
+
+  await t.test('rejects zero and negative amounts', () => {
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '0' }), /greater than zero/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '0.0000000' }), /greater than zero/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '-5' }), /decimal string/);
+  });
+
+  await t.test('rejects malformed amounts and excess precision', () => {
+    for (const amount of ['', 'abc', '1e5', '1.', '.5', '1.12345678']) {
+      assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount }), /decimal string/, amount);
+    }
+  });
+
+  await t.test('rejects amounts above the int64 stroop limit', () => {
+    assert.throws(
+      () => buildPaymentOperation({ destination: VALID_KEY, asset: 'native', amount: '922337203685.4775808' }),
+      /exceeds the maximum/,
+    );
+  });
+
+  await t.test('rejects malformed assets', () => {
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'USDC', amount: '1' }), /CODE:ISSUER/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: 'USDC:NOTAKEY', amount: '1' }), /issuer must be a valid/);
+    assert.throws(() => buildPaymentOperation({ destination: VALID_KEY, asset: `TOOLONGASSETCODE:${ISSUER}`, amount: '1' }), /1-12 alphanumeric/);
   });
 });
