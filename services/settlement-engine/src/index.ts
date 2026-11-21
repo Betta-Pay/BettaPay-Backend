@@ -48,6 +48,7 @@ import { buildSettlementWebhookData } from './webhook-payload.js';
 import {
   createSettlementWithUniqueGuard,
   updateSettlementWithOptimisticLock,
+  transitionSettlementStatus,
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
@@ -169,36 +170,9 @@ export function validateTransition(current: string, next: string) {
   }
 }
 
-const prisma = prismaBase.$extends({
-  query: {
-    settlement: {
-      async update({ args, query }) {
-        if (args.data.status) {
-          const current = await prismaBase.settlement.findUnique({
-            where: args.where,
-            select: { status: true },
-          });
-          if (current) {
-            validateTransition(current.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-      async updateMany({ args, query }) {
-        if (args.data.status) {
-          const records = await prismaBase.settlement.findMany({
-            where: args.where,
-            select: { id: true, status: true },
-          });
-          for (const record of records) {
-            validateTransition(record.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-    },
-  },
-}) as unknown as typeof prismaBase;
+// Status transitions are enforced atomically in the UPDATE's WHERE clause by
+// transitionSettlementStatus (prisma-adapter.ts), not by a read-then-write hook.
+const prisma = prismaBase;
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single settlement creation request (#741).
@@ -537,15 +511,11 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
   try {
     // Transition to processing first
-    await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'processing' },
-    });
+    await transitionSettlementStatus(prisma, settlementId, 'processing');
 
     // In a real app this interacts with Soroban; here we mark completed.
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'completed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'completed', {
+      completedAt: new Date(),
     });
 
     log.info({ settlementId }, 'Settlement completed in database');
@@ -563,9 +533,8 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
   } catch (error) {
     log.error({ error, settlementId }, 'Settlement processing failed');
 
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'failed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'failed', {
+      completedAt: new Date(),
     }).catch(() => null);
 
     if (updatedSettlement?.webhookUrl) {
