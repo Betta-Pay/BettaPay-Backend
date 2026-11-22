@@ -19,6 +19,19 @@ export const ABANDONED_PAYMENTS_CRON_INTERVAL_ENV =
   'ABANDONED_PAYMENTS_CRON_INTERVAL_MS';
 
 /**
+ * Lua script for atomic lock release — only deletes the lock if the stored
+ * value matches what we wrote, preventing accidental deletion of a lock
+ * acquired by another gateway instance.
+ */
+export const RELEASE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+/**
  * Resolves the sweep interval in milliseconds.
  *
  * `ABANDONED_PAYMENTS_CRON_INTERVAL_MS` overrides the default; a missing or
@@ -46,18 +59,44 @@ export function getAbandonedPaymentsCronIntervalMs(): number {
 export async function autoExpireAbandonedPayments(
   prisma: PrismaClient,
   logger: FastifyLoggerInstance,
-  abandonmentHours: number,
+  abandonmentHours: number = DEFAULT_PAYMENT_ABANDONMENT_HOURS,
   webhookQueue?: Queue<WebhookJobData>,
+  redis?: any,
 ): Promise<number> {
-  if (abandonmentHours <= 0) {
+  let safeHours = abandonmentHours;
+  if (!Number.isFinite(safeHours)) {
+    logger.warn?.({ abandonmentHours }, `Invalid abandonmentHours; falling back to ${DEFAULT_PAYMENT_ABANDONMENT_HOURS}`);
+    safeHours = DEFAULT_PAYMENT_ABANDONMENT_HOURS;
+  }
+
+  if (safeHours <= 0) {
     logger.info('Payment abandonment is disabled (PAYMENT_ABANDONMENT_HOURS <= 0).');
     return 0;
+  }
+
+  let lockAcquired = false;
+  const lockKey = 'lock:auto-expire-abandoned-payments';
+  const lockVal = randomUUID();
+  const lockTtlMs = 5 * 60 * 1000;
+
+  if (redis && typeof redis.set === 'function') {
+    try {
+      const res = await redis.set(lockKey, lockVal, 'PX', lockTtlMs, 'NX');
+      if (res !== 'OK' && res !== true && res !== '1') {
+        logger.info('Abandoned payments cron lock held by another instance; skipping run.');
+        return 0;
+      }
+      lockAcquired = true;
+    } catch (err) {
+      logger.warn?.({ err }, 'Failed to acquire Redis lock for abandoned payments cron');
+      return 0;
+    }
   }
 
   const traceId = randomUUID();
   logger.info({ traceId }, 'Starting abandoned payments sweep');
 
-  const cutoff = new Date(Date.now() - abandonmentHours * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - safeHours * 60 * 60 * 1000);
 
   try {
     let cursor: string | undefined;
@@ -81,7 +120,10 @@ export async function autoExpireAbandonedPayments(
 
       const ids = stalePayments.map((p) => p.id);
       const result = await prisma.payment.updateMany({
-        where: { id: { in: ids } },
+        where: {
+          id: { in: ids },
+          status: 'initiated',
+        },
         data: { status: 'cancelled' },
       });
       expiredCount += result.count;
@@ -139,6 +181,10 @@ export async function autoExpireAbandonedPayments(
   } catch (error) {
     logger.error({ traceId, err: error }, 'Error during abandoned payment expiration cron job.');
     return 0;
+  } finally {
+    if (lockAcquired && redis && typeof redis.eval === 'function') {
+      await redis.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, lockVal).catch(() => {});
+    }
   }
 }
 
@@ -147,8 +193,13 @@ export function startAbandonedPaymentsCron(
   logger: FastifyLoggerInstance,
   abandonmentHours: number = DEFAULT_PAYMENT_ABANDONMENT_HOURS,
   webhookQueue?: Queue<WebhookJobData>,
+  redis?: any,
 ) {
   if (cronInterval) return;
+
+  const validHours = Number.isFinite(abandonmentHours)
+    ? abandonmentHours
+    : DEFAULT_PAYMENT_ABANDONMENT_HOURS;
 
   const envVal = process.env[ABANDONED_PAYMENTS_CRON_INTERVAL_ENV];
   const intervalMs = getAbandonedPaymentsCronIntervalMs();
@@ -159,7 +210,7 @@ export function startAbandonedPaymentsCron(
     );
   }
 
-  const runJob = () => autoExpireAbandonedPayments(prisma, logger, abandonmentHours, webhookQueue).catch(err => logger.error({ err }, 'Abandoned payments cron job failed unexpectedly.'));
+  const runJob = () => autoExpireAbandonedPayments(prisma, logger, validHours, webhookQueue, redis).catch(err => logger.error({ err }, 'Abandoned payments cron job failed unexpectedly.'));
   cronInterval = setInterval(runJob, intervalMs);
 }
 

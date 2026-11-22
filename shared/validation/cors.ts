@@ -59,7 +59,29 @@ export function createCorsOriginsSchema(nodeEnv?: string) {
 
     if (isProduction) {
       origins.forEach((origin, i) => {
-        if (!origin.startsWith('https://')) {
+        try {
+          const url = new URL(origin);
+          const hasPath = (url.pathname !== '/' && url.pathname !== '') || origin.endsWith('/');
+          const hasQueryOrHash = Boolean(url.search) || Boolean(url.hash);
+          const hasWildcard = url.hostname.includes('*');
+
+          if (
+            url.protocol !== 'https:' ||
+            !url.hostname ||
+            hasPath ||
+            hasQueryOrHash ||
+            hasWildcard
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i],
+              message:
+                url.protocol !== 'https:'
+                  ? 'CORS origins must use HTTPS in production.'
+                  : `"${origin}" is not a valid CORS origin in production.`,
+            });
+          }
+        } catch {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: [i],

@@ -28,6 +28,18 @@ test('validateMemo — text', async (t) => {
     // '€' is 3 bytes — 10 chars = 30 bytes
     assert.equal(validateMemo('text', '€'.repeat(10)), false);
   });
+
+  await t.test('rejects a memo containing a null byte', () => {
+    assert.equal(validateMemo('text', 'abc\0def'), false);
+  });
+
+  await t.test('rejects a memo that is only a null byte', () => {
+    assert.equal(validateMemo('text', '\0'), false);
+  });
+
+  await t.test('rejects a trailing null byte', () => {
+    assert.equal(validateMemo('text', 'invoice-42\0'), false);
+  });
 });
 
 test('validateMemo — id', async (t) => {

@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -11,6 +12,8 @@ import {
   checkRedisPing,
   computeOverallStatus,
   getBullmqWaitingThreshold,
+  readServiceVersion,
+  POSTGRESQL_DEGRADED_LATENCY_MS,
 } from './health.js';
 
 import { HealthResponse as HealthResponseSchema, type DependencyHealth, type HealthResponse } from './schemas.js';
@@ -470,4 +473,71 @@ test('getBullmqWaitingThreshold: reads env variable or defaults to 1000 (#896)',
       delete process.env.BULLMQ_WAITING_DEGRADED_THRESHOLD;
     }
   }
+});
+// ─── #1083 ──────────────────────────────────────────────────────────────────
+
+test('readServiceVersion resolves package.json from src/, dist/ and nested dist/src/', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+
+  const root = mkdtempSync(join(tmpdir(), 'svc-version-'));
+  try {
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'svc', version: '4.5.6' }));
+    for (const sub of ['src', 'dist', join('dist', 'src')]) {
+      mkdirSync(join(root, sub), { recursive: true });
+      const moduleUrl = pathToFileURL(join(root, sub, 'index.js')).href;
+      assert.equal(readServiceVersion(moduleUrl), '4.5.6', `from ${sub}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('checkPostgresql flags latency above POSTGRESQL_DEGRADED_LATENCY_MS as degraded', async () => {
+  const realNow = performance.now.bind(performance);
+  let calls = 0;
+  // First call is the start mark, second is the end mark.
+  performance.now = () => (calls++ === 0 ? 0 : POSTGRESQL_DEGRADED_LATENCY_MS + 50);
+  try {
+    const dep = await checkPostgresql(async () => [{ serverVersion: 'PostgreSQL 16' }]);
+    assert.equal(dep.status, 'connected');
+    assert.equal(dep.details?.degraded, true);
+    assert.equal(dep.details?.degradedThresholdMs, POSTGRESQL_DEGRADED_LATENCY_MS);
+    assert.equal(dep.details?.serverVersion, 'PostgreSQL 16');
+  } finally {
+    performance.now = realNow;
+  }
+});
+
+test('checkPostgresql does not flag fast responses as degraded', async () => {
+  const dep = await checkPostgresql(async () => [{ serverVersion: 'PostgreSQL 16' }]);
+  assert.equal(dep.details?.degraded, undefined);
+});
+
+test('checkBullMQ coalesces missing or non-numeric job counts to 0', async () => {
+  const dep = await checkBullMQ(async () => undefined as never, 'bullmq-test');
+  assert.deepEqual(dep.details, {
+    queueName: 'bullmq-test', isPaused: false, waiting: 0, active: 0, failed: 0, delayed: 0,
+  });
+
+  const partial = await checkBullMQ(async () => ({ waiting: 3, active: NaN }) as never, 'bullmq-test');
+  assert.equal((partial.details as Record<string, number>).waiting, 3);
+  assert.equal((partial.details as Record<string, number>).active, 0);
+  assert.equal((partial.details as Record<string, number>).failed, 0);
+});
+
+test('checkRedisPing populates details.error when the ping fails', async () => {
+  const dep = await checkRedisPing(async () => {
+    throw new Error('ECONNREFUSED');
+  });
+  assert.equal(dep.status, 'disconnected');
+  assert.equal(dep.details?.error, 'ECONNREFUSED');
+});
+
+test('checkRedisPing populates details.error on an unexpected ping reply', async () => {
+  const dep = await checkRedisPing(async () => 'LOADING');
+  assert.equal(dep.status, 'disconnected');
+  assert.equal(dep.details?.error, 'Unexpected PING response: LOADING');
 });

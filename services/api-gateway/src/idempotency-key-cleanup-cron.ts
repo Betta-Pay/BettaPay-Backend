@@ -20,7 +20,10 @@ export interface CronOptions {
   intervalMs?: number;
   jitterMs?: number;
   redis?: any;
+  batchSize?: number;
 }
+
+export const DEFAULT_IDEMPOTENCY_CLEANUP_BATCH_SIZE = 100;
 
 export function getCronIntervalMs(opts?: CronOptions): number {
   if (opts?.intervalMs && opts.intervalMs > 0) return opts.intervalMs;
@@ -55,11 +58,32 @@ const RELEASE_LOCK_SCRIPT = `
 export async function reclaimExpiredIdempotencyKeys(
   prisma: PrismaClient,
   logger: FastifyLoggerInstance,
-  redis?: any,
+  redisOrOpts?: any,
+  batchSizeParam?: number,
 ): Promise<number> {
   if (isCronRunning) {
     logger.info('Idempotency key cleanup cron job already in progress; skipping execution.');
     return 0;
+  }
+
+  let redis: any = redisOrOpts;
+  let batchSize: number = batchSizeParam ?? DEFAULT_IDEMPOTENCY_CLEANUP_BATCH_SIZE;
+
+  if (redisOrOpts && typeof redisOrOpts === 'object') {
+    if ('batchSize' in redisOrOpts || ('redis' in redisOrOpts && !('set' in redisOrOpts))) {
+      redis = redisOrOpts.redis;
+      if (typeof redisOrOpts.batchSize === 'number') {
+        batchSize = redisOrOpts.batchSize;
+      }
+    }
+  }
+
+  const envBatch = process.env.IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE;
+  if (batchSizeParam === undefined && envBatch) {
+    const parsed = parseInt(envBatch, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      batchSize = parsed;
+    }
   }
 
   let lockAcquired = false;
@@ -77,6 +101,7 @@ export async function reclaimExpiredIdempotencyKeys(
       lockAcquired = true;
     } catch (err) {
       logger.warn({ err }, 'Failed to acquire Redis lock for idempotency key cleanup cron');
+      return 0;
     }
   }
 
@@ -91,9 +116,29 @@ export async function reclaimExpiredIdempotencyKeys(
     };
     const data = { idempotencyKey: null, idempotencyKeyExpiresAt: null };
 
+    const reclaimTable = async (model: any) => {
+      if (typeof model.findMany === 'function') {
+        const rows = await model.findMany({
+          where,
+          select: { id: true },
+          take: batchSize,
+        });
+        if (rows.length === 0) return { count: 0 };
+        const ids = rows.map((r: { id: string }) => r.id);
+        return model.updateMany({
+          where: {
+            id: { in: ids },
+            ...where,
+          },
+          data,
+        });
+      }
+      return model.updateMany({ where, data });
+    };
+
     const [payments, settlements] = await Promise.all([
-      prisma.payment.updateMany({ where, data }),
-      prisma.settlement.updateMany({ where, data }),
+      reclaimTable(prisma.payment),
+      reclaimTable(prisma.settlement),
     ]);
 
     const total = payments.count + settlements.count;
@@ -129,7 +174,7 @@ export function startIdempotencyKeyCleanupCron(
     if (jitter > 0) {
       await new Promise((resolve) => setTimeout(resolve, jitter));
     }
-    await reclaimExpiredIdempotencyKeys(prisma, logger, opts?.redis).catch((err) =>
+    await reclaimExpiredIdempotencyKeys(prisma, logger, opts).catch((err) =>
       logger.error({ err }, 'Idempotency key cleanup cron job failed unexpectedly.'),
     );
   };

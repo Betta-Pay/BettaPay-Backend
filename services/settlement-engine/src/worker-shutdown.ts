@@ -20,13 +20,13 @@ export const DEFAULT_DRAIN_POLL_INTERVAL_MS = 500;
  * closeWorkerWithTimeout, since BullMQ only fires 'active' when a job starts.
  */
 export function trackActiveJob(worker: Worker): () => ActiveJobInfo[] {
-  const activeJobs = new Set<Job>();
+  const activeJobs = new Map<string, ActiveJobInfo>();
   worker.on('active', (job: Job) => {
-    activeJobs.add(job);
+    if (job.id !== undefined) activeJobs.set(job.id, { id: job.id, data: job.data });
   });
-  worker.on('completed', (job: Job) => { for (const active of activeJobs) if (active.id === job?.id) activeJobs.delete(active); });
-  worker.on('failed', (job: Job) => { for (const active of activeJobs) if (active.id === job?.id) activeJobs.delete(active); });
-  return () => [...activeJobs].map((job) => ({ id: job.id, data: job.data }));
+  worker.on('completed', (job: Job) => { if (job?.id !== undefined) activeJobs.delete(job.id); });
+  worker.on('failed', (job: Job) => { if (job?.id !== undefined) activeJobs.delete(job.id); });
+  return () => [...activeJobs.values()];
 }
 
 /**

@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { forEachBatch } from "./batch-scan.js";
+import { forEachBatch, StalledCursorError } from "./batch-scan.js";
 
 /** Builds an id-cursor fetcher over an in-memory dataset. */
 function memoryFetcher<T extends { id: string }>(rows: T[]) {
@@ -133,5 +133,70 @@ test("forEachBatch: rejects a non-positive batchSize", async () => {
         onBatch: () => {},
       }),
     /batchSize must be a positive integer/,
+  );
+});
+
+test("forEachBatch: throws StalledCursorError when the cursor does not advance (#1086)", async () => {
+  let fetches = 0;
+  const seen: string[][] = [];
+
+  await assert.rejects(
+    () =>
+      forEachBatch({
+        batchSize: 2,
+        // Buggy fetcher: always returns the same full page and the same cursor.
+        fetchPage: async () => {
+          fetches += 1;
+          if (fetches > 10) throw new Error("infinite loop: stalled cursor was not detected");
+          return { items: [{ id: "a" }, { id: "b" }], nextCursor: "b" };
+        },
+        onBatch: (items) => {
+          seen.push(items.map((r) => r.id));
+        },
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof StalledCursorError);
+      assert.equal(err.cursor, "b");
+      assert.equal(err.batches, 1);
+      assert.match(err.message, /cursor did not advance/);
+      return true;
+    },
+  );
+
+  assert.equal(fetches, 2, "stops on the first repeated cursor");
+  assert.deepEqual(seen, [["a", "b"]], "the stalled page is not handed to onBatch twice");
+});
+
+test("forEachBatch: a stalled initialCursor is detected on the first page (#1086)", async () => {
+  await assert.rejects(
+    () =>
+      forEachBatch({
+        batchSize: 1,
+        initialCursor: "x",
+        fetchPage: async () => ({ items: [{ id: "x" }], nextCursor: "x" }),
+        onBatch: () => {},
+      }),
+    StalledCursorError,
+  );
+});
+
+test("forEachBatch: advancing cursors still process every batch (#1086)", async () => {
+  const rows = ["a", "b", "c", "d", "e", "f", "g"].map((id) => ({ id }));
+  const { calls, fetchPage } = memoryFetcher(rows);
+  const seen: string[] = [];
+
+  const result = await forEachBatch({
+    batchSize: 2,
+    fetchPage,
+    onBatch: (items) => {
+      seen.push(...items.map((r) => r.id));
+    },
+  });
+
+  assert.deepEqual(seen, ["a", "b", "c", "d", "e", "f", "g"]);
+  assert.deepEqual(result, { batches: 4, itemsProcessed: 7, terminatedEarly: false });
+  assert.deepEqual(
+    calls.map((c) => c.cursor),
+    [undefined, "b", "d", "f"],
   );
 });

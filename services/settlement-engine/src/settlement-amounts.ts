@@ -93,6 +93,14 @@ export interface FeeConfig {
   maxFeeThreshold?: string;
 }
 
+/** Merchant-configured fee caps enforced by computeSettlementAmounts. */
+export interface FeeCaps {
+  /** Upper bound on the effective fee rate (bps), applied after discounts. */
+  maxFeeBps?: number;
+  /** Upper bound on the absolute fee amount (decimal string, asset units). */
+  maxFeeThreshold?: string;
+}
+
 /**
  * Returns the maximum settlement amount (as a decimal string) for a given
  * asset, derived from its decimal precision (#481).
@@ -164,6 +172,10 @@ export function resolveVolumeDiscount(
  * @param discountTiers Volume-discount tier list from `FEE_DISCOUNT_TIERS`.
  * Defaults to [] (no tiers, no discount).
  * @param asset Optional asset code for per-asset max validation (#481).
+ * @param feeCaps Optional merchant fee caps. `maxFeeBps` limits the effective
+ * rate (after discounts); `maxFeeThreshold` limits the absolute fee amount.
+ * When either cap reduces the fee, the snapshot records `capApplied` and the
+ * `uncappedFee` that would otherwise have been charged.
  * @returns { grossAmount, feeAmount, netAmount, feeSnapshot }
  */
 export function computeSettlementAmounts(
@@ -172,10 +184,11 @@ export function computeSettlementAmounts(
   monthlyVolume = 0,
   discountTiers: DiscountTier[] = [],
   asset?: string,
+  feeCaps: FeeCaps = {},
 ): SettlementAmounts {
   const gross = new BigNumber(grossAmountStr);
   if (!gross.isFinite() || !gross.isGreaterThan(0)) {
-    throw new SettlementAmountError("Settlement amount must be finite and greater than zero");
+    throw new SettlementAmountError('Settlement amount must be finite and greater than zero');
   }
 
   // Guard: reject amounts that exceed the maximum allowed settlement amount (#481).
@@ -192,14 +205,45 @@ export function computeSettlementAmounts(
     resolveVolumeDiscount(monthlyVolume, discountTiers),
     feeBps,
   );
-  const effectiveFeeBps = Math.max(0, feeBps - discountBps);
-
-  // fee = gross × effectiveFeeBps / 10 000 (rounded DOWN to preserve net accuracy)
-  const fee = gross.multipliedBy(effectiveFeeBps).dividedBy(10_000);
+  const discountedFeeBps = Math.max(0, feeBps - discountBps);
 
   // Preserve the same decimal places as the original input string.
   const inputDecimals = (grossAmountStr.split(".")[1] ?? "").length;
-  const feeStr = fee.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+
+  // fee = gross × bps / 10 000 (rounded DOWN to preserve net accuracy)
+  const uncappedFeeStr = gross
+    .multipliedBy(discountedFeeBps)
+    .dividedBy(10_000)
+    .toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+
+  // Enforce merchant fee caps. maxFeeBps limits the effective rate;
+  // maxFeeThreshold limits the absolute fee amount.
+  let effectiveFeeBps = discountedFeeBps;
+  let capApplied = false;
+  const { maxFeeBps, maxFeeThreshold } = feeCaps;
+  if (maxFeeBps !== undefined && effectiveFeeBps > maxFeeBps) {
+    effectiveFeeBps = Math.max(0, maxFeeBps);
+    capApplied = true;
+  }
+
+  let feeStr = gross
+    .multipliedBy(effectiveFeeBps)
+    .dividedBy(10_000)
+    .toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+
+  if (maxFeeThreshold !== undefined) {
+    const threshold = new BigNumber(maxFeeThreshold);
+    if (!threshold.isFinite() || threshold.isNegative()) {
+      throw new SettlementAmountError(
+        `Invalid maxFeeThreshold: ${maxFeeThreshold}`,
+      );
+    }
+    if (new BigNumber(feeStr).isGreaterThan(threshold)) {
+      feeStr = threshold.toFixed(inputDecimals, BigNumber.ROUND_DOWN);
+      capApplied = true;
+    }
+  }
+
   const netStr = gross.minus(feeStr).toFixed(inputDecimals);
 
   const feeSnapshot: FeeAuditSnapshot = {
@@ -208,6 +252,7 @@ export function computeSettlementAmounts(
     discountApplied: discountBps,
     monthlyVolumeAtTime: monthlyVolume,
     feeVersion: FEE_VERSION,
+    ...(capApplied ? { capApplied: true, uncappedFee: uncappedFeeStr } : {}),
   };
 
   // Validate fee snapshot against schema (#625)

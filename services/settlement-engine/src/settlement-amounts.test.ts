@@ -189,3 +189,18 @@ test('feeSnapshot: no-discount path still records correct snapshot', (t) => {
   t.equal(feeSnapshot.feeVersion, FEE_VERSION, 'feeVersion is set');
   t.end();
 });
+
+
+test('invalid settlement gross amounts are rejected', (t) => {
+  for (const value of ['NaN', 'Infinity', '-Infinity', '0', '-1', '-0.001']) {
+    t.throws(() => computeSettlementAmounts(value, 100), /finite and greater than zero/, value);
+  }
+  t.end();
+});
+
+test('negative and non-finite volume discounts are rejected', (t) => {
+  for (const discountBps of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    t.throws(() => resolveVolumeDiscount(100, [{ volumeUsd: 10, discountBps }]), /discountBps/, String(discountBps));
+  }
+  t.end();
+});
