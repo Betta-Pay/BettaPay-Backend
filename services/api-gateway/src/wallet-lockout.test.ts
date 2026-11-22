@@ -150,6 +150,19 @@ test('WalletChallengeStore lockout: respects custom threshold (#902)', async (t)
   t.end();
 });
 
+test('wallet lockout store fails gracefully when Redis get throws', async (t) => {
+  const redis: WalletChallengeRedis = {
+    async set() { return 'OK'; },
+    async eval() { return null; },
+    async del() { return 1; },
+    async get() { throw new Error('redis outage'); },
+  };
+  const store = new WalletChallengeStore(redis);
+  t.equal(await store.isLockedOut(TEST_WALLET_ADDRESS), false, 'Redis outage fails open');
+  t.equal(await store.getFailureCount(TEST_WALLET_ADDRESS), 0, 'failure count falls back to zero');
+  t.end();
+});
+
 test('POST /api/auth/wallet/verify returns 429 WALLET_AUTH_LOCKOUT when locked out (#902)', async (t) => {
   const { redis, getClock } = createMockRedis();
   const mockPrisma = createMockPrisma();

@@ -189,8 +189,12 @@ export class WalletChallengeStore {
   async getFailureCount(address: string): Promise<number> {
     const key = walletAuthFailKey(address);
     if (typeof this.redis.get === "function") {
-      const val = await this.redis.get(key);
-      return val ? parseInt(val, 10) : 0;
+      try {
+        const val = await this.redis.get(key);
+        return val ? parseInt(val, 10) : 0;
+      } catch {
+        return 0;
+      }
     }
     return 0;
   }
@@ -204,17 +208,21 @@ export class WalletChallengeStore {
     ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
   ): Promise<number> {
     const key = walletAuthFailKey(address);
-    if (typeof this.redis.incr === "function") {
-      const count = await this.redis.incr(key);
-      if (count === 1 && typeof this.redis.expire === "function") {
-        await this.redis.expire(key, ttlSeconds);
+    try {
+      if (typeof this.redis.incr === "function") {
+        const count = await this.redis.incr(key);
+        if (count === 1 && typeof this.redis.expire === "function") {
+          await this.redis.expire(key, ttlSeconds);
+        }
+        return count;
       }
-      return count;
+      const current = await this.getFailureCount(address);
+      const next = current + 1;
+      await this.redis.set(key, String(next), "PX", ttlSeconds * 1000);
+      return next;
+    } catch {
+      return 0;
     }
-    const current = await this.getFailureCount(address);
-    const next = current + 1;
-    await this.redis.set(key, String(next), "PX", ttlSeconds * 1000);
-    return next;
   }
 
   /**
@@ -223,7 +231,11 @@ export class WalletChallengeStore {
    */
   async resetFailures(address: string): Promise<void> {
     const key = walletAuthFailKey(address);
-    await this.redis.del(key);
+    try {
+      await this.redis.del(key);
+    } catch {
+      return;
+    }
   }
 
   /**
