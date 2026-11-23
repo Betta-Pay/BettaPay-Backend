@@ -1632,6 +1632,11 @@ export function buildApp(opts: AppOptions = {}) {
     await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
   }
 
+  /** Atomically revokes `jti`; true only for the single caller that claimed it. */
+  async function claimJti(jti: string, ttlSeconds: number): Promise<boolean> {
+    return (await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds, "NX")) === "OK";
+  }
+
   async function incrementRefreshRate(merchantId: string): Promise<number> {
     const rateKey = refreshRateKey(merchantId);
     const count = await redis.incr(rateKey);
@@ -1833,6 +1838,20 @@ export function buildApp(opts: AppOptions = {}) {
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
+  // Read straight from the database: a cached row could let a merchant that was
+  // just suspended or deleted keep refreshing.
+  const merchant = await prisma.merchant.findFirst({ where: { id: payload.merchantId } });
+  if (!merchant) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+  if (merchant.deletedAt != null || merchant.status === 'suspended') {
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.MERCHANT_SUSPENDED, 'Merchant is suspended'));
+  }
+
   const refreshCount = await incrementRefreshRate(payload.merchantId);
   if (refreshCount > REFRESH_RATE_LIMIT_MAX) {
     return reply
@@ -1841,7 +1860,13 @@ export function buildApp(opts: AppOptions = {}) {
       .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Too many token refresh requests'));
   }
 
-  await revokeJti(payload.jti, remainingLifetime);
+  // Claim the jti atomically (SET NX) so concurrent refreshes with the same
+  // token cannot both pass the isJtiRevoked check above.
+  if (!(await claimJti(payload.jti, remainingLifetime))) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
   await recordAuthIpSuccess(request);
 
   return reply.send({
