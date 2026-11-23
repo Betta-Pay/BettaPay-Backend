@@ -8,7 +8,7 @@ test('rate-limited route: first request includes X-RateLimit-* headers with Rema
   const res = await app.inject({
     method: 'POST',
     url: '/api/auth/challenge',
-    payload: { address: 'GTESTADDRESS' },
+    payload: { address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H' },
   });
 
   const limit = Number(res.headers['x-ratelimit-limit']);
@@ -51,7 +51,7 @@ test('rate-limited route when rate limiting disabled: emits headers and does not
     const res = await app.inject({
       method: 'POST',
       url: '/api/auth/challenge',
-      payload: { address: 'GTESTADDRESS' },
+      payload: { address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H' },
     });
 
     t.ok(res.headers['x-ratelimit-limit'] !== undefined, 'X-RateLimit-Limit header is present when disabled');

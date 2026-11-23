@@ -134,7 +134,7 @@ import {
   GATEWAY_TIMEOUT_CONFIG,
   REQUEST_TIMEOUT_MS,
 } from "./timeout-config.js";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
@@ -2016,13 +2016,50 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   const WalletChallengeBody = z.object({
-    address: z.string().min(1, "address is required"),
+    address: z
+      .string()
+      .min(1, "address is required")
+      .refine((address) => StrKey.isValidEd25519PublicKey(address), {
+        message: "address must be a valid Stellar public key",
+      }),
   });
+
+  // Challenges are cheap to request but each one is stored, so cap how many a
+  // single address may ask for. The per-IP limit is the gateway-wide one.
+  const CHALLENGE_RATE_LIMIT_MAX = 10;
+  const CHALLENGE_RATE_LIMIT_SECONDS = 60;
+
+  async function incrementChallengeRate(address: string): Promise<number> {
+    const rateKey = `auth_challenge_rate:${address}`;
+    const count = await redis.incr(rateKey);
+    if (count === 1) await redis.expire(rateKey, CHALLENGE_RATE_LIMIT_SECONDS);
+    return count;
+  }
 
   fastify.post<{ Body: WalletChallengeRouteBody }>(
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
+
+      try {
+        if ((await incrementChallengeRate(d.address)) > CHALLENGE_RATE_LIMIT_MAX) {
+          return reply
+            .header("Retry-After", String(CHALLENGE_RATE_LIMIT_SECONDS))
+            .code(429)
+            .send(
+              createErrorResponse(
+                ErrorCodes.RATE_LIMITED,
+                "Too many challenge requests for this address",
+              ),
+            );
+        }
+      } catch (err) {
+        // Best-effort like the auth IP score: Redis trouble must not block login.
+        request.log.warn(
+          { err: (err as Error).message },
+          "Challenge rate limit skipped (Redis unavailable)",
+        );
+      }
 
       let issued;
       try {
