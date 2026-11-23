@@ -2098,8 +2098,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
   fastify.post<{ Body: WalletVerifyRouteBody }>(
     "/api/auth/verify",
+    {
+      preHandler: [enforceAuthIpReputation],
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
     async (request, reply) => {
-      const d = LegacyWalletVerifyBody.parse(request.body);
+      let d: z.infer<typeof LegacyWalletVerifyBody>;
+      try {
+        d = LegacyWalletVerifyBody.parse(request.body);
+      } catch (err) {
+        await recordAuthIpFailure(request);
+        throw err;
+      }
 
       // ── Check lockout backoff (#902) ──────────────────────────────────────────
       try {
@@ -2152,6 +2162,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "not_found") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2164,6 +2175,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "expired") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2184,6 +2196,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         if (!isValid) {
           await walletChallenges.recordFailure(d.address);
+          await recordAuthIpFailure(request);
           return reply
             .code(401)
             .send(
@@ -2192,6 +2205,7 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       } catch (err) {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(401)
           .send(
@@ -2210,7 +2224,8 @@ fastify.get('/api/admin/auth/ip-score', {
           create: {
             id: d.address,
             name: `Merchant ${d.address.substring(0, 6)}`,
-            ownerId: `owner-${d.address.substring(0, 6)}`,
+            // A full UUID: the old 6-character prefix collided across addresses.
+            ownerId: `owner-${crypto.randomUUID()}`,
             settings: {},
           },
         });
@@ -2235,10 +2250,9 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      const token = fastify.jwt.sign({
-        merchantId: merchant.id,
-        ownerId: merchant.ownerId,
-      });
+      // signMerchantJwt adds a `jti`, so these tokens can be revoked.
+      const token = await signMerchantJwt(merchant.id, merchant.ownerId);
+      await recordAuthIpSuccess(request);
       return reply.send({ token });
     },
   );
