@@ -173,6 +173,38 @@ type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
 const PAYMENT_LIST_MAX_PAGE_SIZE = PAYMENTS_MAX_PAGE_SIZE;
 const PAYMENT_LIST_DEFAULT_PAGE_SIZE = PAYMENTS_DEFAULT_PAGE_SIZE;
 
+function isIso8601Date(value: string): boolean {
+  const datePart = value.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return false;
+  const parsedDate = new Date(`${datePart}T00:00:00.000Z`);
+  if (Number.isNaN(parsedDate.getTime())) return false;
+  if (parsedDate.toISOString().slice(0, 10) !== datePart) return false;
+  return (
+    value === datePart ||
+    (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    ) &&
+      !Number.isNaN(Date.parse(value)))
+  );
+}
+
+const AuditLogQuery = PaginationQuery.extend({
+  entityType: z.string().optional(),
+  action: z.string().optional(),
+  startDate: z
+    .string()
+    .refine(isIso8601Date, "Invalid ISO-8601 date")
+    .optional(),
+  endDate: z
+    .string()
+    .refine(isIso8601Date, "Invalid ISO-8601 date")
+    .optional(),
+}).refine(
+  ({ startDate, endDate }) =>
+    !startDate || !endDate || Date.parse(startDate) <= Date.parse(endDate),
+  { message: "startDate must not be after endDate" },
+);
+
 // OpenAPI/querystring schema for GET /api/payments. Kept as one object so the
 // route validator, the swagger document and the docs endpoint cannot drift.
 const PAYMENT_LIST_QUERY_SCHEMA = {
@@ -2656,6 +2688,17 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"),
           );
+      const payload = request.user as MerchantJwtPayload;
+      const isAdmin = payload.merchantId === env.ADMIN_ADDRESS;
+      if (
+        !isAdmin &&
+        payload.merchantId !== id &&
+        (!payload.ownerId || payload.ownerId !== merchant.ownerId)
+      ) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
       if (!merchant.deletedAt) {
         return reply
           .code(400)
@@ -2667,12 +2710,33 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      const restored = await prisma.merchant.update({
-        where: { id },
-        data: { deletedAt: null },
+      const restored = await prisma.$transaction(async (tx) => {
+        const updated = await tx.merchant.update({
+          where: { id },
+          data: { deletedAt: null },
+        });
+        await logAuditEvent(
+          "merchant.restored",
+          "merchant",
+          updated.id,
+          { before: merchant, after: updated },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
+        return updated;
+      });
+      merchantCache.invalidate(id);
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn(
+          { err, merchantId: id },
+          "Merchant cache invalidation failed (non-fatal)",
+        );
       });
 
-      return reply.code(200).send({ success: true, merchant: restored });
+      const { secretHash: _hash, ...safeMerchant } = restored;
+      return reply
+        .code(200)
+        .send({ success: true, merchant: safeMerchant });
     },
   );
 
@@ -2800,6 +2864,17 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"),
           );
+      const payload = request.user as MerchantJwtPayload;
+      const isAdmin = payload.merchantId === env.ADMIN_ADDRESS;
+      if (
+        !isAdmin &&
+        payload.merchantId !== id &&
+        (!payload.ownerId || payload.ownerId !== merchant.ownerId)
+      ) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
 
       const currentSettings = (merchant.settings ?? {}) as Record<
         string,
@@ -2830,7 +2905,8 @@ fastify.get('/api/admin/auth/ip-score', {
         request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
       });
 
-      return reply.code(200).send({ data: { merchant: updated } });
+      const { secretHash: _hash, ...safeMerchant } = updated;
+      return reply.code(200).send({ data: { merchant: safeMerchant } });
     },
   );
 
@@ -3637,10 +3713,9 @@ fastify.get('/api/admin/auth/ip-score', {
 
   // Settlements
   //
-  // Authorization: service-to-service callers (x-service-token) may pass
-  // merchantId to filter across merchants. Merchant-authenticated callers
-  // (JWT) are always scoped to their own merchantId — the query parameter is
-  // ignored for them so one merchant can never read another's settlements.
+  // Service-auth callers may pass merchantId across merchants. Merchant JWTs
+  // are scoped to their merchant, except an admin JWT may request deleted
+  // settlements across merchants.
   fastify.get<{
     Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string };
   }>(
@@ -3657,16 +3732,40 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const query = SettlementListQuery.parse(request.query);
-      const { status, from, to, limit, page } = query;
+      const {
+        status,
+        from,
+        to,
+        limit,
+        page,
+        startDate,
+        endDate,
+        includeDeleted,
+      } = query;
       const requestedMerchantId = (request.query as { merchantId?: string })
         .merchantId;
 
       const isServiceAuth = Boolean(request.headers["x-service-token"]);
-      const scopedMerchantId = isServiceAuth
-        ? requestedMerchantId
-        : (request.user as { merchantId?: string } | undefined)?.merchantId;
+      const jwtMerchantId = (
+        request.user as { merchantId?: string } | undefined
+      )?.merchantId;
+      const isAdminJwt = jwtMerchantId === env.ADMIN_ADDRESS;
+      if (includeDeleted && !isServiceAuth && !isAdminJwt) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "includeDeleted is restricted to admin callers",
+              { field: "includeDeleted" },
+            ),
+          );
+      }
+      const scopedMerchantId =
+        isServiceAuth || (isAdminJwt && includeDeleted)
+          ? requestedMerchantId
+          : jwtMerchantId;
 
-      const { startDate, endDate, includeDeleted } = query as any;
       const where: any = {};
       if (scopedMerchantId) {
         where.merchantId = scopedMerchantId;
@@ -3686,8 +3785,7 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
-      // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+      // Exclude settlements belonging to soft-deleted merchants unless explicitly requested.
       if (!includeDeleted) {
         where.merchant = { deletedAt: null };
       }
@@ -3905,27 +4003,23 @@ fastify.get('/api/admin/auth/ip-score', {
       config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
     },
     async (request, reply) => {
-      const { page, limit } = PaginationQuery.parse(request.query ?? {});
-      const query = request.query as Record<string, string | undefined>;
+      const { page, limit, entityType, action, startDate, endDate } =
+        AuditLogQuery.parse(request.query ?? {});
       const where: Record<string, unknown> = {};
 
-      if (query.entityType) {
-        where.entityType = query.entityType;
+      if (entityType) {
+        where.entityType = entityType;
       }
-      if (query.action) {
-        where.action = query.action;
+      if (action) {
+        where.action = action;
       }
-      if (query.startDate || query.endDate) {
+      if (startDate || endDate) {
         where.createdAt = {};
-        if (query.startDate) {
-          (where.createdAt as Record<string, Date>).gte = new Date(
-            query.startDate,
-          );
+        if (startDate) {
+          (where.createdAt as Record<string, Date>).gte = new Date(startDate);
         }
-        if (query.endDate) {
-          (where.createdAt as Record<string, Date>).lte = new Date(
-            query.endDate,
-          );
+        if (endDate) {
+          (where.createdAt as Record<string, Date>).lte = new Date(endDate);
         }
       }
 

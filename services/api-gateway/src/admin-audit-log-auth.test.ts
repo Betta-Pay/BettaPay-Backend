@@ -6,7 +6,7 @@
  */
 import test from 'tape';
 import { buildApp } from './index.js';
-import { createMockPrisma } from './test-utils.js';
+import { createMockPrisma, createTestApp } from './test-utils.js';
 
 const AUTH_TOKEN = process.env.INTER_SERVICE_SECRET || 'dev-inter-service-secret';
 
@@ -52,5 +52,46 @@ test('GET /api/admin/audit-log: returns 200 with a valid service token (#907)', 
     t.notEqual(res.statusCode, 401, 'valid service token is not rejected');
     t.notEqual(res.statusCode, 403, 'valid service token is not forbidden');
   });
+  t.end();
+});
+
+test('GET /api/admin/audit-log: rejects malformed and reversed date ranges', async (t) => {
+  await withApp(async (app) => {
+    for (const range of [
+      'startDate=not-a-date',
+      'endDate=2026-02-30',
+      'startDate=2026-12-31&endDate=2026-01-01',
+    ]) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/admin/audit-log?${range}`,
+        headers: { 'x-service-token': AUTH_TOKEN },
+      });
+      t.equal(res.statusCode, 400, `${range} returns 400`);
+    }
+  });
+  t.end();
+});
+
+test('GET /api/admin/audit-log: valid ISO date range filters records', async (t) => {
+  const { app } = await createTestApp(
+    {},
+    {
+      auditLogs: [
+        { id: 'old', createdAt: new Date('2026-01-01T00:00:00.000Z') },
+        { id: 'in-range', createdAt: new Date('2026-02-01T12:00:00.000Z') },
+        { id: 'new', createdAt: new Date('2026-03-01T00:00:00.000Z') },
+      ],
+    },
+  );
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/admin/audit-log?startDate=2026-02-01&endDate=2026-02-28',
+    headers: { 'x-service-token': AUTH_TOKEN },
+  });
+  const body = JSON.parse(res.body);
+  t.equal(res.statusCode, 200, 'returns 200 for a valid range');
+  t.deepEqual(body.data.map((row: { id: string }) => row.id), ['in-range']);
+  await app.close();
   t.end();
 });

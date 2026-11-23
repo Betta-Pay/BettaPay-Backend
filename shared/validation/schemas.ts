@@ -677,6 +677,8 @@ export const StrictBooleanQuery = z.union([
   z.enum(["true", "false"]).transform((value) => value === "true"),
 ]);
 
+export const SETTLEMENT_MAX_PAGE_OFFSET = 100_000;
+
 export const EventListQuery = PaginationQuery.extend({
   type: z.string().optional(),
   topic: z.string().optional(),
@@ -700,16 +702,20 @@ export const SettlementListQuery = PaginationQuery.extend({
   to: isoDateString.optional(),
   startDate: isoDateString.optional(),
   endDate: isoDateString.optional(),
-  includeDeleted: z.coerce.boolean().default(false),
+  includeDeleted: StrictBooleanQuery.default(false),
 }).refine(
   (data) => {
     const start = data.startDate ?? data.from;
     const end = data.endDate ?? data.to;
     if (end && !start) return false;
-    if (start && end && start > end) return false;
+    if (start && end && Date.parse(start) > Date.parse(end)) return false;
+    if ((data.page - 1) * data.limit > SETTLEMENT_MAX_PAGE_OFFSET) return false;
     return true;
   },
-  { message: "endDate requires startDate; startDate must be before endDate" },
+  {
+    message:
+      "endDate requires startDate; startDate must not be after endDate; page offset exceeds the maximum",
+  },
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 

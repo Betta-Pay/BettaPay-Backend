@@ -233,6 +233,14 @@ export function createMockPrisma(initialData: MockData = {}) {
       const lte = new Date(where.initiatedAt.lte);
       result = result.filter((s) => new Date(s.initiatedAt) <= lte);
     }
+    if (where?.merchant?.deletedAt === null) {
+      result = result.filter((settlement) => {
+        const merchant = store.merchants.find(
+          (item) => item.id === settlement.merchantId,
+        );
+        return !merchant?.deletedAt;
+      });
+    }
     return result;
   }
 
@@ -284,6 +292,12 @@ export function createMockPrisma(initialData: MockData = {}) {
       let result = [...store.auditLogs];
       if (where?.entityType) result = result.filter((a) => a.entityType === where.entityType);
       if (where?.action) result = result.filter((a) => a.action === where.action);
+      if (where?.createdAt?.gte) {
+        result = result.filter((a) => new Date(a.createdAt) >= where.createdAt.gte);
+      }
+      if (where?.createdAt?.lte) {
+        result = result.filter((a) => new Date(a.createdAt) <= where.createdAt.lte);
+      }
       const start = skip || 0;
       const end = take ? start + take : undefined;
       return result.slice(start, end);
@@ -292,6 +306,12 @@ export function createMockPrisma(initialData: MockData = {}) {
       let result = [...store.auditLogs];
       if (where?.entityType) result = result.filter((a) => a.entityType === where.entityType);
       if (where?.action) result = result.filter((a) => a.action === where.action);
+      if (where?.createdAt?.gte) {
+        result = result.filter((a) => new Date(a.createdAt) >= where.createdAt.gte);
+      }
+      if (where?.createdAt?.lte) {
+        result = result.filter((a) => new Date(a.createdAt) <= where.createdAt.lte);
+      }
       return result.length;
     },
     create: async ({ data }: { data: any }) => {
