@@ -63,6 +63,7 @@ import {
   getActiveCount,
 } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { createShutdownCleanup } from './shutdown-cleanup.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
@@ -238,18 +239,9 @@ const redis = createRedisClient(env.REDIS_URL, fastify.log, {
   healthState: redisHealthState,
 });
 
-// Placeholder for settlement reaper stop function (defined later)
-let stopReaper = () => {};
-
-fastify.addHook('onClose', async () => {
-  // Stop settlement reaper before closing
-  try {
-    stopReaper();
-  } catch (err) {
-    fastify.log.error({ err }, 'Error stopping settlement reaper');
-  }
-  await redis.quit().catch(() => {});
-});
+// Placeholder for settlement reaper stop function (defined later). Returns a
+// promise that settles once any in-flight reaper tick has finished.
+let stopReaper: () => void | Promise<void> = () => {};
 
 fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS
@@ -2060,6 +2052,36 @@ const batchWorker = new Worker(
   { connection: redis, concurrency: 1 }
 );
 
+// Fastify `onClose` (runs on fastify.close()): await in-flight reaper ticks,
+// then close BullMQ workers/queues and Redis so nothing is left open or
+// touching the DB after shutdown. Idempotent and shared with gracefulShutdown.
+let stopSettlementReaper: (() => Promise<void>) | undefined;
+
+const closeBackgroundResources = createShutdownCleanup({
+  stopReapers: [() => stopReaper(), () => stopSettlementReaper?.()],
+  closeWorkers: [
+    () => closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob),
+    () => closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => []),
+    () => closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => []),
+    () => closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob),
+  ],
+  closeQueues: [
+    () => settlementQueue.close(),
+    () => settlementDLQ.close(),
+    () => batchQueue.close(),
+    () => webhookQueue.close(),
+  ],
+  redis,
+  log: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
+  },
+});
+
+fastify.addHook('onClose', async () => {
+  await closeBackgroundResources();
+});
+
 // Schedule the batching job to run every BATCH_INTERVAL_SECONDS
 await batchQueue.add(
   'batch-pending-settlements',
@@ -2086,7 +2108,6 @@ batchWorker.on('failed', (job, err) => {
 // ============================================================================
 
 let isShuttingDown = false;
-let stopSettlementReaper: (() => Promise<void>) | undefined;
 
 async function gracefulShutdown(signal: string): Promise<void> {
   // Prevent multiple shutdown attempts
@@ -2105,9 +2126,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }, 30000);
 
   try {
-    await stopSettlementReaper?.();
-
-    // 1. Close Fastify server (stops accepting new connections)
+    // 1. Close Fastify server (stops accepting new connections). Its onClose
+    //    hook awaits the reaper(s), then closes the BullMQ workers/queues and
+    //    Redis, in that order (see closeBackgroundResources).
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
     fastify.log.info('Fastify server closed');
@@ -2115,26 +2136,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // 1b. Close the metrics server
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 
-    // 2. Close BullMQ workers (drain and close gracefully, force-stop after 10s)
-    fastify.log.info('Closing BullMQ workers...');
-    await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
-    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
-    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
-    fastify.log.info('BullMQ workers closed');
-
-    // 3. Close BullMQ queues
-    fastify.log.info('Closing BullMQ queues...');
-    await settlementQueue.close();
-    await settlementDLQ.close();
-    await batchQueue.close();
-    await closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob);
-    await webhookQueue.close();
-    fastify.log.info('BullMQ queues closed');
-
-    // 4. Close Redis connection
-    fastify.log.info('Closing Redis connection...');
-    await redis.quit();
-    fastify.log.info('Redis connection closed');
+    // 2-4. Reaper, BullMQ workers/queues and Redis are closed by the onClose
+    //      hook above; this is a memoized no-op safety net if it was skipped.
+    await closeBackgroundResources();
 
     // 5. Disconnect Prisma
     fastify.log.info('Disconnecting Prisma...');
