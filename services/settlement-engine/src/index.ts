@@ -706,7 +706,7 @@ domainWorker.on('error', (err) => {
 
 fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
+    queryDatabase: () => prisma.$queryRaw`SELECT version() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
