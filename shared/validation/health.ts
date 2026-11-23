@@ -418,18 +418,28 @@ export interface AggregateHealthOptions {
   targets: ServiceHealthTarget[];
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Probe results already collected per target name; those targets are not probed again. */
+  probeResults?: Record<string, UpstreamHealthResult>;
 }
 
 export async function aggregateAllHealth(options: AggregateHealthOptions): Promise<AggregatedHealthResponse> {
-  const { gatewayHealth, targets, timeoutMs = UPSTREAM_HEALTH_TIMEOUT_MS, fetchImpl = fetch } = options;
+  const {
+    gatewayHealth,
+    targets,
+    timeoutMs = UPSTREAM_HEALTH_TIMEOUT_MS,
+    fetchImpl = fetch,
+    probeResults,
+  } = options;
   const checkedAt = new Date().toISOString();
 
   const downstreamResults = await Promise.allSettled(
     targets.map(async (target) => {
-      const result = await checkUpstreamServiceHealth(target.baseUrl, target.name, {
-        timeoutMs,
-        fetchImpl,
-      });
+      const result =
+        probeResults?.[target.name] ??
+        (await checkUpstreamServiceHealth(target.baseUrl, target.name, {
+          timeoutMs,
+          fetchImpl,
+        }));
       return { target, result };
     }),
   );
