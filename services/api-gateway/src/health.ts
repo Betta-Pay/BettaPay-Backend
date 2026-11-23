@@ -4,6 +4,7 @@ import {
   aggregateAllHealth,
   buildHealthResponse,
   checkPostgresql,
+  checkRedisPing,
   checkUpstreamServiceHealth,
   readServiceVersion,
   UPSTREAM_HEALTH_TIMEOUT_MS,
@@ -23,9 +24,12 @@ export interface RegisterGatewayHealthRoutesOptions {
   startTime: number;
   serviceVersion?: string;
   fetchImpl?: typeof fetch;
+  redisPing?: () => Promise<string>;
 }
 
 const DEFAULT_ABANDONMENT_THRESHOLD_MINUTES = 1440;
+const ABANDONED_COUNT_CACHE_TTL_MS = 30_000;
+const abandonedCountCache = new WeakMap<object, { count: number; expiresAt: number }>();
 
 export function parseAbandonmentThresholdMinutes(raw: string | undefined): number {
   const parsed = parseInt(raw ?? '', 10);
@@ -41,20 +45,22 @@ export async function buildGatewayHealthResponse(
     startTime,
     serviceVersion = readServiceVersion(import.meta.url),
     fetchImpl = fetch,
+    redisPing,
   } = options;
 
-  const [postgresql, fxEngine, settlementEngine, indexer] = await Promise.all([
+  const [postgresql, fxEngine, settlementEngine, indexer, redis] = await Promise.all([
     checkPostgresql(() => prisma.$queryRaw`SELECT version() AS "serverVersion"`),
     checkUpstreamServiceHealth(env.FX_ENGINE_URL, 'fx-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.SETTLEMENT_ENGINE_URL, 'settlement-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
+    redisPing ? checkRedisPing(redisPing) : Promise.resolve(null),
   ]);
 
   const base = buildHealthResponse({
     service: 'api-gateway',
     version: serviceVersion,
     startTime,
-    dependencies: [postgresql],
+    dependencies: redis ? [postgresql, redis] : [postgresql],
     upstream: [fxEngine, settlementEngine, indexer],
     // Only postgresql is truly critical — a dead downstream should degrade
     // the gateway (200 + degraded) rather than 503 the entire payment path.
@@ -70,9 +76,19 @@ export async function buildGatewayHealthResponse(
     );
     const cutoff = new Date(Date.now() - abandonmentMinutes * 60 * 1000);
     try {
-      const count = await prisma.payment.count({
-        where: { status: 'initiated', createdAt: { lt: cutoff } },
-      });
+      const cached = abandonedCountCache.get(prisma);
+      let count: number;
+      if (cached && cached.expiresAt > Date.now()) {
+        count = cached.count;
+      } else {
+        count = await prisma.payment.count({
+          where: { status: 'initiated', createdAt: { lt: cutoff } },
+        });
+        abandonedCountCache.set(prisma, {
+          count,
+          expiresAt: Date.now() + ABANDONED_COUNT_CACHE_TTL_MS,
+        });
+      }
       (base as any).business = { abandonedPayments: count };
     } catch {
       (base as any).business = { abandonedPayments: -1 };

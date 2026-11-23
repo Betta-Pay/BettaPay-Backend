@@ -53,3 +53,46 @@ test('valid ABANDONMENT_THRESHOLD_MINUTES strings override the default (#988)', 
   assert.equal(parseAbandonmentThresholdMinutes('30'), 30);
   assert.equal(parseAbandonmentThresholdMinutes('2880'), 2880);
 });
+
+test('gateway health reports Redis as a dependency and degrades when it is unreachable (#989)', async () => {
+  const base = { prisma: fakePrisma([]), env, startTime: Date.now(), serviceVersion: '0.0.0', fetchImpl: downFetch };
+
+  const up = await buildGatewayHealthResponse({ ...base, redisPing: async () => 'PONG' });
+  assert.equal(up.dependencies.find((d) => d.name === 'redis')?.status, 'connected');
+
+  const down = await buildGatewayHealthResponse({
+    ...base,
+    redisPing: async () => {
+      throw new Error('ECONNREFUSED');
+    },
+  });
+  assert.equal(down.dependencies.find((d) => d.name === 'redis')?.status, 'disconnected');
+  assert.notEqual(down.status, 'unhealthy');
+});
+
+test('gateway health caches payment.count within the TTL window (#989)', async () => {
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    let calls = 0;
+    const prisma = {
+      $queryRaw: async () => [{ serverVersion: 'PostgreSQL 16' }],
+      payment: {
+        count: async () => {
+          calls += 1;
+          return 7;
+        },
+      },
+    } as any;
+    const options = { prisma, env, startTime: Date.now(), serviceVersion: '0.0.0', fetchImpl: downFetch };
+
+    const first = (await buildGatewayHealthResponse(options)) as any;
+    const second = (await buildGatewayHealthResponse(options)) as any;
+
+    assert.equal(calls, 1);
+    assert.equal(first.business.abandonedPayments, 7);
+    assert.equal(second.business.abandonedPayments, 7);
+  } finally {
+    process.env.NODE_ENV = originalEnv;
+  }
+});
