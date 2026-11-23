@@ -751,6 +751,7 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
 
 fastify.post<{ Params: { id: string } }>(
   '/api/settlements/:id/retry',
+  { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
 
@@ -896,7 +897,7 @@ export { computeReconciliationDiff, type ReconcileDiffResult, type ReconcileReco
  * between local (engine) and gateway records, returning per-field mismatches.
  * Capped at 100 diffs; a `truncated` flag indicates if more exist.
  */
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1236,7 +1237,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 // ── Reconciliation Report Endpoint (#490) ──────────────────────────────────────
 // Returns a summary of reconciliation status without full detail records.
 // Useful for monitoring dashboards and alerts.
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1457,6 +1458,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
   '/api/settlements',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
