@@ -544,6 +544,23 @@ test('buildCsrfCookieHeader: sets Secure attribute only when served over HTTPS (
   t.end();
 });
 
+test('buildCsrfCookieHeader: rejects tokens that could inject cookie attributes or split headers', (t) => {
+  for (const bad of ['abc; Domain=evil.com', 'abc\r\nSet-Cookie: x=y', 'abc\nx', 'abc\ry', 'abc\u0000']) {
+    t.throws(
+      () => buildCsrfCookieHeader('csrf_token', bad, { protocol: 'https' }),
+      /Invalid CSRF cookie value/,
+      `rejects ${JSON.stringify(bad)}`,
+    );
+  }
+
+  const b64 = buildCsrfCookieHeader('csrf_token', 'dGVzdC10b2tlbl8xMjM_-A==', { protocol: 'https' });
+  t.ok(b64.startsWith('csrf_token=dGVzdC10b2tlbl8xMjM_-A==; Path=/'), 'base64 token is unchanged');
+  const hex = buildCsrfCookieHeader('csrf_token', 'deadbeef0123456789', { protocol: 'http' });
+  t.ok(hex.startsWith('csrf_token=deadbeef0123456789; Path=/'), 'hex token is unchanged');
+
+  t.end();
+});
+
 test('setCsrfCookie: writes correct Set-Cookie header on reply (#901)', (t) => {
   let headerName = '';
   let headerValue = '';
