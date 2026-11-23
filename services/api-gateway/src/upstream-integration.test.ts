@@ -35,6 +35,7 @@ test('upstream-integration: GET /api/rates forwards request and propagates traci
     });
 
     t.equal(res.statusCode, 200, 'proxy should return 200 OK');
+    t.equal(res.headers['cache-control'], 'public, max-age=60', 'rates response includes Cache-Control');
     const body = JSON.parse(res.body);
     t.equal(body.rate, '1.25');
   } finally {
@@ -132,6 +133,39 @@ test('upstream-integration: fetchUpstream handling socket timeout', async (t) =>
     });
 
     t.equal(res.statusCode, 500, 'failed fetch triggers global 500 handler');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await app.close();
+  }
+
+  t.end();
+});
+
+test('upstream-integration: GET /api/quote rejects duplicate query keys', async (t) => {
+  let upstreamCalled = false;
+  const fetchImpl = async () => {
+    upstreamCalled = true;
+    return new Response(JSON.stringify({ quoteId: 'unexpected' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const app = buildApp({
+    prisma: createMockPrisma() as any,
+    logger: false,
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl as typeof fetch;
+
+  try {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/quote?from=USDC&from=XLM&to=NGN&amount=50.00',
+    });
+
+    t.equal(res.statusCode, 400, 'duplicate from parameter returns 400');
+    t.equal(upstreamCalled, false, 'does not forward duplicate query to upstream');
   } finally {
     globalThis.fetch = originalFetch;
     await app.close();

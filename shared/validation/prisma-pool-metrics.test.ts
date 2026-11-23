@@ -73,6 +73,68 @@ test('startPrismaPoolMetricsCollector: starts periodic updates and handles stop(
   collector.stop();
 });
 
+test('startPrismaPoolMetricsCollector: concurrent collectors run independently and stop() only affects its own', async () => {
+  const registryA = createMockRegistry();
+  const registryB = createMockRegistry();
+  let callsA = 0;
+  let callsB = 0;
+  const statsA = () => { callsA++; return { totalCount: 4, idleCount: 1, waitingCount: 0 }; };
+  const statsB = () => { callsB++; return { totalCount: 8, idleCount: 2, waitingCount: 3 }; };
+
+  const collectorA = startPrismaPoolMetricsCollector(statsA, registryA, 20);
+  const collectorB = startPrismaPoolMetricsCollector(statsB, registryB, 20);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.ok(callsA > 1, 'collector A kept running after collector B started');
+    assert.ok(callsB > 1, 'collector B is running');
+    assert.equal(registryA.metricsStore['prisma_pool_used'].getVal(), 3);
+    assert.equal(registryB.metricsStore['prisma_pool_used'].getVal(), 6);
+
+    collectorA.stop();
+    const stoppedA = callsA;
+    const beforeB = callsB;
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    assert.equal(callsA, stoppedA, 'collector A no longer polls after stop()');
+    assert.ok(callsB > beforeB, 'stopping A did not stop B');
+  } finally {
+    collectorA.stop();
+    collectorB.stop();
+  }
+});
+
+test('startPrismaPoolMetricsCollector: stop() clears its interval handle and is idempotent', () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const live = new Set<unknown>();
+  globalThis.setInterval = ((fn: () => void, ms: number) => {
+    const handle = originalSetInterval(fn, ms);
+    live.add(handle);
+    return handle;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((handle: NodeJS.Timeout) => {
+    live.delete(handle);
+    originalClearInterval(handle);
+  }) as typeof clearInterval;
+
+  try {
+    const stats = { totalCount: 1, idleCount: 1, waitingCount: 0 };
+    const collectors = [1, 2, 3].map(() => startPrismaPoolMetricsCollector(stats, createMockRegistry(), 1000));
+    assert.equal(live.size, 3, 'each collector owns a distinct interval');
+
+    collectors[1].stop();
+    assert.equal(live.size, 2, 'stopping one collector clears only its own interval');
+
+    collectors.forEach((c) => c.stop());
+    collectors[0].stop();
+    assert.equal(live.size, 0, 'no interval handles leak');
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
+});
+
 test('updatePrismaPoolMetrics: handles failing pool getter gracefully without throwing', () => {
   const registry = createMockRegistry();
   let warnCalled = false;

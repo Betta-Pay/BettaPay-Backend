@@ -126,3 +126,29 @@ test('PATCH /api/admin/assets/:code is registered exactly once without duplicate
   await app.close();
   t.end();
 });
+
+test('PATCH /api/admin/assets/:code normalizes lowercase codes and rejects malformed codes', async (t) => {
+  const { app } = await createTestApp(
+    {},
+    { supportedAssets: [{ code: 'USDC', name: 'USD Coin', isActive: true, decimals: 6, contractId: 'CUSDC' }] },
+  );
+
+  const normalized = await app.inject({
+    method: 'PATCH',
+    url: '/api/admin/assets/usdc',
+    headers: { 'x-service-token': SECRET, 'x-csrf-check': '1' },
+    payload: { name: 'Updated USD Coin' },
+  });
+  t.equal(normalized.statusCode, 200, 'lowercase code is normalized to USDC');
+
+  const malformed = await app.inject({
+    method: 'PATCH',
+    url: '/api/admin/assets/USDC!',
+    headers: { 'x-service-token': SECRET, 'x-csrf-check': '1' },
+    payload: { isActive: false },
+  });
+  t.equal(malformed.statusCode, 400, 'malformed code returns 400');
+
+  await app.close();
+  t.end();
+});

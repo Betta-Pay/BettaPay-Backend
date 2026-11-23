@@ -22,8 +22,15 @@ export const PositiveAmountString = AmountString.refine(
   { message: "Amount must be greater than zero" },
 );
 
-/** Settlement amounts must not exceed 10^15 (1,000,000,000,000,000). */
-export const SettlementAmountString = AmountString.refine(
+/**
+ * Settlement amounts must not exceed 10^15 (1,000,000,000,000,000), must not
+ * carry unnecessary leading zeros (`007.50`), and are limited to Stellar's
+ * 7-decimal precision (#1082).
+ */
+export const SettlementAmountString = AmountString.regex(
+  /^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/,
+  "Settlement amount must not have leading zeros and allows at most 7 decimal places",
+).refine(
   (val) => {
     const max = "1000000000000000";
     const [intPart, decPart] = val.split(".");
@@ -67,8 +74,9 @@ export const userSchema = z.object({
   metadata: z.record(z.any()).optional(),
 });
 
+// Matches the `/api/auth/google` handler, which reads `body.token` (#1082).
 export const GoogleAuthBody = z.object({
-  idToken: z.string().min(1),
+  token: z.string().min(1, "token is required"),
 });
 export type GoogleAuthBody = z.infer<typeof GoogleAuthBody>;
 
@@ -167,7 +175,7 @@ export const settlementSchema = z.object({
   batchId: z.string().optional(),
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
-  status: z.enum(["pending", "processing", "completed", "failed"]),
+  status: z.enum(["pending", "processing", "completed", "failed", "superseded"]),
   feeSnapshot: feeSnapshotSchema.optional(),
 });
 

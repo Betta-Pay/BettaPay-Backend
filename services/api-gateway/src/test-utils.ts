@@ -1,5 +1,6 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import fastifyJwt from '@fastify/jwt';
+import { Prisma } from '@prisma/client';
 import { buildApp, AppOptions } from './index.js';
 import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
 import type {
@@ -374,7 +375,26 @@ export function createMockPrisma(initialData: MockData = {}) {
     $transaction: async (cb: (tx: any) => Promise<any>) => {
       return cb(mockPrismaInstance);
     },
-    $queryRaw: async () => [{ '?column?': 1 }],
+    $queryRaw: async (query: any, ...values: any[]) => {
+      const sql = Array.isArray(query) ? query.join("?") : String(query?.text || query || "");
+      if (sql.includes('FROM "Settlement"') || sql.includes("Settlement")) {
+        const merchantId = values[0] || (query as any)?.values?.[0];
+        const excludedStatuses = new Set(["failed", "cancelled", "superseded"]);
+        const sum = store.settlements
+          .filter(
+            (s) =>
+              (!merchantId || s.merchantId === merchantId) &&
+              !excludedStatuses.has((s.status || "").toLowerCase()) &&
+              !s.supersededById,
+          )
+          .reduce(
+            (acc, s) => acc.plus(new Prisma.Decimal(s.totalAmount || "0")),
+            new Prisma.Decimal(0),
+          );
+        return [{ sum: sum.toString() }];
+      }
+      return [{ '?column?': 1 }];
+    },
     $connect: async () => {},
     $disconnect: async () => {},
   };

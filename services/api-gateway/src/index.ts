@@ -63,6 +63,7 @@ import {
   createValidationContext,
   auditRouteAuthPolicy,
   installCrashHandlers,
+  GoogleAuthBody,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -117,6 +118,7 @@ import {
   createAdminApiKeyAuth,
   createAuditLogger,
   timingSafeStrEqual,
+  clearSharedRedisClients,
   type AuditLogRequestLike,
 } from "@bettapay/validation";
 import type { Merchant } from "@prisma/client";
@@ -286,6 +288,17 @@ const IDEMPOTENCY_TTL_SECONDS = IDEMPOTENCY_TTL_MS / 1000;
 // Bulk-cancel summaries share the existing Redis idempotency store. The key is
 // deliberately namespaced so it cannot collide with payment/settlement keys.
 const BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX = "idempotency:bulk-cancel:";
+const BULK_CANCEL_LOCK_PREFIX = "lock:bulk-cancel:";
+const BULK_CANCEL_LOCK_TTL_MS = 30_000;
+
+/** Lua script for atomic lock release — only deletes if the stored value matches. */
+const BULK_CANCEL_RELEASE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -588,6 +601,7 @@ const CLIENT_TIMEOUT_HEADER = "x-client-timeout-ms";
 // --- App Factory & Configuration Options ------------------------------------
 export interface AppOptions {
   prisma?: PrismaClient;
+  merchantCache?: MerchantCache;
   indexerClient?: ReturnType<typeof createIndexerClient>;
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
@@ -634,7 +648,7 @@ export function getDefaultPrisma(): PrismaClient {
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single payment creation request (#740).
-const merchantCache = new MerchantCache();
+export const merchantCache = new MerchantCache();
 
 // Set by buildApp() when it creates the app's Redis client — shutdown()/start()
 // (defined after buildApp, at module scope) need it but don't have their own
@@ -832,6 +846,7 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   const prisma = opts.prisma ?? getDefaultPrisma();
+  const activeMerchantCache = opts.merchantCache ?? merchantCache;
   const indexerClient =
     opts.indexerClient ??
     createIndexerClient({
@@ -1218,7 +1233,7 @@ export function buildApp(opts: AppOptions = {}) {
         typeof result.max === "number"
           ? result.max
           : typeof routeConfig.rateLimit === "object" &&
-              typeof (routeConfig.rateLimit as any).max === "number"
+            typeof (routeConfig.rateLimit as any).max === "number"
             ? (routeConfig.rateLimit as any).max
             : 1000;
       const windowStr =
@@ -1421,7 +1436,7 @@ export function buildApp(opts: AppOptions = {}) {
 
   fastify.addHook(
     "onResponse",
-    async (request: FastifyRequest, _reply: FastifyReply) => {
+    async (request: FastifyRequest) => {
       const merchantId = (request.user as any)?.merchantId;
       if (!merchantId) return;
 
@@ -1529,8 +1544,12 @@ export function buildApp(opts: AppOptions = {}) {
         (domainEvents as any).connection.on("error", () => {});
       }
     }
-    await redis.quit().catch(() => {});
-    redis.disconnect();
+    if (typeof (redis as any)?.quit === "function") {
+      await (redis as any).quit().catch(() => {});
+    }
+    if (typeof (redis as any)?.disconnect === "function") {
+      (redis as any).disconnect();
+    }
   });
 
   // --- Auth IP reputation, token refresh & nonce replay (#task.md) -------------
@@ -2198,10 +2217,6 @@ fastify.get('/api/admin/auth/ip-score', {
     token?: unknown;
   }
 
-  const GoogleAuthBody = z.object({
-    token: z.string().min(1, "token is required"),
-  });
-
   fastify.post<{ Body: GoogleAuthRouteBody }>(
     "/api/auth/google",
     async (request, reply) => {
@@ -2367,11 +2382,35 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+  const WebhookTestParams = z.object({ id: z.string().uuid() });
+
   fastify.post<{ Params: { id: string } }>(
     "/api/webhooks/:id/test",
-    { preValidation: [fastify.authenticate] },
+    {
+      preValidation: [fastify.authenticate],
+      schema: {
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+        },
+      },
+    },
     async (request, reply) => {
-      const { id } = request.params;
+      const parsed = WebhookTestParams.safeParse(request.params);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              "Invalid webhook id: must be a valid UUID",
+            ),
+          );
+      }
+      const { id } = parsed.data;
       const payload = request.user as MerchantJwtPayload;
 
       const existing = await prisma.webhookSubscription.findUnique({
@@ -2417,6 +2456,9 @@ fastify.get('/api/admin/auth/ip-score', {
           return reply
             .code(503)
             .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
+        }
+        if (testResult.statusCode && (testResult.statusCode === 400 || testResult.statusCode === 403)) {
+          return reply.code(testResult.statusCode).send(testResult);
         }
         return reply.send(testResult);
       } catch (err) {
@@ -2525,34 +2567,51 @@ fastify.get('/api/admin/auth/ip-score', {
       const d = CreateMerchantBody.parse(request.body);
       const secret = d.secret || crypto.randomBytes(24).toString("hex");
       const secretHash = encryptField(hashSecret(secret));
-      const merchant = await prisma.$transaction(async (tx) => {
-        const created = await tx.merchant.create({
-          data: {
-            id: d.id,
-            name: d.name,
-            ownerId: d.ownerId,
-            settings: (d.settings as any) ?? {},
-            secretHash,
-          },
+      try {
+        const merchant = await prisma.$transaction(async (tx) => {
+          const created = await tx.merchant.create({
+            data: {
+              id: d.id,
+              name: d.name,
+              ownerId: d.ownerId,
+              settings: (d.settings as any) ?? {},
+              secretHash,
+            },
+          });
+          await logAuditEvent(
+            "merchant.created",
+            "merchant",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "merchant.created",
-          "merchant",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
-      if (!d.secret) {
-        fastify.log.warn(
-          { merchantId: merchant.id },
-          "Auto-generated merchant secret returned in response. This will only be shown once.",
-        );
+        if (!d.secret) {
+          fastify.log.warn(
+            { merchantId: merchant.id },
+            "Auto-generated merchant secret returned in response. This will only be shown once.",
+          );
+        }
+        const { secretHash: _hash, ...safeMerchant } = merchant;
+        return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
+      } catch (err: any) {
+        if (
+          err?.code === "P2002" ||
+          (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")
+        ) {
+          return reply
+            .code(409)
+            .send(
+              createErrorResponse(
+                ErrorCodes.CONFLICT,
+                "Merchant already exists",
+              ),
+            );
+        }
+        throw err;
       }
-      const { secretHash: _hash, ...safeMerchant } = merchant;
-      return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
     },
   );
 
@@ -2787,7 +2846,7 @@ fastify.get('/api/admin/auth/ip-score', {
         tx as unknown as Parameters<typeof logAuditEvent>[5],
       );
     });
-    merchantCache.invalidate(id);
+    activeMerchantCache.invalidate(id);
 
     // #744 — Invalidate cached merchant data so the suspended/unsuspended
     // status is visible to read paths immediately.
@@ -2897,7 +2956,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         return merchantUpdate;
       });
-      merchantCache.invalidate(id);
+      activeMerchantCache.invalidate(id);
 
       // #744 — Invalidate cached merchant data so updated settings are
       // visible to read paths immediately.
@@ -2954,6 +3013,13 @@ fastify.get('/api/admin/auth/ip-score', {
         return merchantUpdate;
       });
 
+      activeMerchantCache.invalidate(id);
+
+      // Invalidate cached merchant data so the updated KYC status is visible immediately
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
+      });
+
       return reply.code(200).send({ data: { merchant: updated } });
     },
   );
@@ -2994,7 +3060,7 @@ fastify.get('/api/admin/auth/ip-score', {
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
       const merchant = await getCachedMerchant(
         d.merchantId,
-        merchantCache,
+        activeMerchantCache,
         (id) => prisma.merchant.findFirst({ where: { id, deletedAt: null } }),
       );
       if (!merchant) {
@@ -3522,106 +3588,167 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      // Deduplicate IDs. The per-item result list mirrors this deduplicated,
-      // input-ordered set so summary shape is stable across replays.
-      const uniqueIds = [...new Set(d.paymentIds)];
+      // Redis lock to serialize operations on the same idempotency key and avoid
+      // concurrent duplicate cancellation transactions.
+      const lockKey = idempotencyKey
+        ? `${BULK_CANCEL_LOCK_PREFIX}${idempotencyKey}:lock`
+        : null;
+      const lockToken = lockKey ? crypto.randomUUID() : null;
+      let lockAcquired = false;
 
-      const payments = await prisma.payment.findMany({
-        where: { id: { in: uniqueIds } },
-      });
-
-      const paymentMap = new Map(payments.map((p) => [p.id, p]));
-
-      const cancelledIds: string[] = [];
-      const skippedIds: string[] = [];
-      const errorIds: string[] = [];
-      const toCancelIds: string[] = [];
-      const items: {
-        id: string;
-        status: "cancelled" | "skipped" | "error";
-        reason?: string;
-      }[] = [];
-
-      for (const id of uniqueIds) {
-        const payment = paymentMap.get(id);
-        if (!payment) {
-          skippedIds.push(id);
-          items.push({ id, status: "skipped", reason: "not_found" });
-          continue;
-        }
-        if (payment.merchantId !== merchantId) {
-          skippedIds.push(id);
-          items.push({ id, status: "skipped", reason: "not_owned" });
-          continue;
-        }
-        if (payment.status === "cancelled") {
-          // A retry (or a fresh-key replay) must report an already-cancelled
-          // payment as cancelled, not as an error/skip.
-          cancelledIds.push(id);
-          items.push({ id, status: "cancelled" });
-          continue;
-        }
-        if (payment.status !== "initiated") {
-          skippedIds.push(id);
-          items.push({
-            id,
-            status: "skipped",
-            reason: `status:${payment.status}`,
-          });
-          continue;
-        }
-        cancelledIds.push(id);
-        toCancelIds.push(id);
-        items.push({ id, status: "cancelled" });
-      }
-
-      if (toCancelIds.length > 0) {
-        await prisma.$transaction(async (tx) => {
-          for (const id of toCancelIds) {
-            const before = paymentMap.get(id)!;
-            const updated = await tx.payment.update({
-              where: { id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              id,
-              { before, after: updated },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
-        });
-      }
-
-      const summary = {
-        cancelled: cancelledIds.length,
-        skipped: skippedIds.length,
-        errors: errorIds.length,
-        cancelledIds,
-        skippedIds,
-        errorIds,
-        items,
-      };
-
-      if (summaryKey) {
+      if (lockKey && lockToken) {
         try {
-          await redis.set(
-            summaryKey,
-            JSON.stringify(summary),
-            "EX",
-            IDEMPOTENCY_TTL_SECONDS,
+          const res = await redis.set(
+            lockKey,
+            lockToken,
+            "PX",
+            BULK_CANCEL_LOCK_TTL_MS,
+            "NX",
           );
+          if (res !== "OK" && res !== true && res !== "1") {
+            return reply
+              .code(409)
+              .send(
+                createErrorResponse(
+                  ErrorCodes.CONCURRENCY_EXCEEDED,
+                  "A bulk-cancel operation with this idempotency key is already in progress",
+                ),
+              );
+          }
+          lockAcquired = true;
         } catch (err) {
           request.log.warn(
             { err, idempotencyKey },
-            "Failed to persist bulk-cancel idempotency summary",
+            "Failed to acquire Redis lock for bulk-cancel — proceeding without lock",
           );
         }
       }
 
-      return reply.code(200).send(summary);
+      try {
+        // Deduplicate IDs. The per-item result list mirrors this deduplicated,
+        // input-ordered set so summary shape is stable across replays.
+        const uniqueIds = [...new Set(d.paymentIds)];
+
+        const payments = await prisma.payment.findMany({
+          where: { id: { in: uniqueIds } },
+        });
+
+        const paymentMap = new Map(payments.map((p) => [p.id, p]));
+
+        const cancelledIds: string[] = [];
+        const skippedIds: string[] = [];
+        const errorIds: string[] = [];
+        const toCancelIds: string[] = [];
+        const items: {
+          id: string;
+          status: "cancelled" | "skipped" | "error";
+          reason?: string;
+        }[] = [];
+
+        for (const id of uniqueIds) {
+          const payment = paymentMap.get(id);
+          if (!payment) {
+            skippedIds.push(id);
+            items.push({ id, status: "skipped", reason: "not_found" });
+            continue;
+          }
+          if (payment.merchantId !== merchantId) {
+            skippedIds.push(id);
+            items.push({ id, status: "skipped", reason: "not_owned" });
+            continue;
+          }
+          if (payment.status === "cancelled") {
+            // A retry (or a fresh-key replay) must report an already-cancelled
+            // payment as cancelled, not as an error/skip.
+            cancelledIds.push(id);
+            items.push({ id, status: "cancelled" });
+            continue;
+          }
+          if (payment.status !== "initiated") {
+            skippedIds.push(id);
+            items.push({
+              id,
+              status: "skipped",
+              reason: `status:${payment.status}`,
+            });
+            continue;
+          }
+          cancelledIds.push(id);
+          toCancelIds.push(id);
+          items.push({ id, status: "cancelled" });
+        }
+
+        if (toCancelIds.length > 0) {
+          await prisma.$transaction(async (tx) => {
+            for (const id of toCancelIds) {
+              const before = paymentMap.get(id)!;
+              const updated = await tx.payment.update({
+                where: { id },
+                data: { status: "cancelled" },
+              });
+              await logAuditEvent(
+                "payment.status.changed",
+                "payment",
+                id,
+                { before, after: updated },
+                request,
+                tx as unknown as Parameters<typeof logAuditEvent>[5],
+              );
+            }
+          });
+        }
+
+        const summary = {
+          cancelled: cancelledIds.length,
+          skipped: skippedIds.length,
+          errors: errorIds.length,
+          cancelledIds,
+          skippedIds,
+          errorIds,
+          items,
+        };
+
+        if (summaryKey) {
+          try {
+            await redis.set(
+              summaryKey,
+              JSON.stringify(summary),
+              "EX",
+              IDEMPOTENCY_TTL_SECONDS,
+            );
+          } catch (err) {
+            request.log.warn(
+              { err, idempotencyKey },
+              "Failed to persist bulk-cancel idempotency summary",
+            );
+          }
+        }
+
+        return reply.code(200).send(summary);
+      } finally {
+        if (lockAcquired && lockKey && lockToken) {
+          try {
+            if (typeof redis.eval === "function") {
+              await redis.eval(
+                BULK_CANCEL_RELEASE_LOCK_SCRIPT,
+                1,
+                lockKey,
+                lockToken,
+              );
+            } else {
+              const current = await redis.get(lockKey);
+              if (current === lockToken) {
+                await redis.del(lockKey);
+              }
+            }
+          } catch (err) {
+            request.log.warn(
+              { err, idempotencyKey },
+              "Failed to release bulk-cancel Redis lock",
+            );
+          }
+        }
+      }
     },
   );
 
@@ -3631,7 +3758,13 @@ fastify.get('/api/admin/auth/ip-score', {
   }>(
     "/api/settlements/:id/status",
     {
-      preValidation: [fastify.authenticate],
+      preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+        if (request.headers["x-service-token"]) {
+          await fastify.serviceAuth(request, reply);
+          return;
+        }
+        await fastify.authenticate(request, reply);
+      },
       preHandler: [logRequestBody],
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
@@ -3665,6 +3798,25 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Settlement not found"),
           );
+
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isServiceAuth && !isAdmin) {
+        if (!callerMerchantId || callerMerchantId !== settlement.merchantId) {
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.FORBIDDEN,
+                "You do not have access to this settlement",
+              ),
+            );
+        }
+      }
 
       const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
       if (
@@ -3816,6 +3968,22 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const d = CreateSettlementBody.parse(request.body);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isAdmin && (!callerMerchantId || callerMerchantId !== d.merchantId)) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "You do not have access to create settlements for this merchant",
+            ),
+          );
+      }
+
       const merchant = await prisma.merchant.findUnique({
         where: { id: d.merchantId },
       });
@@ -3881,12 +4049,12 @@ fastify.get('/api/admin/auth/ip-score', {
 
       // Validate each settlement item against merchant limits
       for (const item of items) {
-        const amount = parseFloat(item.amount);
+        const amount = new Prisma.Decimal(item.amount);
 
         // Check minimum settlement amount
         if (settings?.minSettlementAmount) {
-          const minAmount = parseFloat(settings.minSettlementAmount);
-          if (amount < minAmount) {
+          const minAmount = new Prisma.Decimal(settings.minSettlementAmount);
+          if (amount.lt(minAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3902,8 +4070,8 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Check maximum settlement amount
         if (settings?.maxSettlementAmount) {
-          const maxAmount = parseFloat(settings.maxSettlementAmount);
-          if (amount > maxAmount) {
+          const maxAmount = new Prisma.Decimal(settings.maxSettlementAmount);
+          if (amount.gt(maxAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3933,12 +4101,14 @@ fastify.get('/api/admin/auth/ip-score', {
         SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
         FROM "Settlement"
         WHERE "merchantId" = ${d.merchantId}
+        AND "status"::text NOT IN ('failed', 'cancelled', 'superseded')
+        AND "supersededById" IS NULL
         AND "initiatedAt" >= date_trunc('day', now())
       `;
 
-        const currentDailyTotal = aggregateResult?.[0]?.sum
-          ? parseFloat(aggregateResult[0].sum)
-          : 0;
+        const currentDailyTotal = new Prisma.Decimal(
+          aggregateResult?.[0]?.sum || "0",
+        );
         const queryDurationMs = Date.now() - startTimeMs;
         request.log.debug(
           { queryDurationMs, merchantId: d.merchantId },
@@ -3946,17 +4116,18 @@ fastify.get('/api/admin/auth/ip-score', {
         );
 
         const requestTotal = items.reduce(
-          (sum: number, item: any) => sum + parseFloat(item.amount),
-          0,
+          (sum: Prisma.Decimal, item: any) =>
+            sum.plus(new Prisma.Decimal(item.amount)),
+          new Prisma.Decimal(0),
         );
-        const newDailyTotal = currentDailyTotal + requestTotal;
-        const dailyLimit = parseFloat(settings.dailySettlementLimit);
+        const newDailyTotal = currentDailyTotal.plus(requestTotal);
+        const dailyLimit = new Prisma.Decimal(settings.dailySettlementLimit);
 
-        if (newDailyTotal > dailyLimit) {
+        if (newDailyTotal.gt(dailyLimit)) {
           return reply.code(422).send(
             createErrorResponse(
               "QUOTA_EXCEEDED",
-              `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
+              `Daily settlement limit exceeded. Current: ${currentDailyTotal.toString()}, Requested: ${requestTotal.toString()}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
                 requestedAmount: requestTotal.toString(),
@@ -4125,9 +4296,8 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   fastify.get("/api/rates", async (request, reply) => {
-    const result = await proxyFxUpstream(request, reply, "/api/rates");
     reply.header("Cache-Control", "public, max-age=60");
-    return result;
+    return proxyFxUpstream(request, reply, "/api/rates");
   });
   fastify.get("/api/currencies", async (request, reply) =>
     proxyFxUpstream(request, reply, "/api/currencies"),
@@ -4145,7 +4315,15 @@ fastify.get('/api/admin/auth/ip-score', {
       // database on cache miss or Redis failure.
       const cached = await redis.get("supported-assets").catch(() => null);
       if (cached) {
-        return { data: JSON.parse(cached) };
+        try {
+          return { data: JSON.parse(cached) };
+        } catch (error) {
+          request.log.warn(
+            { error, key: "supported-assets" },
+            "Evicting corrupt supported-assets Redis cache entry",
+          );
+          await redis.del("supported-assets").catch(() => {});
+        }
       }
 
       const assets = await prisma.supportedAsset.findMany({
@@ -4235,9 +4413,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
       const body = UpdateSupportedAssetBody.parse(request.body);
 
       try {
@@ -4289,9 +4477,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
 
       try {
         const before = await prisma.supportedAsset.delete({
@@ -4332,28 +4530,46 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
-  fastify.get("/api/quote", async (request, reply) => {
-    const query = new URLSearchParams(
-      request.query as Record<string, string>,
-    ).toString();
-    const path = query ? `/api/quote?${query}` : "/api/quote";
-    return proxyFxUpstream(request, reply, path);
-  });
+  fastify.get(
+    "/api/quote",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          properties: {
+            from: { type: "string" },
+            to: { type: "string" },
+            amount: { type: "string" },
+            slippageBps: { type: "string" },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const query = new URLSearchParams(
+        request.query as Record<string, string>,
+      ).toString();
+      const path = query ? `/api/quote?${query}` : "/api/quote";
+      return proxyFxUpstream(request, reply, path);
+    },
+  );
 
   return fastify;
 }
 
 // ─── Warmup ─────────────────────────────────────────────────────────────────
 
-interface DownstreamService {
+export interface DownstreamService {
   name: string;
   healthUrl: string;
 }
 
-function getDownstreamServices(env: Env): DownstreamService[] {
+export function getDownstreamServices(env: Env): DownstreamService[] {
   return [
     { name: "fx-engine", healthUrl: `${env.FX_ENGINE_URL}/api/health` },
     { name: "indexer", healthUrl: `${env.INDEXER_URL}/api/health` },
+    { name: "settlement-engine", healthUrl: `${env.SETTLEMENT_ENGINE_URL}/api/health` },
   ];
 }
 
@@ -4366,9 +4582,10 @@ function getDownstreamServices(env: Env): DownstreamService[] {
  * Errors are logged but never thrown — a downstream that is still warming up
  * should not prevent the gateway from starting.
  */
-async function warmupDownstreamServices(
+export async function warmupDownstreamServices(
   env: Env,
   logger: FastifyBaseLogger,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
   const services = getDownstreamServices(env);
 
@@ -4378,7 +4595,7 @@ async function warmupDownstreamServices(
       const startTime = Date.now();
 
       try {
-        const response = await fetch(svc.healthUrl, {
+        const response = await fetchImpl(svc.healthUrl, {
           headers: { "x-trace-id": traceId },
           signal: AbortSignal.timeout(5_000),
         });
@@ -4409,12 +4626,40 @@ let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
 let mainWebhookQueue: ReturnType<typeof createWebhookQueue> | null = null;
 let shuttingDown = false;
 
-async function shutdown(signal: string) {
+export function setSharedPgPool(pool: pg.Pool | null): void {
+  sharedPgPool = pool;
+}
+
+export function getSharedPgPool(): pg.Pool | null {
+  return sharedPgPool;
+}
+
+export function setSharedRedis(client: ReturnType<typeof createRedisClient> | null): void {
+  sharedRedis = client;
+}
+
+export function getSharedRedis(): ReturnType<typeof createRedisClient> | null {
+  return sharedRedis;
+}
+
+export function setMainApp(app: ReturnType<typeof Fastify> | null): void {
+  mainApp = app;
+}
+
+export function getMainApp(): ReturnType<typeof Fastify> | null {
+  return mainApp;
+}
+
+export function resetShutdownStateForTests(): void {
+  shuttingDown = false;
+}
+
+export async function shutdown(signal: string, exitProcess: boolean = true) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  const app = mainApp!;
-  app.log.info(`Received ${signal}, shutting down gracefully...`);
+  const app = mainApp;
+  app?.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
     // Stop crons first so no new jobs are enqueued
@@ -4424,21 +4669,61 @@ async function shutdown(signal: string) {
     // Close the webhook queue after crons stop, before Prisma disconnect
     if (mainWebhookQueue) {
       await mainWebhookQueue.close().catch((err: unknown) => {
-        app.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
+        app?.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
       });
     }
 
-    await app.close();
+    if (app) {
+      await app.close().catch(() => {});
+    }
     if (metricsServer) {
       await new Promise<void>((resolve) =>
         metricsServer!.close(() => resolve()),
       );
     }
-    await getDefaultPrisma().$disconnect();
-    process.exit(0);
+    if (defaultPrisma) {
+      await defaultPrisma.$disconnect().catch(() => {});
+    }
+
+    // Cleanly close pg.Pool
+    if (sharedPgPool) {
+      await sharedPgPool.end().catch((err: unknown) => {
+        app?.log.warn({ err }, "pg.Pool end failed during shutdown (non-fatal)");
+      });
+      sharedPgPool = null;
+    }
+
+    // Cleanly close sharedRedis
+    if (sharedRedis) {
+      try {
+        if (typeof (sharedRedis as any).quit === "function") {
+          await (sharedRedis as any).quit();
+        } else if (typeof (sharedRedis as any).disconnect === "function") {
+          (sharedRedis as any).disconnect();
+        }
+      } catch {
+        if (typeof (sharedRedis as any).disconnect === "function") {
+          (sharedRedis as any).disconnect();
+        }
+      }
+      sharedRedis = null;
+    }
+
+    // Cleanly clear shared Redis clients
+    await clearSharedRedisClients().catch((err: unknown) => {
+      app?.log.warn({ err }, "clearSharedRedisClients failed during shutdown (non-fatal)");
+    });
+
+    if (exitProcess) {
+      process.exit(0);
+    }
   } catch (err) {
-    app.log.error(err, "Error during shutdown");
-    process.exit(1);
+    app?.log.error(err, "Error during shutdown");
+    if (exitProcess) {
+      process.exit(1);
+    } else {
+      throw err;
+    }
   }
 }
 
@@ -4485,6 +4770,7 @@ const start = async () => {
         app.log,
         env.PAYMENT_ABANDONMENT_HOURS,
         webhookQueue,
+        redis,
       );
       startIdempotencyKeyCleanupCron(prisma, app.log, { redis });
     }

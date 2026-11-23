@@ -147,6 +147,42 @@ test('buildPrismaConnectionUrl uses defaults when no poolSize or timeout given',
   assert.strictEqual(result, 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=10&pool_timeout=10');
 });
 
+test('buildPrismaConnectionUrl replaces existing pool params instead of duplicating them (#1076)', () => {
+  const url = 'postgresql://user:pass@localhost:5432/bettapay?connection_limit=5&sslmode=require&pool_timeout=99';
+  const result = buildPrismaConnectionUrl(url, 20, 5);
+  const params = new URL(result).searchParams;
+  assert.deepStrictEqual(params.getAll('connection_limit'), ['20']);
+  assert.deepStrictEqual(params.getAll('pool_timeout'), ['5']);
+  assert.strictEqual(params.get('sslmode'), 'require', 'unrelated params are preserved');
+});
+
+test('buildPrismaConnectionUrl is idempotent when applied to its own output (#1076)', () => {
+  const once = buildPrismaConnectionUrl('postgresql://user:pass@localhost:5432/bettapay', 15, 10);
+  assert.strictEqual(buildPrismaConnectionUrl(once, 15, 10), once);
+});
+
+test('buildPrismaConnectionUrl preserves percent-encoded credentials (#1076)', () => {
+  const url = 'postgresql://us%40er:p%23ss@localhost:5432/bettapay';
+  assert.strictEqual(
+    buildPrismaConnectionUrl(url, 15, 10),
+    'postgresql://us%40er:p%23ss@localhost:5432/bettapay?connection_limit=15&pool_timeout=10',
+  );
+});
+
+test('buildPrismaConnectionUrl rejects malformed DATABASE_URL values (#1076)', () => {
+  assert.throws(() => buildPrismaConnectionUrl(''), /DATABASE_URL is not a valid URL/);
+  assert.throws(() => buildPrismaConnectionUrl('not a url'), /DATABASE_URL is not a valid URL/);
+  assert.throws(() => buildPrismaConnectionUrl('localhost:5432/bettapay?x=1'), /DATABASE_URL must include a host/);
+  assert.throws(() => buildPrismaConnectionUrl('postgresql:bettapay'), /DATABASE_URL must include a host/);
+});
+
+test('buildPrismaConnectionUrl does not leak credentials in validation errors (#1076)', () => {
+  assert.throws(
+    () => buildPrismaConnectionUrl('postgresql://user:s3cret@[bad host/db'),
+    (err: unknown) => err instanceof Error && !err.message.includes('s3cret'),
+  );
+});
+
 test('buildPrismaConnectionUrl rejects invalid pool ranges early', () => {
   const url = 'postgresql://user:pass@localhost:5432/bettapay';
   assert.throws(() => buildPrismaConnectionUrl(url, 0, 10), /DATABASE_POOL_SIZE.*1/);

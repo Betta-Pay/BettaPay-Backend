@@ -23,7 +23,9 @@ never reach the cache or the arithmetic path.
 
 `POST /api/quote/verify` has a route-level JSON body limit. It is configurable
 through `FX_QUOTE_BODY_LIMIT_BYTES` (bytes, default `1048576` / 1 MiB) rather
-than hardcoded in the route.
+than hardcoded in the route. Only a whole number of at least `1024` bytes is
+used; a fractional, smaller, zero, negative or non-numeric value falls back to
+the default.
 
 An oversized body is rejected with HTTP `413` and the shared error envelope:
 

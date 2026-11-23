@@ -19,6 +19,9 @@ import {
   PAYMENT_STATUS_TRANSITIONS,
   SETTLEMENT_STATUS_TRANSITIONS,
   isValidTransition,
+  SettlementAmountString,
+  GoogleAuthBody,
+  settlementSchema,
 } from './schemas.js';
 import { CurrencyCode, validateAmountPrecision, ASSET_DECIMALS } from './currency.js';
 // Barrel import — consumers must resolve FeeScheduleItem from the package
@@ -583,4 +586,37 @@ test('FeeScheduleItem is exported from the validation barrel (#820)', () => {
 
   const rejected = FeeScheduleItemFromBarrel.safeParse({ asset: 'USDC', bps: 10001 });
   assert.strictEqual(rejected.success, false);
+});
+
+// ─── #1082 ──────────────────────────────────────────────────────────────────
+
+test('SettlementAmountString rejects unnecessary leading zeros', () => {
+  for (const ok of ['0', '0.50', '10.50', '1000000000000000', '1.1234567']) {
+    assert.strictEqual(SettlementAmountString.safeParse(ok).success, true, `${ok} should pass`);
+  }
+  for (const bad of ['001.50', '007.50', '00', '01', '1.12345678', '1000000000000001']) {
+    assert.strictEqual(SettlementAmountString.safeParse(bad).success, false, `${bad} should fail`);
+  }
+});
+
+test('GoogleAuthBody matches the /api/auth/google payload ({ token })', () => {
+  assert.deepStrictEqual(GoogleAuthBody.parse({ token: 'abc' }), { token: 'abc' });
+  assert.strictEqual(GoogleAuthBody.safeParse({ token: '' }).success, false);
+  assert.strictEqual(GoogleAuthBody.safeParse({ idToken: 'abc' }).success, false);
+});
+
+test('settlementSchema accepts the superseded status', () => {
+  const result = settlementSchema.safeParse({
+    id: 'stl_1',
+    merchantId: VALID_STELLAR_PUBLIC_KEY,
+    totalAmount: '100',
+    grossAmount: '100',
+    feeAmount: '1',
+    netAmount: '99',
+    feeBps: 100,
+    asset: 'USDC',
+    initiatedAt: new Date().toISOString(),
+    status: 'superseded',
+  });
+  assert.strictEqual(result.success, true, JSON.stringify(result.success ? null : result.error.issues));
 });

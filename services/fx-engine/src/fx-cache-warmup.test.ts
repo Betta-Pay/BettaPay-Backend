@@ -259,3 +259,44 @@ test('FX cache warmup: fails when snapshot fill ratio does not satisfy minimum r
   t.true(threw, 'throws when fill ratio is below threshold on empty cache');
   t.end();
 });
+
+// Issue #1045 — Preserve original cachedAt timestamp in warmupCacheFromRedis
+test('warmupCacheFromRedis: preserves original cachedAt from Redis snapshot', async (t) => {
+  const redis = new MockRedis();
+  // Start with cache at a known timestamp
+  const originalCachedAt = 100000;
+  cache = { rates: { ...FALLBACK_RATES }, cachedAt: originalCachedAt };
+
+  // Add a snapshot with a different timestamp
+  const snapshot = { ts: 200000, rates: { USDC: 2000.00, EURT: 1800.00, NGN: 1.0 } };
+  await redis.zadd(SNAPSHOT_KEY, snapshot.ts, JSON.stringify(snapshot));
+
+  await warmupCacheFromRedis(redis);
+
+  // cachedAt should be preserved from the snapshot (200000), not overwritten to Date.now()
+  t.equal(cache.cachedAt, 200000, `cachedAt preserved as ${cache.cachedAt} (snapshot ts), not Date.now()`);
+  // Rates should be updated from snapshot
+  t.equal(cache.rates.USDC, 2000.00, 'USDC updated from snapshot');
+  t.equal(cache.rates.EURT, 1800.00, 'EURT updated from snapshot');
+  t.equal(cache.rates.NGN, 1.0, 'NGN unchanged from snapshot');
+  t.end();
+});
+
+test('warmupCacheFromRedis: does not write warmed snapshot back to Redis (preserves original cachedAt)', async (t) => {
+  const redis = new MockRedis();
+  const originalCachedAt = 100000;
+  cache = { rates: { ...FALLBACK_RATES }, cachedAt: originalCachedAt };
+
+  // Add a snapshot with a different timestamp
+  const snapshot = { ts: 200000, rates: { USDC: 2000.00, EURT: 1800.00, NGN: 1.0 } };
+  await redis.zadd(SNAPSHOT_KEY, snapshot.ts, JSON.stringify(snapshot));
+
+  await warmupCacheFromRedis(redis);
+
+  // Verify the Redis snapshot still has the original timestamp (not overwritten with Date.now())
+  const members = await redis.zrevrangebyscore(SNAPSHOT_KEY, '+inf', '-inf', 'LIMIT', 0, 1);
+  const redisSnapshot = JSON.parse(members[0]);
+  // The Redis snapshot's ts should still be 200000, not Date.now()
+  t.equal(redisSnapshot.ts, 200000, `Redis snapshot ts preserved as ${redisSnapshot.ts}, not overwritten`);
+  t.end();
+});
