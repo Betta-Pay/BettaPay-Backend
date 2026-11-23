@@ -788,30 +788,38 @@ fastify.post<{ Params: { id: string } }>(
     const newSettlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
     const traceId = crypto.randomUUID();
 
-    const newSettlement = await prisma.settlement.create({
-      data: {
-        id: newSettlementId,
-        merchantId: original.merchantId,
-        totalAmount: original.totalAmount,
-        grossAmount: original.grossAmount,
-        feeAmount: original.feeAmount,
-        netAmount: original.netAmount,
-        feeBps: original.feeBps,
-        asset: original.asset,
-        status: 'pending',
-        webhookUrl: original.webhookUrl,
-        webhookHeaders: (original.webhookHeaders ?? undefined) as any,
-        feeSnapshot: (original.feeSnapshot ?? undefined) as any,
-      },
-    });
-
-    // Mark original as superseded using an optimistic lock so concurrent
-    // retries cannot overwrite each other's chain link (#543).
+    // Create the retry settlement and link the original to it in a single
+    // transaction. The parent update uses an optimistic lock so concurrent
+    // retries cannot overwrite each other's chain link (#543); if it loses the
+    // race, the transaction rolls back and no orphaned settlement row is left
+    // behind to be processed.
+    let newSettlement: SettlementRecord;
     try {
-      await updateSettlementWithOptimisticLock(prisma, {
-        id,
-        expectedVersion: original.version,
-        data: { supersededById: newSettlementId },
+      newSettlement = await prisma.$transaction(async (tx) => {
+        const created = await tx.settlement.create({
+          data: {
+            id: newSettlementId,
+            merchantId: original.merchantId,
+            totalAmount: original.totalAmount,
+            grossAmount: original.grossAmount,
+            feeAmount: original.feeAmount,
+            netAmount: original.netAmount,
+            feeBps: original.feeBps,
+            asset: original.asset,
+            status: 'pending',
+            webhookUrl: original.webhookUrl,
+            webhookHeaders: (original.webhookHeaders ?? undefined) as any,
+            feeSnapshot: (original.feeSnapshot ?? undefined) as any,
+          },
+        });
+
+        await updateSettlementWithOptimisticLock(tx, {
+          id,
+          expectedVersion: original.version,
+          data: { supersededById: newSettlementId },
+        });
+
+        return created;
       });
     } catch (err) {
       if (err instanceof VersionConflictError) {
