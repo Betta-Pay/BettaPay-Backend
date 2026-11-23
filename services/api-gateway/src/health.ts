@@ -25,6 +25,13 @@ export interface RegisterGatewayHealthRoutesOptions {
   fetchImpl?: typeof fetch;
 }
 
+const DEFAULT_ABANDONMENT_THRESHOLD_MINUTES = 1440;
+
+export function parseAbandonmentThresholdMinutes(raw: string | undefined): number {
+  const parsed = parseInt(raw ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ABANDONMENT_THRESHOLD_MINUTES;
+}
+
 export async function buildGatewayHealthResponse(
   options: Omit<RegisterGatewayHealthRoutesOptions, 'fastify'>,
 ): Promise<HealthResponse> {
@@ -58,7 +65,9 @@ export async function buildGatewayHealthResponse(
 
   // Include abandoned payments count in non-test environments
   if (process.env.NODE_ENV !== 'test') {
-    const abandonmentMinutes = parseInt(process.env.ABANDONMENT_THRESHOLD_MINUTES ?? '1440', 10);
+    const abandonmentMinutes = parseAbandonmentThresholdMinutes(
+      process.env.ABANDONMENT_THRESHOLD_MINUTES,
+    );
     const cutoff = new Date(Date.now() - abandonmentMinutes * 60 * 1000);
     try {
       const count = await prisma.payment.count({
