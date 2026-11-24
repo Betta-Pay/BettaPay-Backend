@@ -1588,7 +1588,7 @@ export function buildApp(opts: AppOptions = {}) {
   async function enforceAuthIpReputation(
     request: FastifyRequest,
     reply: FastifyReply,
-  ): Promise<void> {
+  ): Promise<FastifyReply | void> {
     let score = 0;
     try {
       score = await getAuthIpScore(request.ip);
@@ -1600,7 +1600,8 @@ export function buildApp(opts: AppOptions = {}) {
       );
     }
     if (score >= AUTH_IP_THRESHOLD) {
-      await reply
+      // Return the reply so the route handler does not run after the 429 (#983).
+      return reply
         .header("Retry-After", String(AUTH_IP_RETRY_AFTER_SECONDS))
         .code(429)
         .send(

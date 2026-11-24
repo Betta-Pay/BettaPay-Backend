@@ -145,7 +145,7 @@ export interface MerchantAuthHelpers {
   enforceAuthIpReputation: (
     request: FastifyRequest,
     reply: FastifyReply,
-  ) => Promise<void>;
+  ) => Promise<FastifyReply | void>;
   recordAuthIpFailure: (request: FastifyRequest) => Promise<void>;
   recordAuthIpSuccess: (request: FastifyRequest) => Promise<void>;
   isJtiRevoked: (jti: string) => Promise<boolean>;
@@ -225,9 +225,11 @@ export function createAuthHardening(
   async function enforceAuthIpReputation(
     request: FastifyRequest,
     reply: FastifyReply,
-  ): Promise<void> {
+  ): Promise<FastifyReply | void> {
     if ((await getAuthIpScore(request.ip)) >= AUTH_IP_SCORE_THRESHOLD) {
-      reply
+      // Returning the reply tells Fastify the response is handled, so the
+      // route handler does not run after the 429 has been written (#983).
+      return reply
         .header("Retry-After", "300")
         .code(429)
         .send(

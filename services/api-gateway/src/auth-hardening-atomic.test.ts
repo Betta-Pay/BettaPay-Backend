@@ -1,4 +1,5 @@
 import test from 'tape';
+import Fastify from 'fastify';
 import { createAuthHardening } from './auth-hardening.js';
 import {
   DEFAULT_WALLET_AUTH_MAX_FAILURES,
@@ -114,4 +115,43 @@ test('IP score is clamped at zero and the key is removed (#984)', async (t) => {
   t.equal(await helpers.getAuthIpScore('203.0.113.10'), 0, 'the score never drops below zero');
   t.equal(redis.data.size, 0, 'a zero score leaves no key behind');
   t.end();
+});
+
+async function ipReputationApp(score: number) {
+  const redis = createFakeRedis();
+  redis.data.set('auth_ip_score:127.0.0.1', { value: String(score), ttl: 900 });
+  const helpers = createAuthHardening(redis as any, () => 'jwt');
+  const app = Fastify();
+  let handlerCalls = 0;
+  app.post('/auth', { preHandler: [helpers.enforceAuthIpReputation] }, async () => {
+    handlerCalls += 1;
+    return { ok: true };
+  });
+  await app.ready();
+  return { app, calls: () => handlerCalls };
+}
+
+test('a blocked IP gets 429 and the route handler never runs (#983)', async (t) => {
+  const { app, calls } = await ipReputationApp(20);
+  try {
+    const res = await app.inject({ method: 'POST', url: '/auth' });
+    t.equal(res.statusCode, 429, 'blocked with 429');
+    t.equal(res.headers['retry-after'], '300', 'Retry-After is set');
+    t.equal(calls(), 0, 'the handler was short-circuited');
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('an IP below the threshold still reaches the handler (#983)', async (t) => {
+  const { app, calls } = await ipReputationApp(3);
+  try {
+    const res = await app.inject({ method: 'POST', url: '/auth' });
+    t.equal(res.statusCode, 200, 'allowed');
+    t.equal(calls(), 1, 'the handler ran once');
+  } finally {
+    await app.close();
+    t.end();
+  }
 });
