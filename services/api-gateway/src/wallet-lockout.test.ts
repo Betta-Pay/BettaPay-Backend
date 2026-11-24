@@ -1,6 +1,7 @@
 import test from 'tape';
 import {
   WalletChallengeStore,
+  RECORD_FAILURE_SCRIPT,
   WALLET_AUTH_LOCKOUT_KEY_PREFIX,
   DEFAULT_WALLET_AUTH_MAX_FAILURES,
   DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
@@ -66,8 +67,20 @@ function createMockRedis(startTime = 1_700_000_000_000) {
       store.delete(key);
       return 1;
     },
-    async eval(_script: string, _numKeys: number, ...args: any[]) {
+    async eval(script: string, _numKeys: number, ...args: any[]) {
       const key = args[0];
+      if (script === RECORD_FAILURE_SCRIPT) {
+        const live = isLive(key);
+        const next = (live ? parseInt(live.value, 10) : 0) + 1;
+        if (live) {
+          live.value = String(next);
+        } else {
+          const seconds = Number(args[1]);
+          redis.expireCalls.push({ key, seconds });
+          store.set(key, { value: String(next), expiresAt: now + seconds * 1000 });
+        }
+        return next;
+      }
       const entry = isLive(key);
       store.delete(key);
       return entry ? entry.value : null;

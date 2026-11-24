@@ -3,6 +3,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Redis } from "ioredis";
 import { createErrorResponse, ErrorCodes } from "@bettapay/validation";
+import { RECORD_FAILURE_SCRIPT } from "./wallet-challenge-store.js";
 
 export const REFRESH_RATE_LIMIT_MAX = 10;
 export const REFRESH_RATE_LIMIT_SECONDS = 60;
@@ -300,11 +301,13 @@ export function createAuthHardening(
     ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
   ): Promise<number> {
     const key = walletAuthFailKey(address);
-    const count = await redis.incr(key);
-    if (count === 1) {
-      await redis.expire(key, ttlSeconds);
-    }
-    return count;
+    const count = await redis.eval(
+      RECORD_FAILURE_SCRIPT,
+      1,
+      key,
+      String(ttlSeconds),
+    );
+    return Number(count);
   }
 
   async function resetWalletAuthFailures(address: string): Promise<void> {
