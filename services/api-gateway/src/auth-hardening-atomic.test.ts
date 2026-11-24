@@ -1,6 +1,6 @@
 import test from 'tape';
 import Fastify from 'fastify';
-import { createAuthHardening } from './auth-hardening.js';
+import { createAuthHardening, isRequestHttps } from './auth-hardening.js';
 import {
   DEFAULT_WALLET_AUTH_MAX_FAILURES,
   DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
@@ -154,4 +154,19 @@ test('an IP below the threshold still reaches the handler (#983)', async (t) => 
     await app.close();
     t.end();
   }
+});
+
+test('x-forwarded-proto only counts behind a trusted proxy (#985)', async (t) => {
+  const probe = async (trustProxy: boolean) => {
+    const app = Fastify({ trustProxy });
+    app.get('/p', async (request) => ({ https: isRequestHttps(request) }));
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: '/p', headers: { 'x-forwarded-proto': 'https' } });
+    await app.close();
+    return JSON.parse(res.body).https as boolean;
+  };
+
+  t.equal(await probe(false), false, 'a spoofed header is ignored without trustProxy');
+  t.equal(await probe(true), true, 'the header is honoured behind a trusted proxy');
+  t.end();
 });

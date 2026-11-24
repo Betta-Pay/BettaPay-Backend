@@ -63,18 +63,18 @@ export interface CookieFlagOptions {
 }
 
 /**
- * Detects whether an incoming request was served over HTTPS, checking
- * the request protocol and trusted `x-forwarded-proto` header (#901).
+ * Detects whether an incoming request was served over HTTPS (#901).
+ *
+ * Only `request.protocol` is trusted. Fastify derives it from
+ * `X-Forwarded-Proto` solely for connections from a proxy it was configured to
+ * trust (`trustProxy`), so a client cannot claim HTTPS by sending the header
+ * itself (#985).
  */
 export function isRequestHttps(request: {
   protocol?: string;
   headers?: Record<string, string | string[] | undefined>;
 }): boolean {
-  const forwardedProto = Array.isArray(request.headers?.["x-forwarded-proto"])
-    ? request.headers!["x-forwarded-proto"][0]
-    : request.headers?.["x-forwarded-proto"];
-  const proto = forwardedProto || request.protocol || "http";
-  return proto.toLowerCase() === "https";
+  return (request.protocol ?? "http").toLowerCase() === "https";
 }
 
 /**
