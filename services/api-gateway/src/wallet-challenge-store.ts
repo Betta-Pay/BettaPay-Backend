@@ -99,6 +99,20 @@ const CONSUME_CHALLENGE_SCRIPT = `
   end
 `;
 
+/**
+ * Atomically increments a failure counter and, on the first increment, gives
+ * it a TTL. One script means a crash can never leave a counter without an
+ * expiry, and concurrent callers never lose an increment (#982).
+ * KEYS[1] = counter key, ARGV[1] = TTL in seconds. Returns the new count.
+ */
+export const RECORD_FAILURE_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return count
+`;
+
 export class WalletChallengeStore {
   private readonly redis: WalletChallengeRedis;
   private readonly ttlMs: number;
@@ -208,21 +222,13 @@ export class WalletChallengeStore {
     ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
   ): Promise<number> {
     const key = walletAuthFailKey(address);
-    try {
-      if (typeof this.redis.incr === "function") {
-        const count = await this.redis.incr(key);
-        if (count === 1 && typeof this.redis.expire === "function") {
-          await this.redis.expire(key, ttlSeconds);
-        }
-        return count;
-      }
-      const current = await this.getFailureCount(address);
-      const next = current + 1;
-      await this.redis.set(key, String(next), "PX", ttlSeconds * 1000);
-      return next;
-    } catch {
-      return 0;
-    }
+    const count = await this.redis.eval(
+      RECORD_FAILURE_SCRIPT,
+      1,
+      key,
+      String(ttlSeconds),
+    );
+    return Number(count);
   }
 
   /**

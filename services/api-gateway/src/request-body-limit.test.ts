@@ -11,8 +11,8 @@ function gzipJson(payload: unknown): Buffer {
 
 // Builds a gzip payload whose decompressed JSON body is exactly `targetBytes` long.
 function gzipJsonOfExactSize(targetBytes: number): Buffer {
-  const overhead = JSON.stringify({ address: 'GTESTADDRESS', padding: '' }).length;
-  const json = JSON.stringify({ address: 'GTESTADDRESS', padding: 'a'.repeat(targetBytes - overhead) });
+  const overhead = JSON.stringify({ address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H', padding: '' }).length;
+  const json = JSON.stringify({ address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H', padding: 'a'.repeat(targetBytes - overhead) });
   return zlib.gzipSync(Buffer.from(json));
 }
 
@@ -47,7 +47,7 @@ test('payload above limit is rejected with HTTP 413 on gateway app', async (t) =
 
 test('gzip body decompressing to ~500KB is accepted', async (t) => {
   const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
-  const payload = gzipJson({ address: 'GTESTADDRESS', padding: 'a'.repeat(500_000) });
+  const payload = gzipJson({ address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H', padding: 'a'.repeat(500_000) });
 
   const response = await app.inject({
     method: 'POST',
@@ -67,7 +67,7 @@ test('gzip body decompressing to ~500KB is accepted', async (t) => {
 
 test('gzip body decompressing to ~1.5MB is rejected with 413', async (t) => {
   const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
-  const payload = gzipJson({ address: 'GTESTADDRESS', padding: 'a'.repeat(1_500_000) });
+  const payload = gzipJson({ address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H', padding: 'a'.repeat(1_500_000) });
 
   const response = await app.inject({
     method: 'POST',
@@ -147,7 +147,7 @@ test('gzip body decompressing to 1 MB + 1 byte is rejected with 413', async (t) 
 
 test('Content-Encoding: identity skips decompression', async (t) => {
   const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
-  const payload = JSON.stringify({ address: 'GTESTADDRESS' });
+  const payload = JSON.stringify({ address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H' });
 
   const response = await app.inject({
     method: 'POST',

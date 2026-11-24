@@ -452,33 +452,30 @@ test('wallet verification rejects reused nonces and accepts different nonces', a
   }
 });
 
-test('isRequestHttps: correctly detects HTTPS transport from protocol or x-forwarded-proto (#901)', (t) => {
+test('isRequestHttps: detects HTTPS from the request protocol and ignores a raw x-forwarded-proto (#901, #985)', (t) => {
   // Direct protocol checks
   t.equal(isRequestHttps({ protocol: 'https' }), true, 'protocol=https returns true');
   t.equal(isRequestHttps({ protocol: 'http' }), false, 'protocol=http returns false');
   t.equal(isRequestHttps({ protocol: undefined }), false, 'undefined protocol defaults to false');
 
-  // Forwarded protocol header checks (e.g. behind reverse proxies)
+  // A client-supplied header must not change the answer: Fastify already folds
+  // X-Forwarded-Proto into `protocol` for proxies it trusts.
   t.equal(
     isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': 'https' } }),
-    true,
-    'x-forwarded-proto=https overrides http protocol',
-  );
-  t.equal(
-    isRequestHttps({ protocol: 'https', headers: { 'x-forwarded-proto': 'http' } }),
     false,
-    'x-forwarded-proto=http overrides https protocol',
+    'spoofed x-forwarded-proto=https is ignored',
   );
   t.equal(
     isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': ['https', 'http'] } }),
-    true,
-    'array x-forwarded-proto uses first entry',
+    false,
+    'spoofed array header is ignored',
   );
   t.equal(
-    isRequestHttps({ protocol: 'http', headers: { 'x-forwarded-proto': 'HTTPS' } }),
+    isRequestHttps({ protocol: 'https', headers: { 'x-forwarded-proto': 'http' } }),
     true,
-    'case-insensitive header handling',
+    'a trusted https protocol is not downgraded by the header',
   );
+  t.equal(isRequestHttps({ protocol: 'HTTPS' }), true, 'protocol comparison is case-insensitive');
 
   t.end();
 });

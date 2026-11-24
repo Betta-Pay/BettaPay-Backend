@@ -347,7 +347,7 @@ test('the gateway keys its own limits per merchant', async (t) => {
       method: 'POST',
       url: '/api/auth/challenge',
       headers: { 'x-forwarded-for': NAT_IP, authorization: `Bearer ${token}`, 'x-csrf-check': '1' },
-      payload: { address: 'GTESTADDRESS' },
+      payload: { address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H' },
     });
 
   const first = await call(tokenA);
@@ -428,7 +428,7 @@ test('the gateway keys anonymous traffic per IP', async (t) => {
       method: 'POST',
       url: '/api/auth/challenge',
       headers: { 'x-forwarded-for': ip, 'x-csrf-check': '1' },
-      payload: { address: 'GTESTADDRESS' },
+      payload: { address: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H' },
     });
 
   const first = await call(NAT_IP);

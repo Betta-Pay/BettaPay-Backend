@@ -1,4 +1,9 @@
 import { redactReconcileLog } from './reconcile-redaction.js';
+import {
+  computeSettlementPayloadHash,
+  idempotencyHashKey,
+  settlementPayloadHash,
+} from './settlement-idempotency.js';
 /**
  * Settlement Engine — BettaPay Backend
  *
@@ -68,36 +73,6 @@ import { createShutdownCleanup } from './shutdown-cleanup.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
-/**
- * Mask PII fields before writing to reconcile log lines (#905).
- * Replaces merchant identifiers and raw amounts with redacted placeholders so
- * log aggregators never store payment-level PII.
- */
-function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
-  const seen = new WeakMap<object, unknown>();
-  const visit = (value: unknown): unknown => {
-    if (value === null || typeof value !== 'object') return value;
-    if (seen.has(value)) return seen.get(value);
-    const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
-    seen.set(value, result);
-    if (Array.isArray(value)) {
-      for (const item of value) (result as unknown[]).push(visit(item));
-    } else {
-      for (const [key, child] of Object.entries(value)) {
-        const lk = key.toLowerCase();
-        if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
-          (result as Record<string, unknown>)[key] = typeof child === 'string' ? `${child.slice(0, 4)}***` : '[REDACTED]';
-        } else if (['amount', 'diff', 'gross', 'fee', 'net'].some((token) => lk.includes(token))) {
-          (result as Record<string, unknown>)[key] = '[REDACTED]';
-        } else {
-          (result as Record<string, unknown>)[key] = visit(child);
-        }
-      }
-    }
-    return result;
-  };
-  return visit(obj) as T;
-}
 
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
@@ -797,6 +772,12 @@ fastify.post<{ Params: { id: string } }>(
       });
     } catch (err) {
       if (err instanceof VersionConflictError) {
+        // Clean up orphaned newSettlement on version conflict (#1028)
+        try {
+          await prisma.settlement.delete({ where: { id: newSettlementId } });
+        } catch (cleanupErr) {
+          fastify.log.error({ err: cleanupErr, settlementId: newSettlementId }, 'Failed to clean up orphaned retry settlement');
+        }
         return reply.code(409).send(createErrorResponse(
           ErrorCodes.CONCURRENCY_EXCEEDED,
           'Settlement was modified concurrently; please retry',
