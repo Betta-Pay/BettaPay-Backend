@@ -1517,6 +1517,7 @@ export function buildApp(opts: AppOptions = {}) {
     startTime,
     serviceVersion: SERVICE_VERSION,
     fetchImpl: opts.fetchImpl,
+    redisPing: async () => redis.ping(),
   });
 
   // --- Wallet Auth Challenge Store ----------------------------------------------

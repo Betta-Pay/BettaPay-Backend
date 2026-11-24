@@ -90,6 +90,9 @@ export function buildCsrfCookieHeader(
   },
   options?: CookieFlagOptions,
 ): string {
+  if (/[;\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("Invalid CSRF cookie value: ';' and control characters are not allowed");
+  }
   const opts = getAuthCookieOptions(request, options);
   const parts = [`${name}=${value}`, `Path=${opts.path}`, `SameSite=${opts.sameSite}`];
   if (opts.httpOnly) {
