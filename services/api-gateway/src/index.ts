@@ -134,7 +134,7 @@ import {
   GATEWAY_TIMEOUT_CONFIG,
   REQUEST_TIMEOUT_MS,
 } from "./timeout-config.js";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
@@ -1667,6 +1667,11 @@ export function buildApp(opts: AppOptions = {}) {
     await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
   }
 
+  /** Atomically revokes `jti`; true only for the single caller that claimed it. */
+  async function claimJti(jti: string, ttlSeconds: number): Promise<boolean> {
+    return (await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds, "NX")) === "OK";
+  }
+
   async function incrementRefreshRate(merchantId: string): Promise<number> {
     const rateKey = refreshRateKey(merchantId);
     const count = await redis.incr(rateKey);
@@ -1867,6 +1872,20 @@ export function buildApp(opts: AppOptions = {}) {
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
+  // Read straight from the database: a cached row could let a merchant that was
+  // just suspended or deleted keep refreshing.
+  const merchant = await prisma.merchant.findFirst({ where: { id: payload.merchantId } });
+  if (!merchant) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+  if (merchant.deletedAt != null || merchant.status === 'suspended') {
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.MERCHANT_SUSPENDED, 'Merchant is suspended'));
+  }
+
   const refreshCount = await incrementRefreshRate(payload.merchantId);
   if (refreshCount > REFRESH_RATE_LIMIT_MAX) {
     return reply
@@ -1875,7 +1894,13 @@ export function buildApp(opts: AppOptions = {}) {
       .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Too many token refresh requests'));
   }
 
-  await revokeJti(payload.jti, remainingLifetime);
+  // Claim the jti atomically (SET NX) so concurrent refreshes with the same
+  // token cannot both pass the isJtiRevoked check above.
+  if (!(await claimJti(payload.jti, remainingLifetime))) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
   await recordAuthIpSuccess(request);
 
   return reply.send({
@@ -2037,13 +2062,50 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   const WalletChallengeBody = z.object({
-    address: z.string().min(1, "address is required"),
+    address: z
+      .string()
+      .min(1, "address is required")
+      .refine((address) => StrKey.isValidEd25519PublicKey(address), {
+        message: "address must be a valid Stellar public key",
+      }),
   });
+
+  // Challenges are cheap to request but each one is stored, so cap how many a
+  // single address may ask for. The per-IP limit is the gateway-wide one.
+  const CHALLENGE_RATE_LIMIT_MAX = 10;
+  const CHALLENGE_RATE_LIMIT_SECONDS = 60;
+
+  async function incrementChallengeRate(address: string): Promise<number> {
+    const rateKey = `auth_challenge_rate:${address}`;
+    const count = await redis.incr(rateKey);
+    if (count === 1) await redis.expire(rateKey, CHALLENGE_RATE_LIMIT_SECONDS);
+    return count;
+  }
 
   fastify.post<{ Body: WalletChallengeRouteBody }>(
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
+
+      try {
+        if ((await incrementChallengeRate(d.address)) > CHALLENGE_RATE_LIMIT_MAX) {
+          return reply
+            .header("Retry-After", String(CHALLENGE_RATE_LIMIT_SECONDS))
+            .code(429)
+            .send(
+              createErrorResponse(
+                ErrorCodes.RATE_LIMITED,
+                "Too many challenge requests for this address",
+              ),
+            );
+        }
+      } catch (err) {
+        // Best-effort like the auth IP score: Redis trouble must not block login.
+        request.log.warn(
+          { err: (err as Error).message },
+          "Challenge rate limit skipped (Redis unavailable)",
+        );
+      }
 
       let issued;
       try {
@@ -2082,8 +2144,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
   fastify.post<{ Body: WalletVerifyRouteBody }>(
     "/api/auth/verify",
+    {
+      preHandler: [enforceAuthIpReputation],
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
     async (request, reply) => {
-      const d = LegacyWalletVerifyBody.parse(request.body);
+      let d: z.infer<typeof LegacyWalletVerifyBody>;
+      try {
+        d = LegacyWalletVerifyBody.parse(request.body);
+      } catch (err) {
+        await recordAuthIpFailure(request);
+        throw err;
+      }
 
       // ── Check lockout backoff (#902) ──────────────────────────────────────────
       try {
@@ -2136,6 +2208,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "not_found") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2148,6 +2221,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "expired") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2168,6 +2242,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         if (!isValid) {
           await walletChallenges.recordFailure(d.address);
+          await recordAuthIpFailure(request);
           return reply
             .code(401)
             .send(
@@ -2176,6 +2251,7 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       } catch (err) {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(401)
           .send(
@@ -2194,7 +2270,8 @@ fastify.get('/api/admin/auth/ip-score', {
           create: {
             id: d.address,
             name: `Merchant ${d.address.substring(0, 6)}`,
-            ownerId: `owner-${d.address.substring(0, 6)}`,
+            // A full UUID: the old 6-character prefix collided across addresses.
+            ownerId: `owner-${crypto.randomUUID()}`,
             settings: {},
           },
         });
@@ -2219,10 +2296,9 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      const token = fastify.jwt.sign({
-        merchantId: merchant.id,
-        ownerId: merchant.ownerId,
-      });
+      // signMerchantJwt adds a `jti`, so these tokens can be revoked.
+      const token = await signMerchantJwt(merchant.id, merchant.ownerId);
+      await recordAuthIpSuccess(request);
       return reply.send({ token });
     },
   );

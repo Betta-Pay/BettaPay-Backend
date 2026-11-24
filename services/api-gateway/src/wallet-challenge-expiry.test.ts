@@ -15,7 +15,7 @@ import {
 // and that survived every failed verification attempt. They now live in Redis
 // under a TTL and are consumed by the first verification attempt.
 
-const ADDRESS = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890';
+const ADDRESS = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
 
 /**
  * An in-memory Redis with a clock we control, so TTL expiry can be observed

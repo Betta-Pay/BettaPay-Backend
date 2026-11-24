@@ -8,6 +8,7 @@ import {
   checkUpstreamServiceHealth,
   readServiceVersion,
   UPSTREAM_HEALTH_TIMEOUT_MS,
+  type UpstreamHealthResult,
 } from '@bettapay/validation';
 import type { AggregatedHealthResponse, HealthResponse } from '@bettapay/shared-types';
 
@@ -36,23 +37,39 @@ export function parseAbandonmentThresholdMinutes(raw: string | undefined): numbe
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ABANDONMENT_THRESHOLD_MINUTES;
 }
 
-export async function buildGatewayHealthResponse(
-  options: Omit<RegisterGatewayHealthRoutesOptions, 'fastify'>,
-): Promise<HealthResponse> {
-  const {
-    prisma,
-    env,
-    startTime,
-    serviceVersion = readServiceVersion(import.meta.url),
-    fetchImpl = fetch,
-    redisPing,
-  } = options;
+type GatewayHealthOptions = Omit<RegisterGatewayHealthRoutesOptions, 'fastify'>;
 
-  const [postgresql, fxEngine, settlementEngine, indexer, redis] = await Promise.all([
-    checkPostgresql(() => prisma.$queryRaw`SELECT version() AS "serverVersion"`),
+interface UpstreamProbes {
+  fxEngine: UpstreamHealthResult;
+  settlementEngine: UpstreamHealthResult;
+  indexer: UpstreamHealthResult;
+}
+
+/** Probes each upstream service exactly once. */
+async function probeUpstreams(options: GatewayHealthOptions): Promise<UpstreamProbes> {
+  const { env, fetchImpl = fetch } = options;
+  const [fxEngine, settlementEngine, indexer] = await Promise.all([
     checkUpstreamServiceHealth(env.FX_ENGINE_URL, 'fx-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.SETTLEMENT_ENGINE_URL, 'settlement-engine', { fetchImpl }),
     checkUpstreamServiceHealth(env.INDEXER_URL, 'indexer', { fetchImpl }),
+  ]);
+  return { fxEngine, settlementEngine, indexer };
+}
+
+export async function buildGatewayHealthResponse(
+  options: GatewayHealthOptions,
+  probes?: UpstreamProbes,
+): Promise<HealthResponse> {
+  const {
+    prisma,
+    startTime,
+    serviceVersion = readServiceVersion(import.meta.url),
+    redisPing,
+  } = options;
+
+  const [postgresql, { fxEngine, settlementEngine, indexer }, redis] = await Promise.all([
+    checkPostgresql(() => prisma.$queryRaw`SELECT version() AS "serverVersion"`),
+    probes ?? probeUpstreams(options),
     redisPing ? checkRedisPing(redisPing) : Promise.resolve(null),
   ]);
 
@@ -99,9 +116,12 @@ export async function buildGatewayHealthResponse(
 }
 
 export async function buildAggregatedHealthResponse(
-  options: Omit<RegisterGatewayHealthRoutesOptions, 'fastify'>,
+  options: GatewayHealthOptions,
 ): Promise<AggregatedHealthResponse> {
-  const gatewayHealth = await buildGatewayHealthResponse(options);
+  // Probe each upstream once and reuse the result for both the gateway's own
+  // `upstream` block and the aggregated `services` block.
+  const probes = await probeUpstreams(options);
+  const gatewayHealth = await buildGatewayHealthResponse(options, probes);
 
   return aggregateAllHealth({
     gatewayHealth,
@@ -112,6 +132,11 @@ export async function buildAggregatedHealthResponse(
     ],
     timeoutMs: UPSTREAM_HEALTH_TIMEOUT_MS,
     fetchImpl: options.fetchImpl,
+    probeResults: {
+      'fx-engine': probes.fxEngine,
+      'settlement-engine': probes.settlementEngine,
+      indexer: probes.indexer,
+    },
   });
 }
 
