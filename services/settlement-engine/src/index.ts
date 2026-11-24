@@ -1,4 +1,9 @@
 import { redactReconcileLog } from './reconcile-redaction.js';
+import {
+  computeSettlementPayloadHash,
+  idempotencyHashKey,
+  settlementPayloadHash,
+} from './settlement-idempotency.js';
 /**
  * Settlement Engine — BettaPay Backend
  *
@@ -66,36 +71,6 @@ import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
-/**
- * Mask PII fields before writing to reconcile log lines (#905).
- * Replaces merchant identifiers and raw amounts with redacted placeholders so
- * log aggregators never store payment-level PII.
- */
-function redactReconcileLog<T extends Record<string, unknown>>(obj: T): T {
-  const seen = new WeakMap<object, unknown>();
-  const visit = (value: unknown): unknown => {
-    if (value === null || typeof value !== 'object') return value;
-    if (seen.has(value)) return seen.get(value);
-    const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
-    seen.set(value, result);
-    if (Array.isArray(value)) {
-      for (const item of value) (result as unknown[]).push(visit(item));
-    } else {
-      for (const [key, child] of Object.entries(value)) {
-        const lk = key.toLowerCase();
-        if (lk.includes('merchantid') || lk.includes('merchant_id') || lk.includes('accountid')) {
-          (result as Record<string, unknown>)[key] = typeof child === 'string' ? `${child.slice(0, 4)}***` : '[REDACTED]';
-        } else if (['amount', 'diff', 'gross', 'fee', 'net'].some((token) => lk.includes(token))) {
-          (result as Record<string, unknown>)[key] = '[REDACTED]';
-        } else {
-          (result as Record<string, unknown>)[key] = visit(child);
-        }
-      }
-    }
-    return result;
-  };
-  return visit(obj) as T;
-}
 
 import { startSettlementReaper } from './settlement-reaper.js';
 import { runSettlementBatching } from './settlement-batch-processor.js';
@@ -706,7 +681,7 @@ domainWorker.on('error', (err) => {
 
 fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
+    queryDatabase: () => prisma.$queryRaw`SELECT 1, version() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
@@ -751,6 +726,9 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
 
 fastify.post<{ Params: { id: string } }>(
   '/api/settlements/:id/retry',
+  {
+    preValidation: [fastify.serviceAuth],
+  },
   async (request, reply) => {
     const { id } = request.params;
 
@@ -770,6 +748,19 @@ fastify.post<{ Params: { id: string } }>(
         'Only failed settlements can be retried',
         { currentStatus: original.status }
       ));
+    }
+
+    // Check merchant status before retry (#1029)
+    const merchant = await getCachedMerchant(
+      original.merchantId,
+      merchantCache,
+      (mId) => prisma.merchant.findUnique({ where: { id: mId } }),
+    );
+    if (!merchant) {
+      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+    }
+    if (merchant.status === 'suspended' || merchant.deletedAt !== null) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended or inactive'));
     }
 
     const totalRetries = await getSettlementRetryCount(id);
@@ -815,6 +806,12 @@ fastify.post<{ Params: { id: string } }>(
       });
     } catch (err) {
       if (err instanceof VersionConflictError) {
+        // Clean up orphaned newSettlement on version conflict (#1028)
+        try {
+          await prisma.settlement.delete({ where: { id: newSettlementId } });
+        } catch (cleanupErr) {
+          fastify.log.error({ err: cleanupErr, settlementId: newSettlementId }, 'Failed to clean up orphaned retry settlement');
+        }
         return reply.code(409).send(createErrorResponse(
           ErrorCodes.CONCURRENCY_EXCEEDED,
           'Settlement was modified concurrently; please retry',
@@ -888,7 +885,12 @@ export { computeReconciliationDiff, type ReconcileDiffResult, type ReconcileReco
  * between local (engine) and gateway records, returning per-field mismatches.
  * Capped at 100 diffs; a `truncated` flag indicates if more exist.
  */
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>(
+  '/api/settlements/reconcile',
+  {
+    preValidation: [fastify.serviceAuth],
+  },
+  async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1228,7 +1230,12 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 // ── Reconciliation Report Endpoint (#490) ──────────────────────────────────────
 // Returns a summary of reconciliation status without full detail records.
 // Useful for monitoring dashboards and alerts.
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>(
+  '/api/settlements/reconcile/report',
+  {
+    preValidation: [fastify.serviceAuth],
+  },
+  async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1449,6 +1456,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
   '/api/settlements',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -1479,8 +1487,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (merchant.status === 'suspended' || merchant.deletedAt !== null) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended or inactive'));
     }
     if (merchant.kycStatus === 'rejected') {
       return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
@@ -2108,8 +2116,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // 2. Close BullMQ workers (drain and close gracefully, force-stop after 10s)
     fastify.log.info('Closing BullMQ workers...');
     await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
-    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
-    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
+    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => []);
+    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => []);
     fastify.log.info('BullMQ workers closed');
 
     // 3. Close BullMQ queues
