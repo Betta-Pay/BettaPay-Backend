@@ -49,6 +49,7 @@ import { buildSettlementWebhookData } from './webhook-payload.js';
 import {
   createSettlementWithUniqueGuard,
   updateSettlementWithOptimisticLock,
+  transitionSettlementStatus,
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
@@ -170,36 +171,9 @@ export function validateTransition(current: string, next: string) {
   }
 }
 
-const prisma = prismaBase.$extends({
-  query: {
-    settlement: {
-      async update({ args, query }) {
-        if (args.data.status) {
-          const current = await prismaBase.settlement.findUnique({
-            where: args.where,
-            select: { status: true },
-          });
-          if (current) {
-            validateTransition(current.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-      async updateMany({ args, query }) {
-        if (args.data.status) {
-          const records = await prismaBase.settlement.findMany({
-            where: args.where,
-            select: { id: true, status: true },
-          });
-          for (const record of records) {
-            validateTransition(record.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-    },
-  },
-}) as unknown as typeof prismaBase;
+// Status transitions are enforced atomically in the UPDATE's WHERE clause by
+// transitionSettlementStatus (prisma-adapter.ts), not by a read-then-write hook.
+const prisma = prismaBase;
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single settlement creation request (#741).
@@ -538,15 +512,11 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
   try {
     // Transition to processing first
-    await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'processing' },
-    });
+    await transitionSettlementStatus(prisma, settlementId, 'processing');
 
     // In a real app this interacts with Soroban; here we mark completed.
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'completed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'completed', {
+      completedAt: new Date(),
     });
 
     log.info({ settlementId }, 'Settlement completed in database');
@@ -564,9 +534,8 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
   } catch (error) {
     log.error({ error, settlementId }, 'Settlement processing failed');
 
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'failed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'failed', {
+      completedAt: new Date(),
     }).catch(() => null);
 
     if (updatedSettlement?.webhookUrl) {
@@ -621,6 +590,13 @@ export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT
   if (retryCount >= maxRetries) {
     throw new Error(`Maximum retry limit (${maxRetries}) exceeded`);
   }
+}
+
+/** True when a merchant is suspended or soft-deleted and must not get payouts. */
+export function isMerchantBlocked(
+  merchant: { status?: string | null; deletedAt?: Date | string | null } | null | undefined,
+): boolean {
+  return !!merchant && (merchant.status === 'suspended' || merchant.deletedAt != null);
 }
 
 async function getSettlementRetryCount(settlementId: string): Promise<number> {
@@ -770,6 +746,11 @@ fastify.post<{ Params: { id: string } }>(
         'Only failed settlements can be retried',
         { currentStatus: original.status }
       ));
+    }
+
+    const retryMerchant = await prisma.merchant.findUnique({ where: { id: original.merchantId } });
+    if (isMerchantBlocked(retryMerchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const totalRetries = await getSettlementRetryCount(id);
@@ -1479,8 +1460,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
       return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
@@ -1704,8 +1685,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     if (!merchant) {
       return rejectBulk(404, createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return rejectBulk(422, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
       return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));

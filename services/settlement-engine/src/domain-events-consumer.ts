@@ -26,6 +26,7 @@ interface Logger {
   child(bindings: Record<string, unknown>): Logger;
   info(obj: Record<string, unknown>, msg: string): void;
   debug(obj: Record<string, unknown>, msg: string): void;
+  error(obj: Record<string, unknown>, msg: string): void;
 }
 
 /**
@@ -62,7 +63,14 @@ export function createDomainEventProcessor(
         create: { id, ...fields, status: 'initiated' },
       })
       .then(() => true)
-      .catch(() => false); // table optional in this phase; never crash the worker
+      .catch((err: unknown) => {
+        // table optional in this phase; never crash the worker, but make failures visible
+        jobLog.error(
+          { err, eventId: id, eventType: data.type },
+          'Domain event processing failed',
+        );
+        return false;
+      });
 
     if (mirrored) jobLog.info({ id }, 'Domain event mirrored');
   };
