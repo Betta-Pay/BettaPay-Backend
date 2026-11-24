@@ -5,9 +5,11 @@ import { registerErrorHandler } from "@bettapay/validation";
 import {
   createQuoteQuerySchema,
   FX_QUOTE_BODY_LIMIT_DEFAULT,
+  FX_QUOTE_BODY_LIMIT_MIN,
   isPositiveFiniteAmount,
   POSITIVE_AMOUNT_MESSAGE,
   resolveFxQuoteBodyLimit,
+  SAME_CURRENCY_MESSAGE,
 } from "./validation.js";
 
 test("quote query validation applies the production slippage ceiling", () => {
@@ -39,11 +41,69 @@ test("quote amount validation accepts a positive finite amount", () => {
   assert.equal(isPositiveFiniteAmount("0.0001"), true);
 });
 
+test("quote query rejects identical from/to currencies (#1042)", () => {
+  for (const nodeEnv of ["production", "development"]) {
+    const schema = createQuoteQuerySchema(nodeEnv);
+
+    for (const currency of ["USDC", "EURT", "NGN"]) {
+      const result = schema.safeParse({ from: currency, to: currency });
+      assert.equal(result.success, false, `${currency} -> ${currency} is rejected in ${nodeEnv}`);
+      if (!result.success) {
+        assert.equal(result.error.errors[0].message, SAME_CURRENCY_MESSAGE);
+        assert.deepEqual(result.error.errors[0].path, ["to"]);
+      }
+    }
+  }
+});
+
+test("quote query rejects a same-currency pair that only matches via the defaults (#1042)", () => {
+  const schema = createQuoteQuerySchema("development");
+
+  // `to` defaults to NGN, so an explicit from=NGN collapses to NGN -> NGN
+  assert.equal(schema.safeParse({ from: "NGN" }).success, false);
+  // `from` defaults to USDC, so an explicit to=USDC collapses to USDC -> USDC
+  assert.equal(schema.safeParse({ to: "USDC" }).success, false);
+});
+
+test("quote query still accepts valid currency pairs (#1042)", () => {
+  const schema = createQuoteQuerySchema("development");
+
+  assert.deepEqual(schema.parse({}), { from: "USDC", to: "NGN", amount: "1" });
+  assert.equal(schema.parse({ from: "USDC", to: "EURT" }).to, "EURT");
+  assert.equal(schema.parse({ from: "EURT", to: "NGN", amount: "10" }).from, "EURT");
+});
+
 test("quote body limit is configurable and falls back safely", () => {
   assert.equal(resolveFxQuoteBodyLimit("65536"), 65_536);
   assert.equal(resolveFxQuoteBodyLimit(32_768), 32_768);
   assert.equal(resolveFxQuoteBodyLimit("not-a-number"), FX_QUOTE_BODY_LIMIT_DEFAULT);
   assert.equal(resolveFxQuoteBodyLimit(undefined), FX_QUOTE_BODY_LIMIT_DEFAULT);
+});
+
+test("quote body limit honours integers of at least 1KB", () => {
+  assert.equal(FX_QUOTE_BODY_LIMIT_MIN, 1024);
+  assert.equal(resolveFxQuoteBodyLimit(1024), 1024);
+  assert.equal(resolveFxQuoteBodyLimit("1024"), 1024);
+  assert.equal(resolveFxQuoteBodyLimit(" 2048 "), 2048);
+  assert.equal(resolveFxQuoteBodyLimit(10_485_760), 10_485_760);
+});
+
+test("quote body limit falls back for sub-1KB, zero and negative values", () => {
+  for (const raw of [1, 512, 1023, "1", "1023", 0, "0", -1, "-2048", -1024]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${raw} falls back`);
+  }
+});
+
+test("quote body limit falls back for fractional and non-finite values instead of truncating", () => {
+  for (const raw of [2048.5, "2048.5", "1024.0", 1500.25, NaN, Infinity, -Infinity, Number.MAX_VALUE]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${raw} falls back`);
+  }
+});
+
+test("quote body limit falls back for unparseable or empty input", () => {
+  for (const raw of ["", "   ", "64kb", "1e4", "0x800", "abc", undefined]) {
+    assert.equal(resolveFxQuoteBodyLimit(raw), FX_QUOTE_BODY_LIMIT_DEFAULT, `${String(raw)} falls back`);
+  }
 });
 
 test("oversized quote body returns a typed 413 and a normal body is processed", async () => {

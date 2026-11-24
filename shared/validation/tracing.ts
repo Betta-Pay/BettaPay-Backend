@@ -25,6 +25,18 @@ function firstHeader(value: HeaderValue): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+// Client-supplied ids end up in logs and response headers, so they are capped
+// in length and restricted to printable ASCII without whitespace (#1078).
+// Anything else is discarded and a fresh id is generated in its place.
+export const MAX_TRACE_ID_LENGTH = 128;
+const SAFE_TRACE_ID = /^[\x21-\x7e]+$/;
+
+export function sanitizeTraceId(value: HeaderValue): string | undefined {
+  const id = firstHeader(value);
+  if (!id || id.length > MAX_TRACE_ID_LENGTH || !SAFE_TRACE_ID.test(id)) return undefined;
+  return id;
+}
+
 export interface TraceContext {
   requestId: string;
   traceId: string;
@@ -57,12 +69,13 @@ export function shouldSampleTrace(
 
 /**
  * Extract the trace context from incoming headers, generating fresh ids when
- * absent (the gateway edge case). `requestId` and `traceId` are independent so
+ * absent (the gateway edge case) or when the supplied value is oversized or
+ * contains unsafe characters. `requestId` and `traceId` are independent so
  * a trace id remains stable across hops while request ids can differ.
  */
 export function extractTraceContext(headers: HeaderBag = {}): TraceContext {
-  const requestId = firstHeader(headers[REQUEST_ID_HEADER]) || randomUUID();
-  const traceId = firstHeader(headers[TRACE_ID_HEADER]) || randomUUID();
+  const requestId = sanitizeTraceId(headers[REQUEST_ID_HEADER]) ?? randomUUID();
+  const traceId = sanitizeTraceId(headers[TRACE_ID_HEADER]) ?? randomUUID();
   return { requestId, traceId };
 }
 
@@ -95,8 +108,8 @@ export function registerTracing(
 ): void {
   fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     // Honour a forwarded request id; otherwise fall back to Fastify's request.id.
-    const requestId = firstHeader(request.headers[REQUEST_ID_HEADER]) || request.id;
-    const traceId = firstHeader(request.headers[TRACE_ID_HEADER]) || randomUUID();
+    const requestId = sanitizeTraceId(request.headers[REQUEST_ID_HEADER]) ?? request.id;
+    const traceId = sanitizeTraceId(request.headers[TRACE_ID_HEADER]) ?? randomUUID();
 
     request.headers[REQUEST_ID_HEADER] = requestId;
     request.headers[TRACE_ID_HEADER] = traceId;

@@ -86,6 +86,10 @@ model Settlement {
   id                      String           @id
   merchantId              String
   merchant                Merchant         @relation(fields: [merchantId], references: [id])
+  // Monetary columns stay String for exact decimal round-tripping; the
+  // Settlement_*_numeric_check CHECK constraints (migration
+  // 20261119000000_settlement_batch_fk_amount_checks) reject anything that is
+  // not a non-negative decimal string at the database level (#1096).
   totalAmount             String
   grossAmount             String
   feeAmount               String
@@ -97,7 +101,10 @@ model Settlement {
   // Custom headers (idempotency keys, auth tokens, etc.) sent with every
   // webhook delivery attempt for this settlement, including retries (#569).
   webhookHeaders          Json?
+  // FK to SettlementBatch (#1096). onDelete: SetNull — deleting a batch unlinks
+  // its settlements instead of deleting them or leaving an orphaned reference.
   batchId                 String?
+  batch                   SettlementBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
   initiatedAt             DateTime         @default(now())
   completedAt             DateTime?
   // Atomic idempotency guard: unique constraint prevents duplicate settlements
@@ -222,13 +229,16 @@ model SupportedAsset {
   updatedAt  DateTime @updatedAt
 }
 
+// totalGross/totalFees/totalNet are guarded by SettlementBatch_*_numeric_check
+// CHECK constraints, like the Settlement amount columns (#1096).
 model SettlementBatch {
-  id          String    @id @default(cuid())
+  id          String       @id @default(cuid())
   asset       String
   totalCount  Int
   totalGross  String
   totalFees   String
   totalNet    String
-  createdAt   DateTime  @default(now())
+  createdAt   DateTime     @default(now())
   processedAt DateTime?
+  settlements Settlement[]
 }

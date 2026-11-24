@@ -15,9 +15,9 @@ import {
 } from "./idempotency.js";
 
 function stubRedis(overrides: Partial<IdempotencyRedis> = {}): IdempotencyRedis & {
-  calls: { set: number; get: number };
+  calls: { set: number; get: number; del: number };
 } {
-  const calls = { set: 0, get: 0 };
+  const calls = { set: 0, get: 0, del: 0 };
   return {
     calls,
     get: async (_key: string) => {
@@ -27,6 +27,10 @@ function stubRedis(overrides: Partial<IdempotencyRedis> = {}): IdempotencyRedis 
     set: async (_key: string, _value: string) => {
       calls.set += 1;
       return "OK";
+    },
+    del: async (_key: string) => {
+      calls.del += 1;
+      return 1;
     },
     ...overrides,
   };
@@ -140,5 +144,81 @@ test("withIdempotency: bulk-hash mismatch throws instead of replaying", async ()
         create: async () => ({ id: "never" }),
       }),
     IdempotencyConflictError,
+  );
+});
+
+test("withIdempotency: releases Redis claim key when create() throws so subsequent retries succeed (#1069)", async () => {
+  const store = new Map<string, string>();
+  const deletedKeys: string[] = [];
+  const redis: IdempotencyRedis = {
+    get: async (k) => store.get(k) ?? null,
+    set: async (k, value, ...args) => {
+      const hasNx = args.includes("NX");
+      if (hasNx && store.has(k)) return null;
+      store.set(k, value);
+      return "OK";
+    },
+    del: async (k) => {
+      deletedKeys.push(k);
+      return store.delete(k) ? 1 : 0;
+    },
+  };
+
+  let attempts = 0;
+  const transientError = new Error("transient DB timeout");
+
+  await assert.rejects(
+    () =>
+      withIdempotency({
+        key: "key-retry",
+        redis,
+        lookupExisting: async () => null,
+        create: async () => {
+          attempts += 1;
+          throw transientError;
+        },
+      }),
+    (err) => err === transientError,
+  );
+
+  assert.deepEqual(deletedKeys, ["idempotency:key-retry"]);
+  assert.equal(store.has("idempotency:key-retry"), false);
+  assert.equal(attempts, 1);
+
+  const created = { id: "pay_retried" };
+  const retryOut = await withIdempotency({
+    key: "key-retry",
+    redis,
+    lookupExisting: async () => null,
+    create: async () => {
+      attempts += 1;
+      return created;
+    },
+  });
+
+  assert.deepEqual(retryOut, { result: created, deduped: false, source: "created" });
+  assert.equal(attempts, 2);
+  assert.equal(store.has("idempotency:key-retry"), true);
+});
+
+test("withIdempotency: rethrows original create() error even if Redis del() fails during cleanup (#1069)", async () => {
+  const createError = new Error("primary DB write failed");
+  const redis = stubRedis({
+    del: async () => {
+      throw new Error("redis unavailable");
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      withIdempotency({
+        key: "key-del-fail",
+        redis,
+        lookupExisting: async () => null,
+        create: async () => {
+          throw createError;
+        },
+      }),
+    (err) => err === createError,
   );
 });

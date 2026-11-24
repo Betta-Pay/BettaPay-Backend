@@ -1,6 +1,7 @@
 import test from 'tape';
 import {
   WalletChallengeStore,
+  RECORD_FAILURE_SCRIPT,
   WALLET_AUTH_LOCKOUT_KEY_PREFIX,
   DEFAULT_WALLET_AUTH_MAX_FAILURES,
   DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
@@ -66,8 +67,20 @@ function createMockRedis(startTime = 1_700_000_000_000) {
       store.delete(key);
       return 1;
     },
-    async eval(_script: string, _numKeys: number, ...args: any[]) {
+    async eval(script: string, _numKeys: number, ...args: any[]) {
       const key = args[0];
+      if (script === RECORD_FAILURE_SCRIPT) {
+        const live = isLive(key);
+        const next = (live ? parseInt(live.value, 10) : 0) + 1;
+        if (live) {
+          live.value = String(next);
+        } else {
+          const seconds = Number(args[1]);
+          redis.expireCalls.push({ key, seconds });
+          store.set(key, { value: String(next), expiresAt: now + seconds * 1000 });
+        }
+        return next;
+      }
       const entry = isLive(key);
       store.delete(key);
       return entry ? entry.value : null;
@@ -147,6 +160,19 @@ test('WalletChallengeStore lockout: respects custom threshold (#902)', async (t)
   t.equal(await store.isLockedOut(TEST_WALLET_ADDRESS, 5), false, 'not locked out with threshold 5');
   t.equal(await store.isLockedOut(TEST_WALLET_ADDRESS, 2), true, 'locked out with custom threshold 2');
 
+  t.end();
+});
+
+test('wallet lockout store fails gracefully when Redis get throws', async (t) => {
+  const redis: WalletChallengeRedis = {
+    async set() { return 'OK'; },
+    async eval() { return null; },
+    async del() { return 1; },
+    async get() { throw new Error('redis outage'); },
+  };
+  const store = new WalletChallengeStore(redis);
+  t.equal(await store.isLockedOut(TEST_WALLET_ADDRESS), false, 'Redis outage fails open');
+  t.equal(await store.getFailureCount(TEST_WALLET_ADDRESS), 0, 'failure count falls back to zero');
   t.end();
 });
 

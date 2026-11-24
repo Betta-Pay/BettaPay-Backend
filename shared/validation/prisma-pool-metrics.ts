@@ -65,8 +65,6 @@ export function checkPoolAlertThreshold(
   }
 }
 
-let activeInterval: NodeJS.Timeout | null = null;
-
 export function registerPrismaPoolMetrics(registry: any, promClientModule?: any) {
   if (!registry) return null;
 
@@ -153,11 +151,7 @@ export function startPrismaPoolMetricsCollector(
   logger?: { warn: (obj: object, msg?: string) => void },
   promClientModule?: any
 ): { stop: () => void } {
-  if (activeInterval) {
-    clearInterval(activeInterval);
-    activeInterval = null;
-  }
-
+  // Each call owns its own interval; stopping one collector never affects another.
   registerPrismaPoolMetrics(registry, promClientModule);
   updatePrismaPoolMetrics(poolOrGetter, registry, logger, promClientModule);
 
@@ -169,14 +163,7 @@ export function startPrismaPoolMetricsCollector(
     timer.unref();
   }
 
-  activeInterval = timer;
-
   return {
-    stop: () => {
-      clearInterval(timer);
-      if (activeInterval === timer) {
-        activeInterval = null;
-      }
-    },
+    stop: () => clearInterval(timer),
   };
 }

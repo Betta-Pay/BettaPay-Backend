@@ -1,5 +1,6 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import fastifyJwt from '@fastify/jwt';
+import { Prisma } from '@prisma/client';
 import { buildApp, AppOptions } from './index.js';
 import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
 import type {
@@ -171,19 +172,40 @@ export function createMockPrisma(initialData: MockData = {}) {
       store.payments[index] = updated;
       return updated;
     },
+    updateMany: async ({ where, data }: { where: any; data: any }) => {
+      let count = 0;
+      for (let i = 0; i < store.payments.length; i++) {
+        const payment = store.payments[i];
+        if (where.merchantId && payment.merchantId !== where.merchantId) continue;
+        if (where.status && payment.status !== where.status) continue;
+        store.payments[i] = { ...payment, ...data };
+        count++;
+      }
+      return { count };
+    },
   };
 
   const mockMerchant = {
     findUnique: async ({ where }: { where: { id: string } }) => {
       return store.merchants.find((m) => m.id === where.id) || null;
     },
-    findFirst: async ({ where }: { where: any }) => {
-      return (
-        store.merchants.find((m) => {
+    findFirst: async ({ where, select }: { where: any; select?: any }) => {
+      const merchant = store.merchants.find((m) => {
           if (where.id && m.id !== where.id) return false;
+          if (where.ownerId && m.ownerId !== where.ownerId) return false;
+          if (where.OR && !where.OR.some((condition: any) =>
+            (condition.id && m.id === condition.id) ||
+            (condition.ownerId && m.ownerId === condition.ownerId)
+          )) return false;
           if (where.deletedAt === null && m.deletedAt !== null && m.deletedAt !== undefined) return false;
           return true;
-        }) || null
+        }) || null;
+      if (!merchant || !select) return merchant;
+      return Object.fromEntries(
+        Object.entries(select)
+          .filter(([, included]) => included)
+          .map(([field]) => [field, merchant[field]])
+          .filter(([, value]) => value !== undefined),
       );
     },
     findMany: async ({ where }: { where?: any } = {}) => {
@@ -233,6 +255,14 @@ export function createMockPrisma(initialData: MockData = {}) {
       const lte = new Date(where.initiatedAt.lte);
       result = result.filter((s) => new Date(s.initiatedAt) <= lte);
     }
+    if (where?.merchant?.deletedAt === null) {
+      result = result.filter((settlement) => {
+        const merchant = store.merchants.find(
+          (item) => item.id === settlement.merchantId,
+        );
+        return !merchant?.deletedAt;
+      });
+    }
     return result;
   }
 
@@ -277,6 +307,17 @@ export function createMockPrisma(initialData: MockData = {}) {
       store.settlements[index] = updated;
       return updated;
     },
+    updateMany: async ({ where, data }: { where: any; data: any }) => {
+      let count = 0;
+      for (let i = 0; i < store.settlements.length; i++) {
+        const settlement = store.settlements[i];
+        if (where.merchantId && settlement.merchantId !== where.merchantId) continue;
+        if (where.status && settlement.status !== where.status) continue;
+        store.settlements[i] = { ...settlement, ...data };
+        count++;
+      }
+      return { count };
+    },
   };
 
   const mockAuditLog = {
@@ -284,6 +325,12 @@ export function createMockPrisma(initialData: MockData = {}) {
       let result = [...store.auditLogs];
       if (where?.entityType) result = result.filter((a) => a.entityType === where.entityType);
       if (where?.action) result = result.filter((a) => a.action === where.action);
+      if (where?.createdAt?.gte) {
+        result = result.filter((a) => new Date(a.createdAt) >= where.createdAt.gte);
+      }
+      if (where?.createdAt?.lte) {
+        result = result.filter((a) => new Date(a.createdAt) <= where.createdAt.lte);
+      }
       const start = skip || 0;
       const end = take ? start + take : undefined;
       return result.slice(start, end);
@@ -292,6 +339,12 @@ export function createMockPrisma(initialData: MockData = {}) {
       let result = [...store.auditLogs];
       if (where?.entityType) result = result.filter((a) => a.entityType === where.entityType);
       if (where?.action) result = result.filter((a) => a.action === where.action);
+      if (where?.createdAt?.gte) {
+        result = result.filter((a) => new Date(a.createdAt) >= where.createdAt.gte);
+      }
+      if (where?.createdAt?.lte) {
+        result = result.filter((a) => new Date(a.createdAt) <= where.createdAt.lte);
+      }
       return result.length;
     },
     create: async ({ data }: { data: any }) => {
@@ -354,7 +407,26 @@ export function createMockPrisma(initialData: MockData = {}) {
     $transaction: async (cb: (tx: any) => Promise<any>) => {
       return cb(mockPrismaInstance);
     },
-    $queryRaw: async () => [{ '?column?': 1 }],
+    $queryRaw: async (query: any, ...values: any[]) => {
+      const sql = Array.isArray(query) ? query.join("?") : String(query?.text || query || "");
+      if (sql.includes('FROM "Settlement"') || sql.includes("Settlement")) {
+        const merchantId = values[0] || (query as any)?.values?.[0];
+        const excludedStatuses = new Set(["failed", "cancelled", "superseded"]);
+        const sum = store.settlements
+          .filter(
+            (s) =>
+              (!merchantId || s.merchantId === merchantId) &&
+              !excludedStatuses.has((s.status || "").toLowerCase()) &&
+              !s.supersededById,
+          )
+          .reduce(
+            (acc, s) => acc.plus(new Prisma.Decimal(s.totalAmount || "0")),
+            new Prisma.Decimal(0),
+          );
+        return [{ sum: sum.toString() }];
+      }
+      return [{ '?column?': 1 }];
+    },
     $connect: async () => {},
     $disconnect: async () => {},
   };

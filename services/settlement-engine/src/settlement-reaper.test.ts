@@ -49,28 +49,105 @@ test('reapStuckSettlements drains processing rows in batches of 200', async (t) 
   t.end();
 });
 
-test('reapStuckSettlements does nothing when there are no stale rows', async (t) => {
-  let updateCount = 0;
-  let enqueueCount = 0;
+test('reapStuckSettlements transitions settlements exceeding max retries to terminal failure with completedAt set', async (t) => {
+  const stuckBefore = new Date('2026-09-26T19:00:00.000Z');
+  const settlement = {
+    id: 'stuck-terminal-1',
+    initiatedAt: new Date('2026-09-26T18:00:00.000Z'),
+    status: 'processing',
+    completedAt: null as Date | null,
+  };
+
+  const attemptsMap = new Map<string, number>();
+  // Pre-set attempts at maxRetries threshold (3)
+  attemptsMap.set('stuck-terminal-1', 3);
+
+  let updatedData: any = null;
   const prisma = {
     settlement: {
-      findMany: async () => [],
-      updateMany: async () => {
-        updateCount++;
+      findMany: async () => [settlement],
+      updateMany: async (args: any) => {
+        updatedData = args.data;
+        settlement.status = args.data.status;
+        settlement.completedAt = args.data.completedAt;
         return { count: 1 };
       },
     },
   };
+
+  const enqueuedJobs: any[] = [];
   const queue = {
-    add: async () => {
-      enqueueCount++;
+    add: async (name: string, data: any) => {
+      enqueuedJobs.push({ name, data });
     },
   };
 
-  const count = await reapStuckSettlements(prisma as any, queue as any, new Date());
+  const warnings: any[] = [];
+  const logger = {
+    warn: (obj: any, msg?: string) => warnings.push({ obj, msg }),
+    error: () => {},
+  };
 
-  t.equal(count, 0);
-  t.equal(updateCount, 0);
-  t.equal(enqueueCount, 0);
+  const count = await reapStuckSettlements(prisma as any, queue as any, stuckBefore, {
+    maxRetries: 3,
+    attemptsMap,
+    logger: logger as any,
+  });
+
+  t.equal(count, 1, 'reaped 1 settlement');
+  t.equal(settlement.status, 'failed', 'status transitioned to failed');
+  t.ok(settlement.completedAt instanceof Date, 'completedAt is set on terminal failure');
+  t.ok(updatedData.completedAt, 'update payload included completedAt');
+  t.equal(enqueuedJobs.length, 0, 'did not re-enqueue job into BullMQ after reaching retry cap');
+  t.equal(warnings.length, 1, 'logged warning for exceeding retry limit');
+  t.end();
+});
+
+test('reapStuckSettlements handles BullMQ enqueue failure without leaving DB in inconsistent state', async (t) => {
+  const stuckBefore = new Date('2026-09-26T19:00:00.000Z');
+  const settlement = {
+    id: 'stuck-enqueue-fail',
+    initiatedAt: new Date('2026-09-26T18:00:00.000Z'),
+    status: 'processing',
+  };
+
+  const statusHistory: string[] = [];
+  const prisma = {
+    settlement: {
+      findMany: async () => [settlement],
+      updateMany: async (args: any) => {
+        settlement.status = args.data.status;
+        statusHistory.push(args.data.status);
+        return { count: 1 };
+      },
+    },
+  };
+
+  const queue = {
+    add: async () => {
+      throw new Error('BullMQ connection failure');
+    },
+  };
+
+  const loggedErrors: any[] = [];
+  const logger = {
+    error: (obj: any, msg?: string) => loggedErrors.push({ obj, msg }),
+    warn: () => {},
+  };
+
+  const attemptsMap = new Map<string, number>();
+
+  const count = await reapStuckSettlements(prisma as any, queue as any, stuckBefore, {
+    maxRetries: 3,
+    attemptsMap,
+    logger: logger as any,
+  });
+
+  t.equal(count, 0, 'reapedCount not incremented on enqueue error');
+  t.equal(settlement.status, 'processing', 'settlement status restored to processing after enqueue failure');
+  t.deepEqual(statusHistory, ['failed', 'processing'], 'status transitioned processing -> failed -> reverted to processing');
+  t.equal(loggedErrors.length, 1, 'logged the enqueue error');
+  t.match(loggedErrors[0].obj.err.message, /BullMQ connection failure/, 'error logged with cause');
+  t.equal(attemptsMap.get('stuck-enqueue-fail'), undefined, 'failed attempt was not committed to retry map');
   t.end();
 });
