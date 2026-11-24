@@ -132,7 +132,7 @@ import {
   GATEWAY_TIMEOUT_CONFIG,
   REQUEST_TIMEOUT_MS,
 } from "./timeout-config.js";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, Networks } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
@@ -348,7 +348,7 @@ export function isEtagMatch(
 export interface DeploymentsResponsePayload {
   data: {
     network: string;
-    contracts: { name: string; contractId: string; explorerUrl: string }[];
+    contracts: { name: string; contractId: string; explorerUrl: string | null }[];
     updatedAt: string;
   };
 }
@@ -364,15 +364,21 @@ export function buildDeploymentsResponse(input: {
   governanceContractId: string;
   updatedAt?: string;
 }): DeploymentsResponsePayload {
-  // #761 — explorer links must follow the configured network, not assume
-  // testnet, or a mainnet receipt points a member at the wrong ledger viewer
-  // during an incident.
-  const isMainnet = input.networkPassphrase
-    .toLowerCase()
-    .includes("public global");
-  const explorerContractBase = isMainnet
-    ? "https://stellar.expert/explorer/public/contract"
-    : "https://lab.stellar.org/r/testnet/contract";
+  // #761, #978 — explorer links must follow the configured network via exact
+  // passphrase matching, and omit or guard explorerUrl when contract IDs are empty
+  // or on custom networks.
+  let explorerContractBase: string | null = null;
+  if (input.networkPassphrase === Networks.PUBLIC) {
+    explorerContractBase = "https://stellar.expert/explorer/public/contract";
+  } else if (input.networkPassphrase === Networks.TESTNET) {
+    explorerContractBase = "https://lab.stellar.org/r/testnet/contract";
+  }
+
+  const getExplorerUrl = (contractId: string | null | undefined): string | null => {
+    const trimmed = contractId?.trim();
+    if (!trimmed || !explorerContractBase) return null;
+    return `${explorerContractBase}/${trimmed}`;
+  };
 
   return {
     data: {
@@ -381,12 +387,12 @@ export function buildDeploymentsResponse(input: {
         {
           name: "Settlement contract",
           contractId: input.settlementContractId,
-          explorerUrl: `${explorerContractBase}/${input.settlementContractId}`,
+          explorerUrl: getExplorerUrl(input.settlementContractId),
         },
         {
           name: "Governance contract",
           contractId: input.governanceContractId,
-          explorerUrl: `${explorerContractBase}/${input.governanceContractId}`,
+          explorerUrl: getExplorerUrl(input.governanceContractId),
         },
       ],
       updatedAt: input.updatedAt ?? new Date().toISOString(),
