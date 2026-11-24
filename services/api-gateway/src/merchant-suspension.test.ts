@@ -384,7 +384,9 @@ test('Unsuspend writes an audit log entry', async (t) => {
 });
 
 test('Existing data remains readable for suspended merchant (GET /api/merchants/:id → 200)', async (t) => {
-  const { app } = await createTestApp({}, { merchants: [MOCK_MERCHANT_SUSPENDED] });
+  const { app } = await createTestApp({}, {
+    merchants: [{ ...MOCK_MERCHANT_SUSPENDED, secretHash: 'sensitive-hash' }],
+  });
   const token = generateTestJwt(app);
   try {
     const res = await app.inject({
@@ -396,8 +398,33 @@ test('Existing data remains readable for suspended merchant (GET /api/merchants/
     const body = JSON.parse(res.body);
     t.equal(body.data.id, MOCK_MERCHANT_ACTIVE.id, 'returns the suspended merchant record');
     t.equal(body.data.status, 'suspended', 'status field reflects the suspended state');
+    t.equal('secretHash' in body.data, false, 'GET merchant omits secretHash');
   } catch (err: any) {
     t.fail(err);
+  } finally {
+    await app.close();
+    t.end();
+  }
+});
+
+test('DELETE /api/merchants/:id rejects non-owner merchants', async (t) => {
+  const { app } = await createTestApp({}, {
+    merchants: [
+      { ...MOCK_MERCHANT_ACTIVE, id: 'merchant-owner' },
+      { ...MOCK_MERCHANT_ACTIVE, id: 'merchant-other', ownerId: 'other-owner' },
+    ],
+  });
+  const token = generateTestJwt(app, {
+    merchantId: 'merchant-owner',
+    ownerId: 'owner',
+  });
+  try {
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/merchants/merchant-other',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    t.equal(res.statusCode, 403, 'non-owner delete returns 403');
   } finally {
     await app.close();
     t.end();

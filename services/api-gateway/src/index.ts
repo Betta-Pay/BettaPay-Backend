@@ -154,6 +154,8 @@ import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
 import { MerchantCache, getCachedMerchant } from "@bettapay/validation";
 
+const googleOAuthClient = new OAuth2Client();
+
 declare module "fastify" {
   export interface FastifyInstance {
     authenticate: (
@@ -1686,7 +1688,6 @@ export function buildApp(opts: AppOptions = {}) {
     return fastify.jwt.sign({ merchantId, ownerId, jti });
   }
 
-  const GOOGLE_AUTH_GRACE_PERIOD_MS = 30_000;
   const GOOGLE_AUTH_LOCKOUT_KEY_PREFIX = "auth_fail:google:";
   const SESSION_KEY_PREFIX = "session:";
   const SESSION_INDEX_PREFIX = "sessions:";
@@ -1869,16 +1870,20 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   }
 
   // ── Lockout backoff check (#902) ──────────────────────────────────────────
-  if (await walletChallenges.isLockedOut(d.address)) {
-    reply.header("Retry-After", "900");
-    return reply
-      .code(429)
-      .send(
-        createErrorResponse(
-          ErrorCodes.WALLET_AUTH_LOCKOUT,
-          "Too many failed wallet authentication attempts. Address is temporarily locked out.",
-        ),
-      );
+  try {
+    if (await walletChallenges.isLockedOut(d.address)) {
+      reply.header("Retry-After", "900");
+      return reply
+        .code(429)
+        .send(
+          createErrorResponse(
+            ErrorCodes.WALLET_AUTH_LOCKOUT,
+            "Too many failed wallet authentication attempts. Address is temporarily locked out.",
+          ),
+        );
+    }
+  } catch (err) {
+    request.log.error({ err, address: d.address }, "[Auth] Unable to check wallet lockout");
   }
 
   // Atomically claim the server-issued challenge for this address. This is the
@@ -1961,6 +1966,14 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
       OR: [{ id: d.address }, { ownerId: d.address }],
     },
   });
+
+  if (merchant?.status === "suspended") {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Merchant account is suspended"));
+  }
 
   const response: Record<string, unknown> = { success: true, address: d.address };
   if (merchant) {
@@ -2191,8 +2204,7 @@ fastify.get('/api/admin/auth/ip-score', {
       const d = GoogleAuthBody.parse(request.body);
 
       try {
-        const client = new OAuth2Client();
-        const ticket = await client.verifyIdToken({
+        const ticket = await googleOAuthClient.verifyIdToken({
           idToken: d.token,
           audience: process.env.GOOGLE_CLIENT_ID,
         });
@@ -2204,6 +2216,17 @@ fastify.get('/api/admin/auth/ip-score', {
               createErrorResponse(
                 ErrorCodes.UNAUTHORIZED,
                 "Google token verification failed: invalid token payload",
+              ),
+            );
+        }
+        if (payload.email_verified !== true) {
+          request.log.warn("[Auth] Google OAuth rejected: email is not verified");
+          return reply
+            .code(401)
+            .send(
+              createErrorResponse(
+                ErrorCodes.UNAUTHORIZED,
+                "Google email is not verified",
               ),
             );
         }
@@ -2286,8 +2309,8 @@ fastify.get('/api/admin/auth/ip-score', {
 
         const tokenExpired =
           typeof payload.exp === "number" && Date.now() / 1000 > payload.exp;
-        const tokenAgeMs = tokenExpired ? Date.now() - payload.exp * 1000 : 0;
-        if (tokenExpired && tokenAgeMs > GOOGLE_AUTH_GRACE_PERIOD_MS) {
+        if (tokenExpired) {
+          const tokenAgeMs = Date.now() - payload.exp! * 1000;
           await incrementGoogleAuthLockout(email);
           request.log.warn(
             { email, expiredMs: tokenAgeMs },
@@ -2301,13 +2324,6 @@ fastify.get('/api/admin/auth/ip-score', {
                 "Google token expired",
               ),
             );
-        }
-
-        if (tokenExpired) {
-          request.log.warn(
-            { email, expiredMs: tokenAgeMs },
-            "[Auth] Google OAuth accepted with expired token within grace period",
-          );
         }
 
         request.log.info({ email }, "[Auth] Google OAuth accepted");
@@ -2588,13 +2604,26 @@ fastify.get('/api/admin/auth/ip-score', {
     {
       preValidation: [fastify.authenticate],
     },
-    async (request, reply): Promise<ApiResponse<Merchant>> => {
+    async (
+      request,
+      reply,
+    ): Promise<ApiResponse<Omit<Merchant, "secretHash">>> => {
       const { id } = request.params;
       const isServiceAuth = Boolean(request.headers["x-service-token"]);
       const payload = request.user as MerchantJwtPayload;
 
       const merchant = await prisma.merchant.findFirst({
         where: { id, deletedAt: null },
+        select: {
+          id: true,
+          name: true,
+          ownerId: true,
+          createdAt: true,
+          deletedAt: true,
+          status: true,
+          settings: true,
+          kycStatus: true,
+        },
       });
       if (!merchant) {
         reply.code(404);
@@ -2629,6 +2658,17 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const { id } = request.params;
+      const payload = request.user as MerchantJwtPayload;
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const isAdmin =
+        isServiceAuth ||
+        payload.merchantId === env.ADMIN_ADDRESS ||
+        payload.merchantId === id;
+      if (!isAdmin) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
       const merchant = await prisma.merchant.findFirst({
         where: { id, deletedAt: null },
       });
@@ -2653,47 +2693,31 @@ fastify.get('/api/admin/auth/ip-score', {
           tx as unknown as Parameters<typeof logAuditEvent>[5],
         );
 
-        // Best-effort cascade: cancel initiated payments
-        try {
-          const cancelled = await tx.payment.updateMany({
-            where: { merchantId: id, status: "initiated" },
-            data: { status: "cancelled" },
-          });
-          await logAuditEvent(
-            "payments.bulk-cancelled",
-            "merchant",
-            id,
-            { before: null, after: { affectedCount: cancelled.count } },
-            request,
-            tx as unknown as Parameters<typeof logAuditEvent>[5],
-          );
-        } catch (err) {
-          request.log.error(
-            { err, merchantId: id },
-            "Failed to cancel initiated payments during merchant soft-delete",
-          );
-        }
+        const cancelled = await tx.payment.updateMany({
+          where: { merchantId: id, status: "initiated" },
+          data: { status: "cancelled" },
+        });
+        await logAuditEvent(
+          "payments.bulk-cancelled",
+          "merchant",
+          id,
+          { before: null, after: { affectedCount: cancelled.count } },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
 
-        // Best-effort cascade: fail pending settlements
-        try {
-          const failed = await tx.settlement.updateMany({
-            where: { merchantId: id, status: "pending" },
-            data: { status: "failed", completedAt: new Date() },
-          });
-          await logAuditEvent(
-            "settlements.bulk-failed",
-            "merchant",
-            id,
-            { before: null, after: { affectedCount: failed.count } },
-            request,
-            tx as unknown as Parameters<typeof logAuditEvent>[5],
-          );
-        } catch (err) {
-          request.log.error(
-            { err, merchantId: id },
-            "Failed to fail pending settlements during merchant soft-delete",
-          );
-        }
+        const failed = await tx.settlement.updateMany({
+          where: { merchantId: id, status: "pending" },
+          data: { status: "failed", completedAt: new Date() },
+        });
+        await logAuditEvent(
+          "settlements.bulk-failed",
+          "merchant",
+          id,
+          { before: null, after: { affectedCount: failed.count } },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
       });
 
       return reply.code(200).send({ success: true });

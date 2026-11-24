@@ -172,19 +172,40 @@ export function createMockPrisma(initialData: MockData = {}) {
       store.payments[index] = updated;
       return updated;
     },
+    updateMany: async ({ where, data }: { where: any; data: any }) => {
+      let count = 0;
+      for (let i = 0; i < store.payments.length; i++) {
+        const payment = store.payments[i];
+        if (where.merchantId && payment.merchantId !== where.merchantId) continue;
+        if (where.status && payment.status !== where.status) continue;
+        store.payments[i] = { ...payment, ...data };
+        count++;
+      }
+      return { count };
+    },
   };
 
   const mockMerchant = {
     findUnique: async ({ where }: { where: { id: string } }) => {
       return store.merchants.find((m) => m.id === where.id) || null;
     },
-    findFirst: async ({ where }: { where: any }) => {
-      return (
-        store.merchants.find((m) => {
+    findFirst: async ({ where, select }: { where: any; select?: any }) => {
+      const merchant = store.merchants.find((m) => {
           if (where.id && m.id !== where.id) return false;
+          if (where.ownerId && m.ownerId !== where.ownerId) return false;
+          if (where.OR && !where.OR.some((condition: any) =>
+            (condition.id && m.id === condition.id) ||
+            (condition.ownerId && m.ownerId === condition.ownerId)
+          )) return false;
           if (where.deletedAt === null && m.deletedAt !== null && m.deletedAt !== undefined) return false;
           return true;
-        }) || null
+        }) || null;
+      if (!merchant || !select) return merchant;
+      return Object.fromEntries(
+        Object.entries(select)
+          .filter(([, included]) => included)
+          .map(([field]) => [field, merchant[field]])
+          .filter(([, value]) => value !== undefined),
       );
     },
     findMany: async ({ where }: { where?: any } = {}) => {
@@ -277,6 +298,17 @@ export function createMockPrisma(initialData: MockData = {}) {
       };
       store.settlements[index] = updated;
       return updated;
+    },
+    updateMany: async ({ where, data }: { where: any; data: any }) => {
+      let count = 0;
+      for (let i = 0; i < store.settlements.length; i++) {
+        const settlement = store.settlements[i];
+        if (where.merchantId && settlement.merchantId !== where.merchantId) continue;
+        if (where.status && settlement.status !== where.status) continue;
+        store.settlements[i] = { ...settlement, ...data };
+        count++;
+      }
+      return { count };
     },
   };
 
