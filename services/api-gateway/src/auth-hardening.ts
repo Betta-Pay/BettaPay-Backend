@@ -12,6 +12,27 @@ const AUTH_IP_SCORE_THRESHOLD = 20;
 const AUTH_IP_SCORE_TTL_SECONDS = 15 * 60;
 const USED_NONCE_TTL_SECONDS = 5 * 60;
 
+/**
+ * Adjusts an IP's reputation score by ARGV[1] and clamps it at zero in one
+ * step, so concurrent successes and failures cannot lose updates or push the
+ * score negative (#984). KEYS[1] = score key, ARGV[2] = TTL in seconds, which
+ * is refreshed on every change. A score of zero deletes the key. Returns the
+ * new score.
+ */
+const ADJUST_IP_SCORE_SCRIPT = `
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local nextScore = current + tonumber(ARGV[1])
+if nextScore < 0 then
+  nextScore = 0
+end
+if nextScore == 0 then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('SET', KEYS[1], tostring(nextScore), 'EX', tonumber(ARGV[2]))
+end
+return nextScore
+`;
+
 function authIpScoreKey(ip: string): string {
   return `auth_ip_score:${ip}`;
 }
@@ -191,18 +212,14 @@ export function createAuthHardening(
   }
 
   async function updateAuthIpScore(ip: string, delta: number): Promise<number> {
-    const key = authIpScoreKey(ip);
-    if (delta > 0) {
-      const score = await redis.incrby(key, delta);
-      await redis.expire(key, AUTH_IP_SCORE_TTL_SECONDS);
-      return score;
-    }
-
-    const current = Number((await redis.get(key)) ?? "0");
-    const next = Math.max(0, current + delta);
-    if (next === 0) await redis.del(key);
-    else await redis.set(key, String(next), "EX", AUTH_IP_SCORE_TTL_SECONDS);
-    return next;
+    const score = await redis.eval(
+      ADJUST_IP_SCORE_SCRIPT,
+      1,
+      authIpScoreKey(ip),
+      String(delta),
+      String(AUTH_IP_SCORE_TTL_SECONDS),
+    );
+    return Number(score);
   }
 
   async function enforceAuthIpReputation(

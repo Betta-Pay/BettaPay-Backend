@@ -86,3 +86,32 @@ test('recordWalletAuthFailure uses the same atomic script (#982)', async (t) => 
   t.ok(redis.evalCalls.every((s) => s === RECORD_FAILURE_SCRIPT), 'only the atomic script ran');
   t.end();
 });
+
+test('concurrent IP score updates never go negative or lose updates (#984)', async (t) => {
+  const redis = createFakeRedis();
+  const helpers = createAuthHardening(redis as any, () => 'jwt');
+  const request = { ip: '203.0.113.9' } as any;
+
+  for (let i = 0; i < 5; i++) await helpers.recordAuthIpFailure(request);
+  t.equal(await helpers.getAuthIpScore('203.0.113.9'), 5, 'score starts at 5');
+
+  await Promise.all([
+    ...Array.from({ length: 5 }, () => helpers.recordAuthIpSuccess(request)),
+    ...Array.from({ length: 5 }, () => helpers.recordAuthIpFailure(request)),
+  ]);
+  t.equal(await helpers.getAuthIpScore('203.0.113.9'), 5, 'five up and five down leave the score at 5');
+  t.equal([...redis.data.values()][0].ttl, 15 * 60, 'the TTL is refreshed with the score');
+  t.end();
+});
+
+test('IP score is clamped at zero and the key is removed (#984)', async (t) => {
+  const redis = createFakeRedis();
+  const helpers = createAuthHardening(redis as any, () => 'jwt');
+  const request = { ip: '203.0.113.10' } as any;
+
+  await helpers.recordAuthIpFailure(request);
+  await Promise.all(Array.from({ length: 4 }, () => helpers.recordAuthIpSuccess(request)));
+  t.equal(await helpers.getAuthIpScore('203.0.113.10'), 0, 'the score never drops below zero');
+  t.equal(redis.data.size, 0, 'a zero score leaves no key behind');
+  t.end();
+});
