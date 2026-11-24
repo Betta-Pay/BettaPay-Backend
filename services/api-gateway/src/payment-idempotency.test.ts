@@ -2,8 +2,14 @@ import test from 'tape';
 import crypto from 'crypto';
 import { createTestApp, generateTestJwt } from './test-utils.js';
 import { MOCK_MERCHANT_ACTIVE } from './test-fixtures.js';
+import {
+  readIdempotencyKey,
+  IDEMPOTENCY_KEY_MAX_LEN,
+  IdempotencyKeyValidationError,
+} from './index.js';
 
 const MERCHANT_ID = MOCK_MERCHANT_ACTIVE.id;
+const CSRF = { 'x-csrf-check': '1' };
 
 test('1. First request without Idempotency-Key creates a payment (201)', async (t) => {
   const { app, mockPrisma } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
@@ -12,7 +18,7 @@ test('1. First request without Idempotency-Key creates a payment (201)', async (
   const res = await app.inject({
     method: 'POST',
     url: '/api/payments',
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, ...CSRF },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
 
@@ -40,6 +46,7 @@ test('2. First request with Idempotency-Key creates a payment (201)', async (t) 
     headers: {
       authorization: `Bearer ${token}`,
       'idempotency-key': key,
+      ...CSRF,
     },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
@@ -78,6 +85,7 @@ test('3. Duplicate request with same Idempotency-Key returns existing payment (2
     headers: {
       authorization: `Bearer ${token}`,
       'idempotency-key': key,
+      ...CSRF,
     },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
@@ -98,14 +106,14 @@ test('4. Requests without Idempotency-Key always create new payments', async (t)
   const r1 = await app.inject({
     method: 'POST',
     url: '/api/payments',
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, ...CSRF },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
 
   const r2 = await app.inject({
     method: 'POST',
     url: '/api/payments',
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, ...CSRF },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
 
@@ -141,6 +149,7 @@ test('5. TTL expiration — expired key is treated as absent, new payment is cre
     headers: {
       authorization: `Bearer ${token}`,
       'idempotency-key': key,
+      ...CSRF,
     },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
@@ -165,13 +174,83 @@ test('6. Idempotency-Key exceeding 255 characters is rejected (400)', async (t) 
     headers: {
       authorization: `Bearer ${token}`,
       'idempotency-key': longKey,
+      ...CSRF,
     },
     payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
   });
 
   t.equal(res.statusCode, 400, 'returns 400 for oversized key');
+  t.equal(JSON.parse(res.body).error.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
   t.ok(JSON.parse(res.body).error.message.includes('255'), 'error message mentions 255 character limit');
 
   await app.close();
+  t.end();
+});
+
+test('7. Duplicate Idempotency-Key headers (array) are rejected with HTTP 400 (#977)', async (t) => {
+  const { app } = await createTestApp({}, { merchants: [{ ...MOCK_MERCHANT_ACTIVE }] });
+  const token = generateTestJwt(app);
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/payments',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'idempotency-key': ['key-one', 'key-two'] as any,
+      ...CSRF,
+    },
+    payload: { merchantId: MERCHANT_ID, amount: '10.00', asset: 'USDC' },
+  });
+
+  t.equal(res.statusCode, 400, 'returns HTTP 400 for duplicate/array header');
+  const body = JSON.parse(res.body);
+  t.equal(body.error.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR');
+  t.match(body.error.message, /single string/i, 'error message explains single string required');
+
+  await app.close();
+  t.end();
+});
+
+test('8. readIdempotencyKey unit tests (#977)', (t) => {
+  // Empty / absent cases
+  t.equal(readIdempotencyKey({ headers: {} } as any), null, 'absent header returns null');
+  t.equal(readIdempotencyKey({ headers: { 'idempotency-key': '' } } as any), null, 'empty header returns null');
+  t.equal(readIdempotencyKey({ headers: { 'idempotency-key': '   ' } } as any), null, 'whitespace-only header returns null');
+
+  // Valid key
+  t.equal(
+    readIdempotencyKey({ headers: { 'idempotency-key': 'valid-key-123' } } as any),
+    'valid-key-123',
+    'returns trimmed string for valid key',
+  );
+  t.equal(
+    readIdempotencyKey({ headers: { 'idempotency-key': '  trimmed-key  ' } } as any),
+    'trimmed-key',
+    'trims whitespace from valid key',
+  );
+
+  // Exact max length bound
+  const exactKey = 'k'.repeat(IDEMPOTENCY_KEY_MAX_LEN);
+  t.equal(
+    readIdempotencyKey({ headers: { 'idempotency-key': exactKey } } as any),
+    exactKey,
+    'accepts key exactly at IDEMPOTENCY_KEY_MAX_LEN limit',
+  );
+
+  // Array-valued header rejected
+  t.throws(
+    () => readIdempotencyKey({ headers: { 'idempotency-key': ['k1', 'k2'] } } as any),
+    (err: any) => err instanceof IdempotencyKeyValidationError && err.statusCode === 400 && err.code === 'VALIDATION_ERROR',
+    'throws IdempotencyKeyValidationError for array header',
+  );
+
+  // Oversized key rejected
+  const oversizedKey = 'k'.repeat(IDEMPOTENCY_KEY_MAX_LEN + 1);
+  t.throws(
+    () => readIdempotencyKey({ headers: { 'idempotency-key': oversizedKey } } as any),
+    (err: any) => err instanceof IdempotencyKeyValidationError && err.statusCode === 400 && err.message.includes('255'),
+    'throws IdempotencyKeyValidationError for oversized key',
+  );
+
   t.end();
 });
