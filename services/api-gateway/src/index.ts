@@ -134,7 +134,7 @@ import {
   GATEWAY_TIMEOUT_CONFIG,
   REQUEST_TIMEOUT_MS,
 } from "./timeout-config.js";
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { Keypair, Networks } from "@stellar/stellar-sdk";
 import { OAuth2Client } from "google-auth-library";
 import { registerGatewayHealthRoutes } from "./health.js";
 import {
