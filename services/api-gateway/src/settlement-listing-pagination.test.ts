@@ -185,3 +185,80 @@ test('Settlement listing scope: unauthenticated requests are rejected with 401',
   await app.close();
   t.end();
 });
+
+test('Settlement listing parses includeDeleted strictly and restricts deleted records', async (t) => {
+  const settlements = makeSettlements('deleted-merchant', 1);
+  const app = buildApp({
+    prisma: createMockPrisma({
+      settlements,
+      merchants: [{ id: 'deleted-merchant', deletedAt: new Date() }],
+    }) as any,
+    logger: false,
+  });
+  await app.ready();
+  const token = generateTestJwt(app, {
+    merchantId: 'deleted-merchant',
+    ownerId: 'owner-1',
+  });
+
+  const falseValue = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?includeDeleted=false',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(falseValue.statusCode, 200, 'includeDeleted=false is accepted');
+  t.equal(JSON.parse(falseValue.body).data.length, 0, 'false excludes deleted merchants');
+
+  const forbidden = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?includeDeleted=true',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(forbidden.statusCode, 403, 'non-admin JWT cannot include deleted settlements');
+
+  const serviceAdmin = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?includeDeleted=true',
+    headers: { 'x-service-token': SERVICE_TOKEN },
+  });
+  t.equal(serviceAdmin.statusCode, 200, 'service-auth admin can include deleted settlements');
+  t.equal(JSON.parse(serviceAdmin.body).data.length, 1, 'admin receives deleted settlement');
+
+  const adminJwt = generateTestJwt(app, {
+    merchantId: process.env.ADMIN_ADDRESS || 'GA_TEST',
+    ownerId: 'admin',
+  });
+  const adminJwtResponse = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?includeDeleted=true',
+    headers: { authorization: `Bearer ${adminJwt}` },
+  });
+  t.equal(adminJwtResponse.statusCode, 200, 'admin JWT can include deleted settlements');
+  t.equal(JSON.parse(adminJwtResponse.body).data.length, 1, 'admin JWT is not merchant-scoped');
+
+  const invalid = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?includeDeleted=yes',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(invalid.statusCode, 400, 'non-boolean includeDeleted is rejected');
+  await app.close();
+  t.end();
+});
+
+test('Settlement listing rejects page offsets above the maximum', async (t) => {
+  const app = buildApp({ prisma: createMockPrisma() as any, logger: false });
+  await app.ready();
+  const token = generateTestJwt(app, {
+    merchantId: 'merchant-1',
+    ownerId: 'owner-1',
+  });
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/settlements?page=1002&limit=100',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  t.equal(res.statusCode, 400, 'excessive page offset returns 400');
+  await app.close();
+  t.end();
+});

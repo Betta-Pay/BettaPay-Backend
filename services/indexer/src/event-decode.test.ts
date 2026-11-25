@@ -18,7 +18,17 @@ process.env.FIELD_ENCRYPTION_KEY = 'b'.repeat(32);
 import test from 'tape';
 import { Keypair, nativeToScVal, xdr } from '@stellar/stellar-sdk';
 
-const { fastify, decodeScVal, validatePayload, EVENT_SCHEMA_MAP } = await import('./index.js');
+const {
+  fastify,
+  decodeScVal,
+  decodeTopicScVal,
+  decodeEventTopics,
+  validatePayload,
+  EVENT_SCHEMA_MAP,
+  raceWithTimeout,
+  preparePolledEvent,
+  indexerValidationErrorsTotal,
+} = await import('./index.js');
 
 const MERCHANT = Keypair.random().publicKey();
 
@@ -234,6 +244,186 @@ test('a batch of only malformed events yields zero processed and does not throw'
 
   t.equal(processed.length, 0, 'nothing processed');
   t.equal(warnings.length, 2, 'both failures logged');
+  t.end();
+});
+
+test('decodeEventTopics decodes ScVal topics via scValToNative instead of [object Object] (#1058)', async (t) => {
+  const topics = [
+    nativeToScVal('PaymentInitiated', { type: 'symbol' }),
+    nativeToScVal('USDC'),
+    nativeToScVal(42n),
+  ];
+
+  const { result, warnings } = await captureWarnings(() => decodeEventTopics(topics));
+
+  t.deepEqual(
+    result,
+    ['PaymentInitiated', 'USDC', '42'],
+    'ScVal symbol, string, and bigint topics decode cleanly',
+  );
+  t.notEqual(result[0], '[object Object]', 'ScVal topic is not stringified to [object Object]');
+  t.equal(warnings.length, 0, 'no warnings for valid ScVal topics');
+
+  // Single non-array topic and plain string pass-through
+  t.deepEqual(
+    decodeEventTopics(nativeToScVal('BillPaid', { type: 'symbol' })),
+    ['BillPaid'],
+    'single ScVal topic is wrapped in an array and decoded',
+  );
+  t.equal(decodeTopicScVal('PaymentCompleted'), 'PaymentCompleted', 'plain string passes through');
+  t.end();
+});
+
+test('decodeTopicScVal falls back cleanly and logs a warning on malformed ScVal (#1058)', async (t) => {
+  const withToXdr = {
+    toXDR: () => 'AAAAAQ==',
+  };
+  const { result: xdrFallback, warnings: xdrWarnings } = await captureWarnings(() =>
+    decodeTopicScVal(withToXdr),
+  );
+  t.equal(xdrFallback, 'AAAAAQ==', 'falls back to base64 XDR when toXDR is available');
+  t.equal(xdrWarnings.length, 1, 'logs a warning when scValToNative fails');
+
+  const { result: stringFallback, warnings: strWarnings } = await captureWarnings(() =>
+    decodeTopicScVal(malformedScVal()),
+  );
+  t.equal(typeof stringFallback, 'string', 'falls back to string without throwing');
+  t.equal(strWarnings.length, 1, 'logs a warning on unparseable topic');
+  t.end();
+});
+
+test('raceWithTimeout clears its timeout handle in finally on resolution and rejection (#1058)', async (t) => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const createdByDelay = new Map<number, unknown[]>();
+  const clearedHandles = new Set<unknown>();
+
+  (globalThis as any).setTimeout = (...args: Parameters<typeof setTimeout>) => {
+    const handle = originalSetTimeout(...args);
+    const delay = typeof args[1] === 'number' ? args[1] : -1;
+    const list = createdByDelay.get(delay) ?? [];
+    list.push(handle);
+    createdByDelay.set(delay, list);
+    return handle;
+  };
+  (globalThis as any).clearTimeout = (handle: ReturnType<typeof setTimeout>) => {
+    clearedHandles.add(handle);
+    return originalClearTimeout(handle);
+  };
+
+  try {
+    const resolved = await raceWithTimeout(Promise.resolve('ok'), 54_321, 'PER_LEDGER_TIMEOUT');
+    const resolvedHandle = createdByDelay.get(54_321)?.[0];
+    t.equal(resolved, 'ok', 'returns resolved value when promise wins the race');
+    t.ok(resolvedHandle !== undefined, 'created timeout handle for resolved race');
+    t.ok(clearedHandles.has(resolvedHandle), 'cleared the exact timer handle in finally on resolution');
+
+    let caughtError: Error | null = null;
+    try {
+      await raceWithTimeout(Promise.reject(new Error('rpc boom')), 54_322, 'PER_LEDGER_TIMEOUT');
+    } catch (err) {
+      caughtError = err as Error;
+    }
+    const rejectedHandle = createdByDelay.get(54_322)?.[0];
+    t.equal(caughtError?.message, 'rpc boom', 'propagates rejection from underlying promise');
+    t.ok(rejectedHandle !== undefined, 'created timeout handle for rejected race');
+    t.ok(clearedHandles.has(rejectedHandle), 'clears timeout handle in finally even when underlying promise rejects');
+
+    let timeoutError: Error | null = null;
+    try {
+      await raceWithTimeout(new Promise<never>(() => {}), 15, 'PER_LEDGER_TIMEOUT');
+    } catch (err) {
+      timeoutError = err as Error;
+    }
+    const timedOutHandle = createdByDelay.get(15)?.[0];
+    t.equal(timeoutError?.message, 'PER_LEDGER_TIMEOUT', 'rejects with timeout message when timer fires');
+    t.ok(timedOutHandle !== undefined, 'created timeout handle for timed-out race');
+    t.ok(clearedHandles.has(timedOutHandle), 'clears timeout handle in finally on timeout too');
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+
+  t.end();
+});
+
+test('preparePolledEvent logs warning, increments metric, and retains validationError row (#1058)', async (t) => {
+  const contractId = process.env.SETTLEMENT_CONTRACT_ID!;
+  const getMetricValue = async (type: string): Promise<number> => {
+    const metric = await indexerValidationErrorsTotal.get();
+    const match = metric.values.find(
+      (v) => v.labels.contractId === contractId && v.labels.type === type,
+    );
+    return match?.value ?? 0;
+  };
+
+  const beforeCount = await getMetricValue('PaymentInitiated');
+  const invalidPayload = { ...validPaymentInitiated, occurredAt: 'not-a-timestamp' };
+
+  const { result: row, warnings } = await captureWarnings(() =>
+    preparePolledEvent({
+      id: 'stellar_evt_invalid_1',
+      topic: [nativeToScVal('PaymentInitiated', { type: 'symbol' })],
+      value: scVal(invalidPayload),
+      contractId: { toString: () => contractId },
+      ledger: 999_001,
+    }),
+  );
+
+  const afterCount = await getMetricValue('PaymentInitiated');
+
+  t.ok(row !== null, 'invalid event is retained with validationError rather than silently dropped');
+  t.deepEqual(row?.topics, ['PaymentInitiated'], 'ScVal topic is decoded properly');
+  t.equal(row?.type, 'PaymentInitiated', 'event type uses decoded ScVal topic');
+  t.ok(
+    typeof row?.validationError === 'string' && row.validationError.includes('occurredAt'),
+    'returned row carries validationError for dead-letter persistence',
+  );
+  t.equal(
+    afterCount,
+    beforeCount + 1,
+    'indexer_validation_errors_total counter is incremented for contractId and type',
+  );
+  t.ok(
+    warnings.some(
+      (w) =>
+        w.ctx?.stellarId === 'stellar_evt_invalid_1' &&
+        w.ctx?.ledger === 999_001 &&
+        typeof w.ctx?.validationError === 'string',
+    ),
+    'structured warning is logged with event context and validationError',
+  );
+
+  // Valid event with ScVal topic does not increment the validation-error metric.
+  const validBefore = await getMetricValue('PaymentInitiated');
+  const { result: validRow } = await captureWarnings(() =>
+    preparePolledEvent({
+      id: 'stellar_evt_valid_1',
+      topic: [nativeToScVal('PaymentInitiated', { type: 'symbol' })],
+      value: scVal(validPaymentInitiated),
+      contractId: { toString: () => contractId },
+      ledger: 999_002,
+    }),
+  );
+  const validAfter = await getMetricValue('PaymentInitiated');
+
+  t.ok(validRow !== null, 'valid event is prepared');
+  t.equal(validRow?.validationError, undefined, 'valid event has no validationError');
+  t.deepEqual(validRow?.topics, ['PaymentInitiated'], 'valid event topic is decoded');
+  t.equal(validAfter, validBefore, 'valid event does not increment validation error metric');
+
+  // Undecodable XDR value still returns null so the poll loop skips it safely.
+  const { result: undecodable } = await captureWarnings(() =>
+    preparePolledEvent({
+      id: 'stellar_evt_bad_xdr',
+      topic: [nativeToScVal('PaymentInitiated', { type: 'symbol' })],
+      value: malformedScVal(),
+      contractId: { toString: () => contractId },
+      ledger: 999_003,
+    }),
+  );
+  t.equal(undecodable, null, 'undecodable XDR payload returns null');
+
   t.end();
 });
 

@@ -1,7 +1,7 @@
 import test from 'tape';
 import type { IndexerClient, IndexerEvent } from './clients/indexer-client.js';
 import { validateEnv } from '@bettapay/validation';
-import { buildApp } from './index.js';
+import { buildApp, PAYMENT_LIST_QUERY_SCHEMA } from './index.js';
 import { createMockPrisma, createTestApp, generateTestJwt } from './test-utils.js';
 
 const env = validateEnv(process.env);
@@ -360,6 +360,55 @@ test('Payment listing: limit defaults to 50, accepts 100 and rejects 101', async
     headers: auth,
   });
   t.equal(nonNumeric.statusCode, 400, 'non-numeric limit is rejected');
+
+  await app.close();
+  t.end();
+});
+
+test('Payment listing: rejects unknown query parameters with 400 (#976)', async (t) => {
+  t.equal(
+    PAYMENT_LIST_QUERY_SCHEMA.additionalProperties,
+    false,
+    'PAYMENT_LIST_QUERY_SCHEMA sets additionalProperties: false',
+  );
+
+  const { app } = await createTestApp(
+    {},
+    { merchants: [LIST_ACTIVE_MERCHANT], payments: makePayments('merchant-active', 2) },
+  );
+
+  const token = generateTestJwt(app, { merchantId: 'merchant-active', ownerId: 'owner-a' });
+  const auth = { authorization: `Bearer ${token}` };
+
+  // Unknown query parameter rejected
+  const resUnknown = await app.inject({
+    method: 'GET',
+    url: '/api/payments?unknownParam=123',
+    headers: auth,
+  });
+  t.equal(resUnknown.statusCode, 400, 'returns HTTP 400 for unknown parameter');
+  const bodyUnknown = JSON.parse(resUnknown.body);
+  t.equal(bodyUnknown.error.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
+
+  // Another arbitrary query parameter rejected
+  const resFoo = await app.inject({
+    method: 'GET',
+    url: '/api/payments?foo=bar',
+    headers: auth,
+  });
+  t.equal(resFoo.statusCode, 400, 'returns HTTP 400 for foo parameter');
+  const bodyFoo = JSON.parse(resFoo.body);
+  t.equal(bodyFoo.error.code, 'VALIDATION_ERROR', 'returns VALIDATION_ERROR code');
+
+  // Valid query parameters continue to pass
+  const resValid = await app.inject({
+    method: 'GET',
+    url: '/api/payments?limit=10&page=1&status=completed&includeEvents=false',
+    headers: auth,
+  });
+  t.equal(resValid.statusCode, 200, 'valid query parameters return HTTP 200');
+  const bodyValid = JSON.parse(resValid.body);
+  t.ok(Array.isArray(bodyValid.data), 'returns payments list data');
 
   await app.close();
   t.end();

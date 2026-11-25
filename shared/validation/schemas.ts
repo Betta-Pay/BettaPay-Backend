@@ -22,8 +22,15 @@ export const PositiveAmountString = AmountString.refine(
   { message: "Amount must be greater than zero" },
 );
 
-/** Settlement amounts must not exceed 10^15 (1,000,000,000,000,000). */
-export const SettlementAmountString = AmountString.refine(
+/**
+ * Settlement amounts must not exceed 10^15 (1,000,000,000,000,000), must not
+ * carry unnecessary leading zeros (`007.50`), and are limited to Stellar's
+ * 7-decimal precision (#1082).
+ */
+export const SettlementAmountString = AmountString.regex(
+  /^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/,
+  "Settlement amount must not have leading zeros and allows at most 7 decimal places",
+).refine(
   (val) => {
     const max = "1000000000000000";
     const [intPart, decPart] = val.split(".");
@@ -67,8 +74,9 @@ export const userSchema = z.object({
   metadata: z.record(z.any()).optional(),
 });
 
+// Matches the `/api/auth/google` handler, which reads `body.token` (#1082).
 export const GoogleAuthBody = z.object({
-  idToken: z.string().min(1),
+  token: z.string().min(1, "token is required"),
 });
 export type GoogleAuthBody = z.infer<typeof GoogleAuthBody>;
 
@@ -167,7 +175,7 @@ export const settlementSchema = z.object({
   batchId: z.string().optional(),
   initiatedAt: isoDateString,
   completedAt: isoDateString.optional(),
-  status: z.enum(["pending", "processing", "completed", "failed"]),
+  status: z.enum(["pending", "processing", "completed", "failed", "superseded"]),
   feeSnapshot: feeSnapshotSchema.optional(),
 });
 
@@ -677,6 +685,8 @@ export const StrictBooleanQuery = z.union([
   z.enum(["true", "false"]).transform((value) => value === "true"),
 ]);
 
+export const SETTLEMENT_MAX_PAGE_OFFSET = 100_000;
+
 export const EventListQuery = PaginationQuery.extend({
   type: z.string().optional(),
   topic: z.string().optional(),
@@ -700,16 +710,20 @@ export const SettlementListQuery = PaginationQuery.extend({
   to: isoDateString.optional(),
   startDate: isoDateString.optional(),
   endDate: isoDateString.optional(),
-  includeDeleted: z.coerce.boolean().default(false),
+  includeDeleted: StrictBooleanQuery.default(false),
 }).refine(
   (data) => {
     const start = data.startDate ?? data.from;
     const end = data.endDate ?? data.to;
     if (end && !start) return false;
-    if (start && end && start > end) return false;
+    if (start && end && Date.parse(start) > Date.parse(end)) return false;
+    if ((data.page - 1) * data.limit > SETTLEMENT_MAX_PAGE_OFFSET) return false;
     return true;
   },
-  { message: "endDate requires startDate; startDate must be before endDate" },
+  {
+    message:
+      "endDate requires startDate; startDate must not be after endDate; page offset exceeds the maximum",
+  },
 );
 export type SettlementListQuery = z.infer<typeof SettlementListQuery>;
 

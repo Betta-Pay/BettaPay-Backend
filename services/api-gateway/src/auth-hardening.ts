@@ -3,6 +3,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Redis } from "ioredis";
 import { createErrorResponse, ErrorCodes } from "@bettapay/validation";
+import { RECORD_FAILURE_SCRIPT } from "./wallet-challenge-store.js";
 
 export const REFRESH_RATE_LIMIT_MAX = 10;
 export const REFRESH_RATE_LIMIT_SECONDS = 60;
@@ -10,6 +11,27 @@ export const REFRESH_RATE_LIMIT_SECONDS = 60;
 const AUTH_IP_SCORE_THRESHOLD = 20;
 const AUTH_IP_SCORE_TTL_SECONDS = 15 * 60;
 const USED_NONCE_TTL_SECONDS = 5 * 60;
+
+/**
+ * Adjusts an IP's reputation score by ARGV[1] and clamps it at zero in one
+ * step, so concurrent successes and failures cannot lose updates or push the
+ * score negative (#984). KEYS[1] = score key, ARGV[2] = TTL in seconds, which
+ * is refreshed on every change. A score of zero deletes the key. Returns the
+ * new score.
+ */
+const ADJUST_IP_SCORE_SCRIPT = `
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local nextScore = current + tonumber(ARGV[1])
+if nextScore < 0 then
+  nextScore = 0
+end
+if nextScore == 0 then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('SET', KEYS[1], tostring(nextScore), 'EX', tonumber(ARGV[2]))
+end
+return nextScore
+`;
 
 function authIpScoreKey(ip: string): string {
   return `auth_ip_score:${ip}`;
@@ -41,18 +63,18 @@ export interface CookieFlagOptions {
 }
 
 /**
- * Detects whether an incoming request was served over HTTPS, checking
- * the request protocol and trusted `x-forwarded-proto` header (#901).
+ * Detects whether an incoming request was served over HTTPS (#901).
+ *
+ * Only `request.protocol` is trusted. Fastify derives it from
+ * `X-Forwarded-Proto` solely for connections from a proxy it was configured to
+ * trust (`trustProxy`), so a client cannot claim HTTPS by sending the header
+ * itself (#985).
  */
 export function isRequestHttps(request: {
   protocol?: string;
   headers?: Record<string, string | string[] | undefined>;
 }): boolean {
-  const forwardedProto = Array.isArray(request.headers?.["x-forwarded-proto"])
-    ? request.headers!["x-forwarded-proto"][0]
-    : request.headers?.["x-forwarded-proto"];
-  const proto = forwardedProto || request.protocol || "http";
-  return proto.toLowerCase() === "https";
+  return (request.protocol ?? "http").toLowerCase() === "https";
 }
 
 /**
@@ -90,6 +112,9 @@ export function buildCsrfCookieHeader(
   },
   options?: CookieFlagOptions,
 ): string {
+  if (/[;\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("Invalid CSRF cookie value: ';' and control characters are not allowed");
+  }
   const opts = getAuthCookieOptions(request, options);
   const parts = [`${name}=${value}`, `Path=${opts.path}`, `SameSite=${opts.sameSite}`];
   if (opts.httpOnly) {
@@ -123,7 +148,7 @@ export interface MerchantAuthHelpers {
   enforceAuthIpReputation: (
     request: FastifyRequest,
     reply: FastifyReply,
-  ) => Promise<void>;
+  ) => Promise<FastifyReply | void>;
   recordAuthIpFailure: (request: FastifyRequest) => Promise<void>;
   recordAuthIpSuccess: (request: FastifyRequest) => Promise<void>;
   isJtiRevoked: (jti: string) => Promise<boolean>;
@@ -190,26 +215,24 @@ export function createAuthHardening(
   }
 
   async function updateAuthIpScore(ip: string, delta: number): Promise<number> {
-    const key = authIpScoreKey(ip);
-    if (delta > 0) {
-      const score = await redis.incrby(key, delta);
-      await redis.expire(key, AUTH_IP_SCORE_TTL_SECONDS);
-      return score;
-    }
-
-    const current = Number((await redis.get(key)) ?? "0");
-    const next = Math.max(0, current + delta);
-    if (next === 0) await redis.del(key);
-    else await redis.set(key, String(next), "EX", AUTH_IP_SCORE_TTL_SECONDS);
-    return next;
+    const score = await redis.eval(
+      ADJUST_IP_SCORE_SCRIPT,
+      1,
+      authIpScoreKey(ip),
+      String(delta),
+      String(AUTH_IP_SCORE_TTL_SECONDS),
+    );
+    return Number(score);
   }
 
   async function enforceAuthIpReputation(
     request: FastifyRequest,
     reply: FastifyReply,
-  ): Promise<void> {
+  ): Promise<FastifyReply | void> {
     if ((await getAuthIpScore(request.ip)) >= AUTH_IP_SCORE_THRESHOLD) {
-      reply
+      // Returning the reply tells Fastify the response is handled, so the
+      // route handler does not run after the 429 has been written (#983).
+      return reply
         .header("Retry-After", "300")
         .code(429)
         .send(
@@ -300,11 +323,13 @@ export function createAuthHardening(
     ttlSeconds: number = DEFAULT_WALLET_AUTH_LOCKOUT_TTL_SEC,
   ): Promise<number> {
     const key = walletAuthFailKey(address);
-    const count = await redis.incr(key);
-    if (count === 1) {
-      await redis.expire(key, ttlSeconds);
-    }
-    return count;
+    const count = await redis.eval(
+      RECORD_FAILURE_SCRIPT,
+      1,
+      key,
+      String(ttlSeconds),
+    );
+    return Number(count);
   }
 
   async function resetWalletAuthFailures(address: string): Promise<void> {

@@ -33,6 +33,9 @@ function buildGoogleAuthApp(opts: { allowedDomains?: string[] } = {}) {
       if (!payload) {
         return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google token verification failed: invalid token payload'));
       }
+      if (payload.email_verified !== true) {
+        return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Google email is not verified'));
+      }
       const rawEmail = payload.email;
       if (!rawEmail) {
         return reply.code(400).send(createErrorResponse(ErrorCodes.INVALID_REQUEST, 'Email missing in Google token payload'));
@@ -70,7 +73,7 @@ function buildGoogleAuthApp(opts: { allowedDomains?: string[] } = {}) {
 test('Google OAuth: domain not in allowlist returns 403', async (t) => {
   const { app } = buildGoogleAuthApp({ allowedDomains: ['example.com', 'corp.com'] });
   const verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@evil.com' }),
+    getPayload: () => ({ email: 'user@evil.com', email_verified: true }),
   } as any);
 
   try {
@@ -96,7 +99,7 @@ test('Google OAuth: domain not in allowlist returns 403', async (t) => {
 test('Google OAuth: domain in allowlist succeeds', async (t) => {
   const { app, db } = buildGoogleAuthApp({ allowedDomains: ['example.com'] });
   const verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@example.com' }),
+    getPayload: () => ({ email: 'user@example.com', email_verified: true }),
   } as any);
 
   try {
@@ -125,7 +128,7 @@ test('Google OAuth: adversarial email bypass attempts are rejected or normalized
 
   // Test 1: Subdomain spoofing attempt user@example.com.evil.com
   let verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@example.com.evil.com' }),
+    getPayload: () => ({ email: 'user@example.com.evil.com', email_verified: true }),
   } as any);
 
   let res = await app.inject({
@@ -138,7 +141,7 @@ test('Google OAuth: adversarial email bypass attempts are rejected or normalized
 
   // Test 2: Double @ symbol malformed email
   verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@evil.com@example.com' }),
+    getPayload: () => ({ email: 'user@evil.com@example.com', email_verified: true }),
   } as any);
 
   res = await app.inject({
@@ -151,7 +154,7 @@ test('Google OAuth: adversarial email bypass attempts are rejected or normalized
 
   // Test 3: Fullwidth unicode dot normalized to standard dot and succeeds
   verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@example\uFF0Ecom' }),
+    getPayload: () => ({ email: 'user@example\uFF0Ecom', email_verified: true }),
   } as any);
 
   res = await app.inject({
@@ -169,7 +172,7 @@ test('Google OAuth: adversarial email bypass attempts are rejected or normalized
 test('Google OAuth: no domain restriction allows all emails', async (t) => {
   const { app, db } = buildGoogleAuthApp({});
   const verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({ email: 'user@any-domain.com' }),
+    getPayload: () => ({ email: 'user@any-domain.com', email_verified: true }),
   } as any);
 
   try {
@@ -195,7 +198,7 @@ test('Google OAuth: no domain restriction allows all emails', async (t) => {
 test('Google OAuth: missing email in payload returns 400', async (t) => {
   const { app } = buildGoogleAuthApp({ allowedDomains: ['example.com'] });
   const verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
-    getPayload: () => ({}),
+    getPayload: () => ({ email_verified: true }),
   } as any);
 
   try {
@@ -210,6 +213,26 @@ test('Google OAuth: missing email in payload returns 400', async (t) => {
     t.equal(body.error.code, 'INVALID_REQUEST', 'returns INVALID_REQUEST');
   } catch (err: any) {
     t.fail(err);
+  } finally {
+    verifyStub.restore();
+    await app.close();
+    t.end();
+  }
+});
+
+test('Google OAuth: unverified email returns 401', async (t) => {
+  const { app } = buildGoogleAuthApp({ allowedDomains: ['example.com'] });
+  const verifyStub = sinon.stub(OAuth2Client.prototype, 'verifyIdToken').resolves({
+    getPayload: () => ({ email: 'user@example.com', email_verified: false }),
+  } as any);
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/google',
+      payload: { token: 'unverified-email-token' },
+    });
+    t.equal(res.statusCode, 401, 'returns 401 for unverified email');
   } finally {
     verifyStub.restore();
     await app.close();

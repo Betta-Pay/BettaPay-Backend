@@ -242,3 +242,70 @@ test('x-service-token is sent on capability probes that require it', async (t) =
 
   t.end();
 });
+
+test('warmupDownstreamServices probes all configured downstream services including settlement-engine', async (t) => {
+  const { getDownstreamServices, warmupDownstreamServices } = await import('./index.js');
+
+  const mockEnv: any = {
+    FX_ENGINE_URL: 'http://fx-engine:3002',
+    INDEXER_URL: 'http://indexer:3003',
+    SETTLEMENT_ENGINE_URL: 'http://settlement-engine:3001',
+  };
+
+  const configured = getDownstreamServices(mockEnv);
+  t.equal(configured.length, 3, 'three downstream services configured for warmup');
+  t.ok(
+    configured.some((s) => s.name === 'settlement-engine' && s.healthUrl === 'http://settlement-engine:3001/api/health'),
+    'settlement-engine is included in getDownstreamServices',
+  );
+  t.ok(
+    configured.some((s) => s.name === 'fx-engine' && s.healthUrl === 'http://fx-engine:3002/api/health'),
+    'fx-engine is included in getDownstreamServices',
+  );
+  t.ok(
+    configured.some((s) => s.name === 'indexer' && s.healthUrl === 'http://indexer:3003/api/health'),
+    'indexer is included in getDownstreamServices',
+  );
+
+  const capturedUrls: string[] = [];
+  const capturedTraceIds: string[] = [];
+  const infoLogs: any[] = [];
+  const warnLogs: any[] = [];
+
+  const mockLogger: any = {
+    info: (obj: any, msg: string) => infoLogs.push({ obj, msg }),
+    warn: (obj: any, msg: string) => warnLogs.push({ obj, msg }),
+  };
+
+  // One service fails, others succeed — verify failures remain non-fatal and logged
+  const mockFetch: any = async (url: string, init?: RequestInit) => {
+    capturedUrls.push(url);
+    const traceId = (init?.headers as any)?.['x-trace-id'];
+    if (traceId) capturedTraceIds.push(traceId);
+
+    if (url.includes('settlement-engine')) {
+      throw new Error('Connection refused to settlement engine');
+    }
+    return new Response('ok', { status: 200 });
+  };
+
+  // Must not throw even when settlement-engine throws
+  await warmupDownstreamServices(mockEnv, mockLogger, mockFetch);
+
+  t.equal(capturedUrls.length, 3, 'all 3 services were probed');
+  t.ok(capturedUrls.includes('http://settlement-engine:3001/api/health'), 'settlement-engine health URL was probed');
+  t.ok(capturedUrls.includes('http://fx-engine:3002/api/health'), 'fx-engine health URL was probed');
+  t.ok(capturedUrls.includes('http://indexer:3003/api/health'), 'indexer health URL was probed');
+
+  t.equal(capturedTraceIds.length, 3, 'each probe carried an x-trace-id header');
+  for (const tid of capturedTraceIds) {
+    t.ok(/^[0-9a-f-]{36}$/.test(tid), 'trace-id is a valid UUID format');
+  }
+
+  t.equal(infoLogs.length, 2, 'two successful services logged info');
+  t.equal(warnLogs.length, 1, 'failing settlement-engine warmup logged warn');
+  t.equal(warnLogs[0].obj.targetService, 'settlement-engine', 'warn log identifies settlement-engine failure');
+  t.match(warnLogs[0].msg, /Warmup failed/, 'warn log indicates warmup failure was non-fatal');
+
+  t.end();
+});

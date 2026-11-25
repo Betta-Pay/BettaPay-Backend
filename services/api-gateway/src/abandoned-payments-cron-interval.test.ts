@@ -26,8 +26,9 @@ function stubTimers(): TimerSpy {
   const cleared: unknown[] = [];
 
   (global as any).setInterval = (fn: () => unknown, ms: number) => {
-    scheduled.push({ fn, ms });
-    return { fn, ms };
+    const entry = { fn, ms };
+    scheduled.push(entry);
+    return entry;
   };
   (global as any).clearInterval = (handle: unknown) => {
     cleared.push(handle);

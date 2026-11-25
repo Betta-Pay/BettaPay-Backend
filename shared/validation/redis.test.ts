@@ -156,3 +156,101 @@ test('clearSharedRedisClients quits every injected shared client', async () => {
   await clearSharedRedisClients();
   assert.deepEqual(created.map((client) => client.quitCalls), [1, 1]);
 });
+
+test('getSharedRedisClient fans healthState updates out to every caller of a cached client', async () => {
+  const created: FakeRedis[] = [];
+  const factory = fakeRedisFactory(created);
+  const first: RedisHealthState = { connected: false, errors: 0, reconnects: 0 };
+  const second: RedisHealthState = { connected: false, errors: 0, reconnects: 0 };
+
+  const a = getSharedRedisClient('redis://health', dummyLogger, { redisFactory: factory, healthState: first });
+  const b = getSharedRedisClient('redis://health', dummyLogger, { redisFactory: factory, healthState: second });
+  // Re-registering the same state must not double-count events.
+  getSharedRedisClient('redis://health', dummyLogger, { redisFactory: factory, healthState: first });
+
+  assert.equal(a, b);
+  assert.equal(created.length, 1);
+
+  const fake = created[0];
+  fake.emit('connect');
+  fake.emit('reconnecting');
+  fake.emit('error', new Error('boom'));
+
+  for (const state of [first, second]) {
+    assert.equal(state.connected, true);
+    assert.equal(state.reconnects, 1);
+    assert.equal(state.errors, 1);
+    assert.equal(state.lastError, 'boom');
+  }
+
+  fake.emit('close');
+  assert.equal(first.connected, false);
+  assert.equal(second.connected, false);
+
+  await clearSharedRedisClients();
+});
+
+test('getSharedRedisClient seeds a late healthState from the current client status', async () => {
+  const created: FakeRedis[] = [];
+  const factory = fakeRedisFactory(created);
+  getSharedRedisClient('redis://late', dummyLogger, { redisFactory: factory });
+  (created[0] as unknown as { status: string }).status = 'ready';
+
+  const late: RedisHealthState = { connected: false, errors: 0, reconnects: 0 };
+  getSharedRedisClient('redis://late', dummyLogger, { redisFactory: factory, healthState: late });
+
+  assert.equal(late.connected, true);
+  await clearSharedRedisClients();
+});
+
+test('clearSharedRedisClients falls back to disconnect() when quit() hangs', async () => {
+  const created: FakeRedis[] = [];
+  const hangingFactory = (_url: string, options: RedisOptions) => {
+    const client = new FakeRedis(options);
+    client.quit = () => {
+      client.quitCalls++;
+      return new Promise<'OK'>(() => {});
+    };
+    created.push(client);
+    return client as never;
+  };
+  getSharedRedisClient('redis://down-1', dummyLogger, { redisFactory: hangingFactory });
+  getSharedRedisClient('redis://down-2', dummyLogger, { redisFactory: hangingFactory });
+
+  const started = Date.now();
+  await clearSharedRedisClients(50);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 1_000, `resolved within timeout (took ${elapsed}ms)`);
+  assert.deepEqual(created.map((c) => [c.quitCalls, c.disconnectCalls]), [[1, 1], [1, 1]]);
+
+  // The registry is cleared, so a new call creates a fresh client.
+  getSharedRedisClient('redis://down-1', dummyLogger, { redisFactory: hangingFactory });
+  assert.equal(created.length, 3);
+  await clearSharedRedisClients(10);
+});
+
+test('clearSharedRedisClients falls back to disconnect() when quit() rejects', async () => {
+  const created: FakeRedis[] = [];
+  const rejectingFactory = (_url: string, options: RedisOptions) => {
+    const client = new FakeRedis(options);
+    client.quit = async () => {
+      client.quitCalls++;
+      throw new Error('Connection is closed.');
+    };
+    created.push(client);
+    return client as never;
+  };
+  getSharedRedisClient('redis://reject', dummyLogger, { redisFactory: rejectingFactory });
+
+  await clearSharedRedisClients(1_000);
+  assert.deepEqual(created.map((c) => [c.quitCalls, c.disconnectCalls]), [[1, 1]]);
+});
+
+test('clearSharedRedisClients does not disconnect clients that quit cleanly', async () => {
+  const created: FakeRedis[] = [];
+  getSharedRedisClient('redis://clean', dummyLogger, { redisFactory: fakeRedisFactory(created) });
+
+  await clearSharedRedisClients(1_000);
+  assert.deepEqual(created.map((c) => [c.quitCalls, c.disconnectCalls]), [[1, 0]]);
+});

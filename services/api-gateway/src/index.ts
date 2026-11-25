@@ -63,6 +63,7 @@ import {
   createValidationContext,
   auditRouteAuthPolicy,
   installCrashHandlers,
+  GoogleAuthBody,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -117,6 +118,7 @@ import {
   createAdminApiKeyAuth,
   createAuditLogger,
   timingSafeStrEqual,
+  clearSharedRedisClients,
   type AuditLogRequestLike,
 } from "@bettapay/validation";
 import type { Merchant } from "@prisma/client";
@@ -152,6 +154,8 @@ import swagger from "@fastify/swagger";
 import { readServiceVersion } from "@bettapay/validation";
 import { MerchantCache, getCachedMerchant } from "@bettapay/validation";
 
+const googleOAuthClient = new OAuth2Client();
+
 declare module "fastify" {
   export interface FastifyInstance {
     authenticate: (
@@ -173,11 +177,43 @@ type AuthFailureMarkedRequest = FastifyRequest & { authFailed?: boolean };
 const PAYMENT_LIST_MAX_PAGE_SIZE = PAYMENTS_MAX_PAGE_SIZE;
 const PAYMENT_LIST_DEFAULT_PAGE_SIZE = PAYMENTS_DEFAULT_PAGE_SIZE;
 
+function isIso8601Date(value: string): boolean {
+  const datePart = value.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return false;
+  const parsedDate = new Date(`${datePart}T00:00:00.000Z`);
+  if (Number.isNaN(parsedDate.getTime())) return false;
+  if (parsedDate.toISOString().slice(0, 10) !== datePart) return false;
+  return (
+    value === datePart ||
+    (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    ) &&
+      !Number.isNaN(Date.parse(value)))
+  );
+}
+
+const AuditLogQuery = PaginationQuery.extend({
+  entityType: z.string().optional(),
+  action: z.string().optional(),
+  startDate: z
+    .string()
+    .refine(isIso8601Date, "Invalid ISO-8601 date")
+    .optional(),
+  endDate: z
+    .string()
+    .refine(isIso8601Date, "Invalid ISO-8601 date")
+    .optional(),
+}).refine(
+  ({ startDate, endDate }) =>
+    !startDate || !endDate || Date.parse(startDate) <= Date.parse(endDate),
+  { message: "startDate must not be after endDate" },
+);
+
 // OpenAPI/querystring schema for GET /api/payments. Kept as one object so the
 // route validator, the swagger document and the docs endpoint cannot drift.
-const PAYMENT_LIST_QUERY_SCHEMA = {
+export const PAYMENT_LIST_QUERY_SCHEMA = {
   type: "object",
-  additionalProperties: true,
+  additionalProperties: false,
   properties: {
     merchantId: {
       type: "string",
@@ -196,8 +232,18 @@ const PAYMENT_LIST_QUERY_SCHEMA = {
       type: "string",
       enum: ["initiated", "completed", "failed", "cancelled"],
     },
-    from: { type: "string", format: "date-time" },
-    to: { type: "string", format: "date-time" },
+    from: {
+      type: "string",
+      format: "date-time",
+      description:
+        "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
+    },
+    to: {
+      type: "string",
+      format: "date-time",
+      description:
+        "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
+    },
     includeEvents: {
       type: "boolean",
       default: false,
@@ -248,12 +294,23 @@ const PAYMENT_LIST_OPENAPI_PATH = {
   },
 };
 
-const IDEMPOTENCY_KEY_MAX_LEN = 255;
+export const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_TTL_SECONDS = IDEMPOTENCY_TTL_MS / 1000;
 // Bulk-cancel summaries share the existing Redis idempotency store. The key is
 // deliberately namespaced so it cannot collide with payment/settlement keys.
 const BULK_CANCEL_IDEMPOTENCY_KEY_PREFIX = "idempotency:bulk-cancel:";
+const BULK_CANCEL_LOCK_PREFIX = "lock:bulk-cancel:";
+const BULK_CANCEL_LOCK_TTL_MS = 30_000;
+
+/** Lua script for atomic lock release — only deletes if the stored value matches. */
+const BULK_CANCEL_RELEASE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
 
 // Caps decompressed request bodies. Fastify's own bodyLimit only sees the
 // compressed (on-the-wire) byte count, so a small gzip payload can otherwise
@@ -306,11 +363,60 @@ function createLimitedGunzipStream(maxBytes: number): {
   return { input: gunzip, output: limiter };
 }
 
-function readIdempotencyKey(request: FastifyRequest): string | null {
+export class IdempotencyKeyValidationError extends Error {
+  statusCode = 400;
+  code = ErrorCodes.VALIDATION_ERROR;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyKeyValidationError";
+  }
+}
+
+export function readIdempotencyKey(
+  request: FastifyRequest | { headers: Record<string, unknown>; raw?: { rawHeaders?: string[] } },
+): string | null {
   const raw = request.headers["idempotency-key"];
-  if (!raw) return null;
-  const key = Array.isArray(raw) ? raw[0] : raw;
-  return (key as string).trim() || null;
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (Array.isArray(raw)) {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  if (typeof raw !== "string") {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  // When duplicate headers are received in HTTP/1.1, Node joins them with commas.
+  // Also check rawHeaders if available on the underlying HTTP request.
+  const rawHeaders = (request as any).raw?.rawHeaders;
+  if (Array.isArray(rawHeaders)) {
+    let count = 0;
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      if (rawHeaders[i].toLowerCase() === "idempotency-key") {
+        count++;
+        if (count > 1) {
+          throw new IdempotencyKeyValidationError(
+            "Idempotency-Key header must be a single string, multiple values are not allowed",
+          );
+        }
+      }
+    }
+  }
+  if (raw.includes(",")) {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  const key = raw.trim();
+  if (!key) return null;
+  if (key.length > IDEMPOTENCY_KEY_MAX_LEN) {
+    throw new IdempotencyKeyValidationError(
+      `Idempotency-Key must not exceed ${IDEMPOTENCY_KEY_MAX_LEN} characters`,
+    );
+  }
+  return key;
 }
 
 // ── Conditional requests (#918) ──────────────────────────────────────────────
@@ -489,22 +595,7 @@ export const paymentsListRouteSchema = {
     "and `to` bounds filter on `createdAt`; both boundaries are " +
     "inclusive (createdAt >= from and createdAt <= to) and interpreted " +
     "as UTC instants. `from` must not be after `to`.",
-  querystring: {
-    type: "object",
-    additionalProperties: true,
-    properties: {
-      from: {
-        type: "string",
-        description:
-          "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
-      },
-      to: {
-        type: "string",
-        description:
-          "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
-      },
-    },
-  },
+  querystring: PAYMENT_LIST_QUERY_SCHEMA,
 };
 
 export const paymentEventsRouteSchema = {
@@ -562,6 +653,7 @@ const CLIENT_TIMEOUT_HEADER = "x-client-timeout-ms";
 // --- App Factory & Configuration Options ------------------------------------
 export interface AppOptions {
   prisma?: PrismaClient;
+  merchantCache?: MerchantCache;
   indexerClient?: ReturnType<typeof createIndexerClient>;
   settlementClient?: ReturnType<typeof createSettlementClient>;
   fxClient?: ReturnType<typeof createFxClient>;
@@ -608,7 +700,7 @@ export function getDefaultPrisma(): PrismaClient {
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single payment creation request (#740).
-const merchantCache = new MerchantCache();
+export const merchantCache = new MerchantCache();
 
 // Set by buildApp() when it creates the app's Redis client — shutdown()/start()
 // (defined after buildApp, at module scope) need it but don't have their own
@@ -753,6 +845,11 @@ export function buildApp(opts: AppOptions = {}) {
     requestTimeout: REQUEST_TIMEOUT_MS,
     connectionTimeout: CONNECTION_TIMEOUT_MS,
     bodyLimit: 1_048_576,
+    ajv: {
+      customOptions: {
+        removeAdditional: false,
+      },
+    },
   });
 
   registerRequestId(fastify);
@@ -806,6 +903,7 @@ export function buildApp(opts: AppOptions = {}) {
   });
 
   const prisma = opts.prisma ?? getDefaultPrisma();
+  const activeMerchantCache = opts.merchantCache ?? merchantCache;
   const indexerClient =
     opts.indexerClient ??
     createIndexerClient({
@@ -1192,7 +1290,7 @@ export function buildApp(opts: AppOptions = {}) {
         typeof result.max === "number"
           ? result.max
           : typeof routeConfig.rateLimit === "object" &&
-              typeof (routeConfig.rateLimit as any).max === "number"
+            typeof (routeConfig.rateLimit as any).max === "number"
             ? (routeConfig.rateLimit as any).max
             : 1000;
       const windowStr =
@@ -1395,7 +1493,7 @@ export function buildApp(opts: AppOptions = {}) {
 
   fastify.addHook(
     "onResponse",
-    async (request: FastifyRequest, _reply: FastifyReply) => {
+    async (request: FastifyRequest) => {
       const merchantId = (request.user as any)?.merchantId;
       if (!merchantId) return;
 
@@ -1474,6 +1572,7 @@ export function buildApp(opts: AppOptions = {}) {
     startTime,
     serviceVersion: SERVICE_VERSION,
     fetchImpl: opts.fetchImpl,
+    redisPing: async () => redis.ping(),
   });
 
   // --- Wallet Auth Challenge Store ----------------------------------------------
@@ -1503,8 +1602,12 @@ export function buildApp(opts: AppOptions = {}) {
         (domainEvents as any).connection.on("error", () => {});
       }
     }
-    await redis.quit().catch(() => {});
-    redis.disconnect();
+    if (typeof (redis as any)?.quit === "function") {
+      await (redis as any).quit().catch(() => {});
+    }
+    if (typeof (redis as any)?.disconnect === "function") {
+      (redis as any).disconnect();
+    }
   });
 
   // --- Auth IP reputation, token refresh & nonce replay (#task.md) -------------
@@ -1575,7 +1678,7 @@ export function buildApp(opts: AppOptions = {}) {
   async function enforceAuthIpReputation(
     request: FastifyRequest,
     reply: FastifyReply,
-  ): Promise<void> {
+  ): Promise<FastifyReply | void> {
     let score = 0;
     try {
       score = await getAuthIpScore(request.ip);
@@ -1587,7 +1690,8 @@ export function buildApp(opts: AppOptions = {}) {
       );
     }
     if (score >= AUTH_IP_THRESHOLD) {
-      await reply
+      // Return the reply so the route handler does not run after the 429 (#983).
+      return reply
         .header("Retry-After", String(AUTH_IP_RETRY_AFTER_SECONDS))
         .code(429)
         .send(
@@ -1617,6 +1721,11 @@ export function buildApp(opts: AppOptions = {}) {
 
   async function revokeJti(jti: string, ttlSeconds: number): Promise<void> {
     await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds);
+  }
+
+  /** Atomically revokes `jti`; true only for the single caller that claimed it. */
+  async function claimJti(jti: string, ttlSeconds: number): Promise<boolean> {
+    return (await redis.set(revokedJtiKey(jti), "1", "EX", ttlSeconds, "NX")) === "OK";
   }
 
   async function incrementRefreshRate(merchantId: string): Promise<number> {
@@ -1673,7 +1782,6 @@ export function buildApp(opts: AppOptions = {}) {
     return fastify.jwt.sign({ merchantId, ownerId, jti });
   }
 
-  const GOOGLE_AUTH_GRACE_PERIOD_MS = 30_000;
   const GOOGLE_AUTH_LOCKOUT_KEY_PREFIX = "auth_fail:google:";
   const SESSION_KEY_PREFIX = "session:";
   const SESSION_INDEX_PREFIX = "sessions:";
@@ -1820,6 +1928,20 @@ export function buildApp(opts: AppOptions = {}) {
     return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
   }
 
+  // Read straight from the database: a cached row could let a merchant that was
+  // just suspended or deleted keep refreshing.
+  const merchant = await prisma.merchant.findFirst({ where: { id: payload.merchantId } });
+  if (!merchant) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
+  if (merchant.deletedAt != null || merchant.status === 'suspended') {
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.MERCHANT_SUSPENDED, 'Merchant is suspended'));
+  }
+
   const refreshCount = await incrementRefreshRate(payload.merchantId);
   if (refreshCount > REFRESH_RATE_LIMIT_MAX) {
     return reply
@@ -1828,7 +1950,13 @@ export function buildApp(opts: AppOptions = {}) {
       .send(createErrorResponse(ErrorCodes.RATE_LIMITED, 'Too many token refresh requests'));
   }
 
-  await revokeJti(payload.jti, remainingLifetime);
+  // Claim the jti atomically (SET NX) so concurrent refreshes with the same
+  // token cannot both pass the isJtiRevoked check above.
+  if (!(await claimJti(payload.jti, remainingLifetime))) {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply.code(401).send(createErrorResponse(ErrorCodes.UNAUTHORIZED, 'Unauthorized'));
+  }
   await recordAuthIpSuccess(request);
 
   return reply.send({
@@ -1856,16 +1984,20 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
   }
 
   // ── Lockout backoff check (#902) ──────────────────────────────────────────
-  if (await walletChallenges.isLockedOut(d.address)) {
-    reply.header("Retry-After", "900");
-    return reply
-      .code(429)
-      .send(
-        createErrorResponse(
-          ErrorCodes.WALLET_AUTH_LOCKOUT,
-          "Too many failed wallet authentication attempts. Address is temporarily locked out.",
-        ),
-      );
+  try {
+    if (await walletChallenges.isLockedOut(d.address)) {
+      reply.header("Retry-After", "900");
+      return reply
+        .code(429)
+        .send(
+          createErrorResponse(
+            ErrorCodes.WALLET_AUTH_LOCKOUT,
+            "Too many failed wallet authentication attempts. Address is temporarily locked out.",
+          ),
+        );
+    }
+  } catch (err) {
+    request.log.error({ err, address: d.address }, "[Auth] Unable to check wallet lockout");
   }
 
   // Atomically claim the server-issued challenge for this address. This is the
@@ -1949,6 +2081,14 @@ fastify.post<{ Body: z.infer<typeof WalletVerifyBody> }>('/api/auth/wallet/verif
     },
   });
 
+  if (merchant?.status === "suspended") {
+    await recordAuthIpFailure(request);
+    markAuthRejected(request);
+    return reply
+      .code(403)
+      .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Merchant account is suspended"));
+  }
+
   const response: Record<string, unknown> = { success: true, address: d.address };
   if (merchant) {
     response.token = await signMerchantJwt(merchant.id, merchant.ownerId);
@@ -1978,13 +2118,50 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   const WalletChallengeBody = z.object({
-    address: z.string().min(1, "address is required"),
+    address: z
+      .string()
+      .min(1, "address is required")
+      .refine((address) => StrKey.isValidEd25519PublicKey(address), {
+        message: "address must be a valid Stellar public key",
+      }),
   });
+
+  // Challenges are cheap to request but each one is stored, so cap how many a
+  // single address may ask for. The per-IP limit is the gateway-wide one.
+  const CHALLENGE_RATE_LIMIT_MAX = 10;
+  const CHALLENGE_RATE_LIMIT_SECONDS = 60;
+
+  async function incrementChallengeRate(address: string): Promise<number> {
+    const rateKey = `auth_challenge_rate:${address}`;
+    const count = await redis.incr(rateKey);
+    if (count === 1) await redis.expire(rateKey, CHALLENGE_RATE_LIMIT_SECONDS);
+    return count;
+  }
 
   fastify.post<{ Body: WalletChallengeRouteBody }>(
     "/api/auth/challenge",
     async (request, reply) => {
       const d = WalletChallengeBody.parse(request.body);
+
+      try {
+        if ((await incrementChallengeRate(d.address)) > CHALLENGE_RATE_LIMIT_MAX) {
+          return reply
+            .header("Retry-After", String(CHALLENGE_RATE_LIMIT_SECONDS))
+            .code(429)
+            .send(
+              createErrorResponse(
+                ErrorCodes.RATE_LIMITED,
+                "Too many challenge requests for this address",
+              ),
+            );
+        }
+      } catch (err) {
+        // Best-effort like the auth IP score: Redis trouble must not block login.
+        request.log.warn(
+          { err: (err as Error).message },
+          "Challenge rate limit skipped (Redis unavailable)",
+        );
+      }
 
       let issued;
       try {
@@ -2023,8 +2200,18 @@ fastify.get('/api/admin/auth/ip-score', {
 
   fastify.post<{ Body: WalletVerifyRouteBody }>(
     "/api/auth/verify",
+    {
+      preHandler: [enforceAuthIpReputation],
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
     async (request, reply) => {
-      const d = LegacyWalletVerifyBody.parse(request.body);
+      let d: z.infer<typeof LegacyWalletVerifyBody>;
+      try {
+        d = LegacyWalletVerifyBody.parse(request.body);
+      } catch (err) {
+        await recordAuthIpFailure(request);
+        throw err;
+      }
 
       // ── Check lockout backoff (#902) ──────────────────────────────────────────
       try {
@@ -2077,6 +2264,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "not_found") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2089,6 +2277,7 @@ fastify.get('/api/admin/auth/ip-score', {
 
       if (consumed.status === "expired") {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(400)
           .send(
@@ -2109,6 +2298,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         if (!isValid) {
           await walletChallenges.recordFailure(d.address);
+          await recordAuthIpFailure(request);
           return reply
             .code(401)
             .send(
@@ -2117,6 +2307,7 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       } catch (err) {
         await walletChallenges.recordFailure(d.address);
+        await recordAuthIpFailure(request);
         return reply
           .code(401)
           .send(
@@ -2135,7 +2326,8 @@ fastify.get('/api/admin/auth/ip-score', {
           create: {
             id: d.address,
             name: `Merchant ${d.address.substring(0, 6)}`,
-            ownerId: `owner-${d.address.substring(0, 6)}`,
+            // A full UUID: the old 6-character prefix collided across addresses.
+            ownerId: `owner-${crypto.randomUUID()}`,
             settings: {},
           },
         });
@@ -2160,10 +2352,9 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      const token = fastify.jwt.sign({
-        merchantId: merchant.id,
-        ownerId: merchant.ownerId,
-      });
+      // signMerchantJwt adds a `jti`, so these tokens can be revoked.
+      const token = await signMerchantJwt(merchant.id, merchant.ownerId);
+      await recordAuthIpSuccess(request);
       return reply.send({ token });
     },
   );
@@ -2172,18 +2363,13 @@ fastify.get('/api/admin/auth/ip-score', {
     token?: unknown;
   }
 
-  const GoogleAuthBody = z.object({
-    token: z.string().min(1, "token is required"),
-  });
-
   fastify.post<{ Body: GoogleAuthRouteBody }>(
     "/api/auth/google",
     async (request, reply) => {
       const d = GoogleAuthBody.parse(request.body);
 
       try {
-        const client = new OAuth2Client();
-        const ticket = await client.verifyIdToken({
+        const ticket = await googleOAuthClient.verifyIdToken({
           idToken: d.token,
           audience: process.env.GOOGLE_CLIENT_ID,
         });
@@ -2195,6 +2381,17 @@ fastify.get('/api/admin/auth/ip-score', {
               createErrorResponse(
                 ErrorCodes.UNAUTHORIZED,
                 "Google token verification failed: invalid token payload",
+              ),
+            );
+        }
+        if (payload.email_verified !== true) {
+          request.log.warn("[Auth] Google OAuth rejected: email is not verified");
+          return reply
+            .code(401)
+            .send(
+              createErrorResponse(
+                ErrorCodes.UNAUTHORIZED,
+                "Google email is not verified",
               ),
             );
         }
@@ -2277,8 +2474,8 @@ fastify.get('/api/admin/auth/ip-score', {
 
         const tokenExpired =
           typeof payload.exp === "number" && Date.now() / 1000 > payload.exp;
-        const tokenAgeMs = tokenExpired ? Date.now() - payload.exp * 1000 : 0;
-        if (tokenExpired && tokenAgeMs > GOOGLE_AUTH_GRACE_PERIOD_MS) {
+        if (tokenExpired) {
+          const tokenAgeMs = Date.now() - payload.exp! * 1000;
           await incrementGoogleAuthLockout(email);
           request.log.warn(
             { email, expiredMs: tokenAgeMs },
@@ -2292,13 +2489,6 @@ fastify.get('/api/admin/auth/ip-score', {
                 "Google token expired",
               ),
             );
-        }
-
-        if (tokenExpired) {
-          request.log.warn(
-            { email, expiredMs: tokenAgeMs },
-            "[Auth] Google OAuth accepted with expired token within grace period",
-          );
         }
 
         request.log.info({ email }, "[Auth] Google OAuth accepted");
@@ -2341,11 +2531,35 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
+  const WebhookTestParams = z.object({ id: z.string().uuid() });
+
   fastify.post<{ Params: { id: string } }>(
     "/api/webhooks/:id/test",
-    { preValidation: [fastify.authenticate] },
+    {
+      preValidation: [fastify.authenticate],
+      schema: {
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+        },
+      },
+    },
     async (request, reply) => {
-      const { id } = request.params;
+      const parsed = WebhookTestParams.safeParse(request.params);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              "Invalid webhook id: must be a valid UUID",
+            ),
+          );
+      }
+      const { id } = parsed.data;
       const payload = request.user as MerchantJwtPayload;
 
       const existing = await prisma.webhookSubscription.findUnique({
@@ -2391,6 +2605,9 @@ fastify.get('/api/admin/auth/ip-score', {
           return reply
             .code(503)
             .send(createErrorResponse(ErrorCodes.INTERNAL_ERROR, "Indexer service unavailable"));
+        }
+        if (testResult.statusCode && (testResult.statusCode === 400 || testResult.statusCode === 403)) {
+          return reply.code(testResult.statusCode).send(testResult);
         }
         return reply.send(testResult);
       } catch (err) {
@@ -2499,34 +2716,51 @@ fastify.get('/api/admin/auth/ip-score', {
       const d = CreateMerchantBody.parse(request.body);
       const secret = d.secret || crypto.randomBytes(24).toString("hex");
       const secretHash = encryptField(hashSecret(secret));
-      const merchant = await prisma.$transaction(async (tx) => {
-        const created = await tx.merchant.create({
-          data: {
-            id: d.id,
-            name: d.name,
-            ownerId: d.ownerId,
-            settings: (d.settings as any) ?? {},
-            secretHash,
-          },
+      try {
+        const merchant = await prisma.$transaction(async (tx) => {
+          const created = await tx.merchant.create({
+            data: {
+              id: d.id,
+              name: d.name,
+              ownerId: d.ownerId,
+              settings: (d.settings as any) ?? {},
+              secretHash,
+            },
+          });
+          await logAuditEvent(
+            "merchant.created",
+            "merchant",
+            created.id,
+            { before: null, after: created },
+            request,
+            tx as unknown as Parameters<typeof logAuditEvent>[5],
+          );
+          return created;
         });
-        await logAuditEvent(
-          "merchant.created",
-          "merchant",
-          created.id,
-          { before: null, after: created },
-          request,
-          tx as unknown as Parameters<typeof logAuditEvent>[5],
-        );
-        return created;
-      });
-      if (!d.secret) {
-        fastify.log.warn(
-          { merchantId: merchant.id },
-          "Auto-generated merchant secret returned in response. This will only be shown once.",
-        );
+        if (!d.secret) {
+          fastify.log.warn(
+            { merchantId: merchant.id },
+            "Auto-generated merchant secret returned in response. This will only be shown once.",
+          );
+        }
+        const { secretHash: _hash, ...safeMerchant } = merchant;
+        return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
+      } catch (err: any) {
+        if (
+          err?.code === "P2002" ||
+          (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")
+        ) {
+          return reply
+            .code(409)
+            .send(
+              createErrorResponse(
+                ErrorCodes.CONFLICT,
+                "Merchant already exists",
+              ),
+            );
+        }
+        throw err;
       }
-      const { secretHash: _hash, ...safeMerchant } = merchant;
-      return reply.code(201).send({ data: { merchant: safeMerchant, secret } });
     },
   );
 
@@ -2535,13 +2769,26 @@ fastify.get('/api/admin/auth/ip-score', {
     {
       preValidation: [fastify.authenticate],
     },
-    async (request, reply): Promise<ApiResponse<Merchant>> => {
+    async (
+      request,
+      reply,
+    ): Promise<ApiResponse<Omit<Merchant, "secretHash">>> => {
       const { id } = request.params;
       const isServiceAuth = Boolean(request.headers["x-service-token"]);
       const payload = request.user as MerchantJwtPayload;
 
       const merchant = await prisma.merchant.findFirst({
         where: { id, deletedAt: null },
+        select: {
+          id: true,
+          name: true,
+          ownerId: true,
+          createdAt: true,
+          deletedAt: true,
+          status: true,
+          settings: true,
+          kycStatus: true,
+        },
       });
       if (!merchant) {
         reply.code(404);
@@ -2576,6 +2823,17 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const { id } = request.params;
+      const payload = request.user as MerchantJwtPayload;
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const isAdmin =
+        isServiceAuth ||
+        payload.merchantId === env.ADMIN_ADDRESS ||
+        payload.merchantId === id;
+      if (!isAdmin) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
       const merchant = await prisma.merchant.findFirst({
         where: { id, deletedAt: null },
       });
@@ -2600,47 +2858,31 @@ fastify.get('/api/admin/auth/ip-score', {
           tx as unknown as Parameters<typeof logAuditEvent>[5],
         );
 
-        // Best-effort cascade: cancel initiated payments
-        try {
-          const cancelled = await tx.payment.updateMany({
-            where: { merchantId: id, status: "initiated" },
-            data: { status: "cancelled" },
-          });
-          await logAuditEvent(
-            "payments.bulk-cancelled",
-            "merchant",
-            id,
-            { before: null, after: { affectedCount: cancelled.count } },
-            request,
-            tx as unknown as Parameters<typeof logAuditEvent>[5],
-          );
-        } catch (err) {
-          request.log.error(
-            { err, merchantId: id },
-            "Failed to cancel initiated payments during merchant soft-delete",
-          );
-        }
+        const cancelled = await tx.payment.updateMany({
+          where: { merchantId: id, status: "initiated" },
+          data: { status: "cancelled" },
+        });
+        await logAuditEvent(
+          "payments.bulk-cancelled",
+          "merchant",
+          id,
+          { before: null, after: { affectedCount: cancelled.count } },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
 
-        // Best-effort cascade: fail pending settlements
-        try {
-          const failed = await tx.settlement.updateMany({
-            where: { merchantId: id, status: "pending" },
-            data: { status: "failed", completedAt: new Date() },
-          });
-          await logAuditEvent(
-            "settlements.bulk-failed",
-            "merchant",
-            id,
-            { before: null, after: { affectedCount: failed.count } },
-            request,
-            tx as unknown as Parameters<typeof logAuditEvent>[5],
-          );
-        } catch (err) {
-          request.log.error(
-            { err, merchantId: id },
-            "Failed to fail pending settlements during merchant soft-delete",
-          );
-        }
+        const failed = await tx.settlement.updateMany({
+          where: { merchantId: id, status: "pending" },
+          data: { status: "failed", completedAt: new Date() },
+        });
+        await logAuditEvent(
+          "settlements.bulk-failed",
+          "merchant",
+          id,
+          { before: null, after: { affectedCount: failed.count } },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
       });
 
       return reply.code(200).send({ success: true });
@@ -2662,6 +2904,17 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"),
           );
+      const payload = request.user as MerchantJwtPayload;
+      const isAdmin = payload.merchantId === env.ADMIN_ADDRESS;
+      if (
+        !isAdmin &&
+        payload.merchantId !== id &&
+        (!payload.ownerId || payload.ownerId !== merchant.ownerId)
+      ) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
       if (!merchant.deletedAt) {
         return reply
           .code(400)
@@ -2673,12 +2926,33 @@ fastify.get('/api/admin/auth/ip-score', {
           );
       }
 
-      const restored = await prisma.merchant.update({
-        where: { id },
-        data: { deletedAt: null },
+      const restored = await prisma.$transaction(async (tx) => {
+        const updated = await tx.merchant.update({
+          where: { id },
+          data: { deletedAt: null },
+        });
+        await logAuditEvent(
+          "merchant.restored",
+          "merchant",
+          updated.id,
+          { before: merchant, after: updated },
+          request,
+          tx as unknown as Parameters<typeof logAuditEvent>[5],
+        );
+        return updated;
+      });
+      merchantCache.invalidate(id);
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn(
+          { err, merchantId: id },
+          "Merchant cache invalidation failed (non-fatal)",
+        );
       });
 
-      return reply.code(200).send({ success: true, merchant: restored });
+      const { secretHash: _hash, ...safeMerchant } = restored;
+      return reply
+        .code(200)
+        .send({ success: true, merchant: safeMerchant });
     },
   );
 
@@ -2729,7 +3003,7 @@ fastify.get('/api/admin/auth/ip-score', {
         tx as unknown as Parameters<typeof logAuditEvent>[5],
       );
     });
-    merchantCache.invalidate(id);
+    activeMerchantCache.invalidate(id);
 
     // #744 — Invalidate cached merchant data so the suspended/unsuspended
     // status is visible to read paths immediately.
@@ -2806,6 +3080,17 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Merchant not found"),
           );
+      const payload = request.user as MerchantJwtPayload;
+      const isAdmin = payload.merchantId === env.ADMIN_ADDRESS;
+      if (
+        !isAdmin &&
+        payload.merchantId !== id &&
+        (!payload.ownerId || payload.ownerId !== merchant.ownerId)
+      ) {
+        return reply
+          .code(403)
+          .send(createErrorResponse(ErrorCodes.FORBIDDEN, "Forbidden"));
+      }
 
       const currentSettings = (merchant.settings ?? {}) as Record<
         string,
@@ -2828,7 +3113,7 @@ fastify.get('/api/admin/auth/ip-score', {
         );
         return merchantUpdate;
       });
-      merchantCache.invalidate(id);
+      activeMerchantCache.invalidate(id);
 
       // #744 — Invalidate cached merchant data so updated settings are
       // visible to read paths immediately.
@@ -2836,7 +3121,8 @@ fastify.get('/api/admin/auth/ip-score', {
         request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
       });
 
-      return reply.code(200).send({ data: { merchant: updated } });
+      const { secretHash: _hash, ...safeMerchant } = updated;
+      return reply.code(200).send({ data: { merchant: safeMerchant } });
     },
   );
 
@@ -2884,6 +3170,13 @@ fastify.get('/api/admin/auth/ip-score', {
         return merchantUpdate;
       });
 
+      activeMerchantCache.invalidate(id);
+
+      // Invalidate cached merchant data so the updated KYC status is visible immediately
+      await redis.del(`merchant:${id}`).catch((err: unknown) => {
+        request.log.warn({ err, merchantId: id }, "Merchant cache invalidation failed (non-fatal)");
+      });
+
       return reply.code(200).send({ data: { merchant: updated } });
     },
   );
@@ -2924,7 +3217,7 @@ fastify.get('/api/admin/auth/ip-score', {
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
       const merchant = await getCachedMerchant(
         d.merchantId,
-        merchantCache,
+        activeMerchantCache,
         (id) => prisma.merchant.findFirst({ where: { id, deletedAt: null } }),
       );
       if (!merchant) {
@@ -3139,6 +3432,18 @@ fastify.get('/api/admin/auth/ip-score', {
       schema: paymentsListRouteSchema,
     },
     async (request, reply) => {
+      if (request.validationError) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              request.validationError.message,
+              request.validationError.validation,
+              request.id,
+            ),
+          );
+      }
       const query = PaymentListQuery.parse(request.query);
       const { status, from, to, limit, page, includeEvents, includeDeleted } = query;
       const eventPage = parseInt((request.query as any)?.eventPage ?? "1", 10) || 1;
@@ -3452,106 +3757,167 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      // Deduplicate IDs. The per-item result list mirrors this deduplicated,
-      // input-ordered set so summary shape is stable across replays.
-      const uniqueIds = [...new Set(d.paymentIds)];
+      // Redis lock to serialize operations on the same idempotency key and avoid
+      // concurrent duplicate cancellation transactions.
+      const lockKey = idempotencyKey
+        ? `${BULK_CANCEL_LOCK_PREFIX}${idempotencyKey}:lock`
+        : null;
+      const lockToken = lockKey ? crypto.randomUUID() : null;
+      let lockAcquired = false;
 
-      const payments = await prisma.payment.findMany({
-        where: { id: { in: uniqueIds } },
-      });
-
-      const paymentMap = new Map(payments.map((p) => [p.id, p]));
-
-      const cancelledIds: string[] = [];
-      const skippedIds: string[] = [];
-      const errorIds: string[] = [];
-      const toCancelIds: string[] = [];
-      const items: {
-        id: string;
-        status: "cancelled" | "skipped" | "error";
-        reason?: string;
-      }[] = [];
-
-      for (const id of uniqueIds) {
-        const payment = paymentMap.get(id);
-        if (!payment) {
-          skippedIds.push(id);
-          items.push({ id, status: "skipped", reason: "not_found" });
-          continue;
-        }
-        if (payment.merchantId !== merchantId) {
-          skippedIds.push(id);
-          items.push({ id, status: "skipped", reason: "not_owned" });
-          continue;
-        }
-        if (payment.status === "cancelled") {
-          // A retry (or a fresh-key replay) must report an already-cancelled
-          // payment as cancelled, not as an error/skip.
-          cancelledIds.push(id);
-          items.push({ id, status: "cancelled" });
-          continue;
-        }
-        if (payment.status !== "initiated") {
-          skippedIds.push(id);
-          items.push({
-            id,
-            status: "skipped",
-            reason: `status:${payment.status}`,
-          });
-          continue;
-        }
-        cancelledIds.push(id);
-        toCancelIds.push(id);
-        items.push({ id, status: "cancelled" });
-      }
-
-      if (toCancelIds.length > 0) {
-        await prisma.$transaction(async (tx) => {
-          for (const id of toCancelIds) {
-            const before = paymentMap.get(id)!;
-            const updated = await tx.payment.update({
-              where: { id },
-              data: { status: "cancelled" },
-            });
-            await logAuditEvent(
-              "payment.status.changed",
-              "payment",
-              id,
-              { before, after: updated },
-              request,
-              tx as unknown as Parameters<typeof logAuditEvent>[5],
-            );
-          }
-        });
-      }
-
-      const summary = {
-        cancelled: cancelledIds.length,
-        skipped: skippedIds.length,
-        errors: errorIds.length,
-        cancelledIds,
-        skippedIds,
-        errorIds,
-        items,
-      };
-
-      if (summaryKey) {
+      if (lockKey && lockToken) {
         try {
-          await redis.set(
-            summaryKey,
-            JSON.stringify(summary),
-            "EX",
-            IDEMPOTENCY_TTL_SECONDS,
+          const res = await redis.set(
+            lockKey,
+            lockToken,
+            "PX",
+            BULK_CANCEL_LOCK_TTL_MS,
+            "NX",
           );
+          if (res !== "OK" && res !== true && res !== "1") {
+            return reply
+              .code(409)
+              .send(
+                createErrorResponse(
+                  ErrorCodes.CONCURRENCY_EXCEEDED,
+                  "A bulk-cancel operation with this idempotency key is already in progress",
+                ),
+              );
+          }
+          lockAcquired = true;
         } catch (err) {
           request.log.warn(
             { err, idempotencyKey },
-            "Failed to persist bulk-cancel idempotency summary",
+            "Failed to acquire Redis lock for bulk-cancel — proceeding without lock",
           );
         }
       }
 
-      return reply.code(200).send(summary);
+      try {
+        // Deduplicate IDs. The per-item result list mirrors this deduplicated,
+        // input-ordered set so summary shape is stable across replays.
+        const uniqueIds = [...new Set(d.paymentIds)];
+
+        const payments = await prisma.payment.findMany({
+          where: { id: { in: uniqueIds } },
+        });
+
+        const paymentMap = new Map(payments.map((p) => [p.id, p]));
+
+        const cancelledIds: string[] = [];
+        const skippedIds: string[] = [];
+        const errorIds: string[] = [];
+        const toCancelIds: string[] = [];
+        const items: {
+          id: string;
+          status: "cancelled" | "skipped" | "error";
+          reason?: string;
+        }[] = [];
+
+        for (const id of uniqueIds) {
+          const payment = paymentMap.get(id);
+          if (!payment) {
+            skippedIds.push(id);
+            items.push({ id, status: "skipped", reason: "not_found" });
+            continue;
+          }
+          if (payment.merchantId !== merchantId) {
+            skippedIds.push(id);
+            items.push({ id, status: "skipped", reason: "not_owned" });
+            continue;
+          }
+          if (payment.status === "cancelled") {
+            // A retry (or a fresh-key replay) must report an already-cancelled
+            // payment as cancelled, not as an error/skip.
+            cancelledIds.push(id);
+            items.push({ id, status: "cancelled" });
+            continue;
+          }
+          if (payment.status !== "initiated") {
+            skippedIds.push(id);
+            items.push({
+              id,
+              status: "skipped",
+              reason: `status:${payment.status}`,
+            });
+            continue;
+          }
+          cancelledIds.push(id);
+          toCancelIds.push(id);
+          items.push({ id, status: "cancelled" });
+        }
+
+        if (toCancelIds.length > 0) {
+          await prisma.$transaction(async (tx) => {
+            for (const id of toCancelIds) {
+              const before = paymentMap.get(id)!;
+              const updated = await tx.payment.update({
+                where: { id },
+                data: { status: "cancelled" },
+              });
+              await logAuditEvent(
+                "payment.status.changed",
+                "payment",
+                id,
+                { before, after: updated },
+                request,
+                tx as unknown as Parameters<typeof logAuditEvent>[5],
+              );
+            }
+          });
+        }
+
+        const summary = {
+          cancelled: cancelledIds.length,
+          skipped: skippedIds.length,
+          errors: errorIds.length,
+          cancelledIds,
+          skippedIds,
+          errorIds,
+          items,
+        };
+
+        if (summaryKey) {
+          try {
+            await redis.set(
+              summaryKey,
+              JSON.stringify(summary),
+              "EX",
+              IDEMPOTENCY_TTL_SECONDS,
+            );
+          } catch (err) {
+            request.log.warn(
+              { err, idempotencyKey },
+              "Failed to persist bulk-cancel idempotency summary",
+            );
+          }
+        }
+
+        return reply.code(200).send(summary);
+      } finally {
+        if (lockAcquired && lockKey && lockToken) {
+          try {
+            if (typeof redis.eval === "function") {
+              await redis.eval(
+                BULK_CANCEL_RELEASE_LOCK_SCRIPT,
+                1,
+                lockKey,
+                lockToken,
+              );
+            } else {
+              const current = await redis.get(lockKey);
+              if (current === lockToken) {
+                await redis.del(lockKey);
+              }
+            }
+          } catch (err) {
+            request.log.warn(
+              { err, idempotencyKey },
+              "Failed to release bulk-cancel Redis lock",
+            );
+          }
+        }
+      }
     },
   );
 
@@ -3561,7 +3927,13 @@ fastify.get('/api/admin/auth/ip-score', {
   }>(
     "/api/settlements/:id/status",
     {
-      preValidation: [fastify.authenticate],
+      preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
+        if (request.headers["x-service-token"]) {
+          await fastify.serviceAuth(request, reply);
+          return;
+        }
+        await fastify.authenticate(request, reply);
+      },
       preHandler: [logRequestBody],
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
@@ -3595,6 +3967,25 @@ fastify.get('/api/admin/auth/ip-score', {
           .send(
             createErrorResponse(ErrorCodes.NOT_FOUND, "Settlement not found"),
           );
+
+      const isServiceAuth = Boolean(request.headers["x-service-token"]);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isServiceAuth && !isAdmin) {
+        if (!callerMerchantId || callerMerchantId !== settlement.merchantId) {
+          return reply
+            .code(403)
+            .send(
+              createErrorResponse(
+                ErrorCodes.FORBIDDEN,
+                "You do not have access to this settlement",
+              ),
+            );
+        }
+      }
 
       const allowed = SETTLEMENT_STATUS_TRANSITIONS[settlement.status] ?? [];
       if (
@@ -3643,10 +4034,9 @@ fastify.get('/api/admin/auth/ip-score', {
 
   // Settlements
   //
-  // Authorization: service-to-service callers (x-service-token) may pass
-  // merchantId to filter across merchants. Merchant-authenticated callers
-  // (JWT) are always scoped to their own merchantId — the query parameter is
-  // ignored for them so one merchant can never read another's settlements.
+  // Service-auth callers may pass merchantId across merchants. Merchant JWTs
+  // are scoped to their merchant, except an admin JWT may request deleted
+  // settlements across merchants.
   fastify.get<{
     Querystring: z.infer<typeof SettlementListQuery> & { merchantId?: string };
   }>(
@@ -3663,16 +4053,40 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const query = SettlementListQuery.parse(request.query);
-      const { status, from, to, limit, page } = query;
+      const {
+        status,
+        from,
+        to,
+        limit,
+        page,
+        startDate,
+        endDate,
+        includeDeleted,
+      } = query;
       const requestedMerchantId = (request.query as { merchantId?: string })
         .merchantId;
 
       const isServiceAuth = Boolean(request.headers["x-service-token"]);
-      const scopedMerchantId = isServiceAuth
-        ? requestedMerchantId
-        : (request.user as { merchantId?: string } | undefined)?.merchantId;
+      const jwtMerchantId = (
+        request.user as { merchantId?: string } | undefined
+      )?.merchantId;
+      const isAdminJwt = jwtMerchantId === env.ADMIN_ADDRESS;
+      if (includeDeleted && !isServiceAuth && !isAdminJwt) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "includeDeleted is restricted to admin callers",
+              { field: "includeDeleted" },
+            ),
+          );
+      }
+      const scopedMerchantId =
+        isServiceAuth || (isAdminJwt && includeDeleted)
+          ? requestedMerchantId
+          : jwtMerchantId;
 
-      const { startDate, endDate, includeDeleted } = query as any;
       const where: any = {};
       if (scopedMerchantId) {
         where.merchantId = scopedMerchantId;
@@ -3692,8 +4106,7 @@ fastify.get('/api/admin/auth/ip-score', {
         }
       }
 
-      // When includeDeleted is false, exclude settlements belonging to soft-deleted merchants.
-      // Service-auth callers (preValidation: [fastify.serviceAuth]) always see everything.
+      // Exclude settlements belonging to soft-deleted merchants unless explicitly requested.
       if (!includeDeleted) {
         where.merchant = { deletedAt: null };
       }
@@ -3724,6 +4137,22 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       const d = CreateSettlementBody.parse(request.body);
+      const callerMerchantId =
+        (request as any).merchantId ??
+        (request.user as MerchantJwtPayload | undefined)?.merchantId;
+      const isAdmin = callerMerchantId === env.ADMIN_ADDRESS;
+
+      if (!isAdmin && (!callerMerchantId || callerMerchantId !== d.merchantId)) {
+        return reply
+          .code(403)
+          .send(
+            createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              "You do not have access to create settlements for this merchant",
+            ),
+          );
+      }
+
       const merchant = await prisma.merchant.findUnique({
         where: { id: d.merchantId },
       });
@@ -3789,12 +4218,12 @@ fastify.get('/api/admin/auth/ip-score', {
 
       // Validate each settlement item against merchant limits
       for (const item of items) {
-        const amount = parseFloat(item.amount);
+        const amount = new Prisma.Decimal(item.amount);
 
         // Check minimum settlement amount
         if (settings?.minSettlementAmount) {
-          const minAmount = parseFloat(settings.minSettlementAmount);
-          if (amount < minAmount) {
+          const minAmount = new Prisma.Decimal(settings.minSettlementAmount);
+          if (amount.lt(minAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3810,8 +4239,8 @@ fastify.get('/api/admin/auth/ip-score', {
 
         // Check maximum settlement amount
         if (settings?.maxSettlementAmount) {
-          const maxAmount = parseFloat(settings.maxSettlementAmount);
-          if (amount > maxAmount) {
+          const maxAmount = new Prisma.Decimal(settings.maxSettlementAmount);
+          if (amount.gt(maxAmount)) {
             return reply.code(422).send(
               createErrorResponse(
                 ErrorCodes.VALIDATION_ERROR,
@@ -3841,12 +4270,14 @@ fastify.get('/api/admin/auth/ip-score', {
         SELECT COALESCE(SUM(CAST("totalAmount" AS DECIMAL)), 0)::text as sum
         FROM "Settlement"
         WHERE "merchantId" = ${d.merchantId}
+        AND "status"::text NOT IN ('failed', 'cancelled', 'superseded')
+        AND "supersededById" IS NULL
         AND "initiatedAt" >= date_trunc('day', now())
       `;
 
-        const currentDailyTotal = aggregateResult?.[0]?.sum
-          ? parseFloat(aggregateResult[0].sum)
-          : 0;
+        const currentDailyTotal = new Prisma.Decimal(
+          aggregateResult?.[0]?.sum || "0",
+        );
         const queryDurationMs = Date.now() - startTimeMs;
         request.log.debug(
           { queryDurationMs, merchantId: d.merchantId },
@@ -3854,17 +4285,18 @@ fastify.get('/api/admin/auth/ip-score', {
         );
 
         const requestTotal = items.reduce(
-          (sum: number, item: any) => sum + parseFloat(item.amount),
-          0,
+          (sum: Prisma.Decimal, item: any) =>
+            sum.plus(new Prisma.Decimal(item.amount)),
+          new Prisma.Decimal(0),
         );
-        const newDailyTotal = currentDailyTotal + requestTotal;
-        const dailyLimit = parseFloat(settings.dailySettlementLimit);
+        const newDailyTotal = currentDailyTotal.plus(requestTotal);
+        const dailyLimit = new Prisma.Decimal(settings.dailySettlementLimit);
 
-        if (newDailyTotal > dailyLimit) {
+        if (newDailyTotal.gt(dailyLimit)) {
           return reply.code(422).send(
             createErrorResponse(
               "QUOTA_EXCEEDED",
-              `Daily settlement limit exceeded. Current: ${currentDailyTotal}, Requested: ${requestTotal}, Limit: ${settings.dailySettlementLimit}`,
+              `Daily settlement limit exceeded. Current: ${currentDailyTotal.toString()}, Requested: ${requestTotal.toString()}, Limit: ${settings.dailySettlementLimit}`,
               {
                 currentDailyTotal: currentDailyTotal.toString(),
                 requestedAmount: requestTotal.toString(),
@@ -3911,27 +4343,23 @@ fastify.get('/api/admin/auth/ip-score', {
       config: { rateLimit: { max: 100, timeWindow: "1 minute" } },
     },
     async (request, reply) => {
-      const { page, limit } = PaginationQuery.parse(request.query ?? {});
-      const query = request.query as Record<string, string | undefined>;
+      const { page, limit, entityType, action, startDate, endDate } =
+        AuditLogQuery.parse(request.query ?? {});
       const where: Record<string, unknown> = {};
 
-      if (query.entityType) {
-        where.entityType = query.entityType;
+      if (entityType) {
+        where.entityType = entityType;
       }
-      if (query.action) {
-        where.action = query.action;
+      if (action) {
+        where.action = action;
       }
-      if (query.startDate || query.endDate) {
+      if (startDate || endDate) {
         where.createdAt = {};
-        if (query.startDate) {
-          (where.createdAt as Record<string, Date>).gte = new Date(
-            query.startDate,
-          );
+        if (startDate) {
+          (where.createdAt as Record<string, Date>).gte = new Date(startDate);
         }
-        if (query.endDate) {
-          (where.createdAt as Record<string, Date>).lte = new Date(
-            query.endDate,
-          );
+        if (endDate) {
+          (where.createdAt as Record<string, Date>).lte = new Date(endDate);
         }
       }
 
@@ -4037,9 +4465,8 @@ fastify.get('/api/admin/auth/ip-score', {
   }
 
   fastify.get("/api/rates", async (request, reply) => {
-    const result = await proxyFxUpstream(request, reply, "/api/rates");
     reply.header("Cache-Control", "public, max-age=60");
-    return result;
+    return proxyFxUpstream(request, reply, "/api/rates");
   });
   fastify.get("/api/currencies", async (request, reply) =>
     proxyFxUpstream(request, reply, "/api/currencies"),
@@ -4057,7 +4484,15 @@ fastify.get('/api/admin/auth/ip-score', {
       // database on cache miss or Redis failure.
       const cached = await redis.get("supported-assets").catch(() => null);
       if (cached) {
-        return { data: JSON.parse(cached) };
+        try {
+          return { data: JSON.parse(cached) };
+        } catch (error) {
+          request.log.warn(
+            { error, key: "supported-assets" },
+            "Evicting corrupt supported-assets Redis cache entry",
+          );
+          await redis.del("supported-assets").catch(() => {});
+        }
       }
 
       const assets = await prisma.supportedAsset.findMany({
@@ -4147,9 +4582,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
       const body = UpdateSupportedAssetBody.parse(request.body);
 
       try {
@@ -4201,9 +4646,19 @@ fastify.get('/api/admin/auth/ip-score', {
     "/api/admin/assets/:code",
     {
       preValidation: [fastify.serviceAuth],
+      schema: {
+        params: {
+          type: "object",
+          required: ["code"],
+          properties: {
+            code: { type: "string", pattern: "^[A-Za-z0-9]{1,12}$" },
+          },
+        },
+      },
     },
     async (request, reply) => {
-      const { code } = request.params as { code: string };
+      const { code: rawCode } = request.params as { code: string };
+      const code = rawCode.toUpperCase();
 
       try {
         const before = await prisma.supportedAsset.delete({
@@ -4244,28 +4699,46 @@ fastify.get('/api/admin/auth/ip-score', {
     },
   );
 
-  fastify.get("/api/quote", async (request, reply) => {
-    const query = new URLSearchParams(
-      request.query as Record<string, string>,
-    ).toString();
-    const path = query ? `/api/quote?${query}` : "/api/quote";
-    return proxyFxUpstream(request, reply, path);
-  });
+  fastify.get(
+    "/api/quote",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          properties: {
+            from: { type: "string" },
+            to: { type: "string" },
+            amount: { type: "string" },
+            slippageBps: { type: "string" },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const query = new URLSearchParams(
+        request.query as Record<string, string>,
+      ).toString();
+      const path = query ? `/api/quote?${query}` : "/api/quote";
+      return proxyFxUpstream(request, reply, path);
+    },
+  );
 
   return fastify;
 }
 
 // ─── Warmup ─────────────────────────────────────────────────────────────────
 
-interface DownstreamService {
+export interface DownstreamService {
   name: string;
   healthUrl: string;
 }
 
-function getDownstreamServices(env: Env): DownstreamService[] {
+export function getDownstreamServices(env: Env): DownstreamService[] {
   return [
     { name: "fx-engine", healthUrl: `${env.FX_ENGINE_URL}/api/health` },
     { name: "indexer", healthUrl: `${env.INDEXER_URL}/api/health` },
+    { name: "settlement-engine", healthUrl: `${env.SETTLEMENT_ENGINE_URL}/api/health` },
   ];
 }
 
@@ -4278,9 +4751,10 @@ function getDownstreamServices(env: Env): DownstreamService[] {
  * Errors are logged but never thrown — a downstream that is still warming up
  * should not prevent the gateway from starting.
  */
-async function warmupDownstreamServices(
+export async function warmupDownstreamServices(
   env: Env,
   logger: FastifyBaseLogger,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
   const services = getDownstreamServices(env);
 
@@ -4290,7 +4764,7 @@ async function warmupDownstreamServices(
       const startTime = Date.now();
 
       try {
-        const response = await fetch(svc.healthUrl, {
+        const response = await fetchImpl(svc.healthUrl, {
           headers: { "x-trace-id": traceId },
           signal: AbortSignal.timeout(5_000),
         });
@@ -4321,12 +4795,40 @@ let metricsServer: ReturnType<typeof startMetricsServer> | null = null;
 let mainWebhookQueue: ReturnType<typeof createWebhookQueue> | null = null;
 let shuttingDown = false;
 
-async function shutdown(signal: string) {
+export function setSharedPgPool(pool: pg.Pool | null): void {
+  sharedPgPool = pool;
+}
+
+export function getSharedPgPool(): pg.Pool | null {
+  return sharedPgPool;
+}
+
+export function setSharedRedis(client: ReturnType<typeof createRedisClient> | null): void {
+  sharedRedis = client;
+}
+
+export function getSharedRedis(): ReturnType<typeof createRedisClient> | null {
+  return sharedRedis;
+}
+
+export function setMainApp(app: ReturnType<typeof Fastify> | null): void {
+  mainApp = app;
+}
+
+export function getMainApp(): ReturnType<typeof Fastify> | null {
+  return mainApp;
+}
+
+export function resetShutdownStateForTests(): void {
+  shuttingDown = false;
+}
+
+export async function shutdown(signal: string, exitProcess: boolean = true) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  const app = mainApp!;
-  app.log.info(`Received ${signal}, shutting down gracefully...`);
+  const app = mainApp;
+  app?.log.info(`Received ${signal}, shutting down gracefully...`);
 
   try {
     // Stop crons first so no new jobs are enqueued
@@ -4336,21 +4838,61 @@ async function shutdown(signal: string) {
     // Close the webhook queue after crons stop, before Prisma disconnect
     if (mainWebhookQueue) {
       await mainWebhookQueue.close().catch((err: unknown) => {
-        app.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
+        app?.log.warn({ err }, "Webhook queue close failed during shutdown (non-fatal)");
       });
     }
 
-    await app.close();
+    if (app) {
+      await app.close().catch(() => {});
+    }
     if (metricsServer) {
       await new Promise<void>((resolve) =>
         metricsServer!.close(() => resolve()),
       );
     }
-    await getDefaultPrisma().$disconnect();
-    process.exit(0);
+    if (defaultPrisma) {
+      await defaultPrisma.$disconnect().catch(() => {});
+    }
+
+    // Cleanly close pg.Pool
+    if (sharedPgPool) {
+      await sharedPgPool.end().catch((err: unknown) => {
+        app?.log.warn({ err }, "pg.Pool end failed during shutdown (non-fatal)");
+      });
+      sharedPgPool = null;
+    }
+
+    // Cleanly close sharedRedis
+    if (sharedRedis) {
+      try {
+        if (typeof (sharedRedis as any).quit === "function") {
+          await (sharedRedis as any).quit();
+        } else if (typeof (sharedRedis as any).disconnect === "function") {
+          (sharedRedis as any).disconnect();
+        }
+      } catch {
+        if (typeof (sharedRedis as any).disconnect === "function") {
+          (sharedRedis as any).disconnect();
+        }
+      }
+      sharedRedis = null;
+    }
+
+    // Cleanly clear shared Redis clients
+    await clearSharedRedisClients().catch((err: unknown) => {
+      app?.log.warn({ err }, "clearSharedRedisClients failed during shutdown (non-fatal)");
+    });
+
+    if (exitProcess) {
+      process.exit(0);
+    }
   } catch (err) {
-    app.log.error(err, "Error during shutdown");
-    process.exit(1);
+    app?.log.error(err, "Error during shutdown");
+    if (exitProcess) {
+      process.exit(1);
+    } else {
+      throw err;
+    }
   }
 }
 
@@ -4397,6 +4939,7 @@ const start = async () => {
         app.log,
         env.PAYMENT_ABANDONMENT_HOURS,
         webhookQueue,
+        redis,
       );
       startIdempotencyKeyCleanupCron(prisma, app.log, { redis });
     }

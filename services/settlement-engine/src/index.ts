@@ -1,3 +1,9 @@
+import { redactReconcileLog } from './reconcile-redaction.js';
+import {
+  computeSettlementPayloadHash,
+  idempotencyHashKey,
+  settlementPayloadHash,
+} from './settlement-idempotency.js';
 /**
  * Settlement Engine — BettaPay Backend
  *
@@ -40,6 +46,7 @@ import {
 } from './settlement-amounts.js';
 import type {
   DiscountTier,
+  FeeAuditSnapshot,
   ReconcileDiffResult,
   ReconcileRecordLike,
 } from './settlement-amounts.js';
@@ -47,6 +54,7 @@ import { buildSettlementWebhookData } from './webhook-payload.js';
 import {
   createSettlementWithUniqueGuard,
   updateSettlementWithOptimisticLock,
+  transitionSettlementStatus,
   VersionConflictError,
 } from './prisma-adapter.js';
 import {
@@ -61,6 +69,7 @@ import {
   getActiveCount,
 } from './redis-semaphore.js';
 import { closeWorkerWithTimeout, trackActiveJob } from './worker-shutdown.js';
+import { createShutdownCleanup } from './shutdown-cleanup.js';
 import { validateTimeoutConstants } from './timeout-constants.js';
 import { getMerchantMaxConcurrency } from './settlement-properties.js';
 
@@ -168,36 +177,9 @@ export function validateTransition(current: string, next: string) {
   }
 }
 
-const prisma = prismaBase.$extends({
-  query: {
-    settlement: {
-      async update({ args, query }) {
-        if (args.data.status) {
-          const current = await prismaBase.settlement.findUnique({
-            where: args.where,
-            select: { status: true },
-          });
-          if (current) {
-            validateTransition(current.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-      async updateMany({ args, query }) {
-        if (args.data.status) {
-          const records = await prismaBase.settlement.findMany({
-            where: args.where,
-            select: { id: true, status: true },
-          });
-          for (const record of records) {
-            validateTransition(record.status, args.data.status as string);
-          }
-        }
-        return query(args);
-      },
-    },
-  },
-}) as unknown as typeof prismaBase;
+// Status transitions are enforced atomically in the UPDATE's WHERE clause by
+// transitionSettlementStatus (prisma-adapter.ts), not by a read-then-write hook.
+const prisma = prismaBase;
 
 // Merchant cache: avoids repeated DB reads for the same merchant during
 // a single settlement creation request (#741).
@@ -236,18 +218,9 @@ const redis = createRedisClient(env.REDIS_URL, fastify.log, {
   healthState: redisHealthState,
 });
 
-// Placeholder for settlement reaper stop function (defined later)
-let stopReaper = () => {};
-
-fastify.addHook('onClose', async () => {
-  // Stop settlement reaper before closing
-  try {
-    stopReaper();
-  } catch (err) {
-    fastify.log.error({ err }, 'Error stopping settlement reaper');
-  }
-  await redis.quit().catch(() => {});
-});
+// Placeholder for settlement reaper stop function (defined later). Returns a
+// promise that settles once any in-flight reaper tick has finished.
+let stopReaper: () => void | Promise<void> = () => {};
 
 fastify.register(cors, {
   origin: env.ALLOWED_ORIGINS
@@ -536,15 +509,11 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
 
   try {
     // Transition to processing first
-    await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'processing' },
-    });
+    await transitionSettlementStatus(prisma, settlementId, 'processing');
 
     // In a real app this interacts with Soroban; here we mark completed.
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'completed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'completed', {
+      completedAt: new Date(),
     });
 
     log.info({ settlementId }, 'Settlement completed in database');
@@ -562,9 +531,8 @@ export const baseSettlementProcessor = async (job: Job): Promise<void> => {
   } catch (error) {
     log.error({ error, settlementId }, 'Settlement processing failed');
 
-    const updatedSettlement = await prisma.settlement.update({
-      where: { id: settlementId },
-      data: { status: 'failed', completedAt: new Date() },
+    const updatedSettlement = await transitionSettlementStatus(prisma, settlementId, 'failed', {
+      completedAt: new Date(),
     }).catch(() => null);
 
     if (updatedSettlement?.webhookUrl) {
@@ -619,6 +587,13 @@ export function assertRetryLimit(retryCount: number, maxRetries = MAX_SETTLEMENT
   if (retryCount >= maxRetries) {
     throw new Error(`Maximum retry limit (${maxRetries}) exceeded`);
   }
+}
+
+/** True when a merchant is suspended or soft-deleted and must not get payouts. */
+export function isMerchantBlocked(
+  merchant: { status?: string | null; deletedAt?: Date | string | null } | null | undefined,
+): boolean {
+  return !!merchant && (merchant.status === 'suspended' || merchant.deletedAt != null);
 }
 
 async function getSettlementRetryCount(settlementId: string): Promise<number> {
@@ -704,7 +679,7 @@ domainWorker.on('error', (err) => {
 
 fastify.get('/api/health', { config: { rateLimit: false } }, async (_request, reply) => {
   const health = await buildSettlementEngineHealthResponse({
-    queryDatabase: () => prisma.$queryRaw`SELECT 1, NOW() AS "serverVersion"`,
+    queryDatabase: () => prisma.$queryRaw`SELECT version() AS "serverVersion"`,
     pingRedis: () => redis.ping(),
     redisHealthState,
     getQueueJobCounts: () => settlementQueue.getJobCounts(),
@@ -749,6 +724,7 @@ fastify.get('/api/settlements', async (request, reply): Promise<PaginatedRespons
 
 fastify.post<{ Params: { id: string } }>(
   '/api/settlements/:id/retry',
+  { preValidation: [fastify.serviceAuth] },
   async (request, reply) => {
     const { id } = request.params;
 
@@ -770,6 +746,11 @@ fastify.post<{ Params: { id: string } }>(
       ));
     }
 
+    const retryMerchant = await prisma.merchant.findUnique({ where: { id: original.merchantId } });
+    if (isMerchantBlocked(retryMerchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
+    }
+
     const totalRetries = await getSettlementRetryCount(id);
 
     try {
@@ -786,33 +767,47 @@ fastify.post<{ Params: { id: string } }>(
     const newSettlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
     const traceId = crypto.randomUUID();
 
-    const newSettlement = await prisma.settlement.create({
-      data: {
-        id: newSettlementId,
-        merchantId: original.merchantId,
-        totalAmount: original.totalAmount,
-        grossAmount: original.grossAmount,
-        feeAmount: original.feeAmount,
-        netAmount: original.netAmount,
-        feeBps: original.feeBps,
-        asset: original.asset,
-        status: 'pending',
-        webhookUrl: original.webhookUrl,
-        webhookHeaders: (original.webhookHeaders ?? undefined) as any,
-        feeSnapshot: (original.feeSnapshot ?? undefined) as any,
-      },
-    });
-
-    // Mark original as superseded using an optimistic lock so concurrent
-    // retries cannot overwrite each other's chain link (#543).
+    // Create the retry settlement and link the original to it in a single
+    // transaction. The parent update uses an optimistic lock so concurrent
+    // retries cannot overwrite each other's chain link (#543); if it loses the
+    // race, the transaction rolls back and no orphaned settlement row is left
+    // behind to be processed.
+    let newSettlement: SettlementRecord;
     try {
-      await updateSettlementWithOptimisticLock(prisma, {
-        id,
-        expectedVersion: original.version,
-        data: { supersededById: newSettlementId },
+      newSettlement = await prisma.$transaction(async (tx) => {
+        const created = await tx.settlement.create({
+          data: {
+            id: newSettlementId,
+            merchantId: original.merchantId,
+            totalAmount: original.totalAmount,
+            grossAmount: original.grossAmount,
+            feeAmount: original.feeAmount,
+            netAmount: original.netAmount,
+            feeBps: original.feeBps,
+            asset: original.asset,
+            status: 'pending',
+            webhookUrl: original.webhookUrl,
+            webhookHeaders: (original.webhookHeaders ?? undefined) as any,
+            feeSnapshot: (original.feeSnapshot ?? undefined) as any,
+          },
+        });
+
+        await updateSettlementWithOptimisticLock(tx, {
+          id,
+          expectedVersion: original.version,
+          data: { supersededById: newSettlementId },
+        });
+
+        return created;
       });
     } catch (err) {
       if (err instanceof VersionConflictError) {
+        // Clean up orphaned newSettlement on version conflict (#1028)
+        try {
+          await prisma.settlement.delete({ where: { id: newSettlementId } });
+        } catch (cleanupErr) {
+          fastify.log.error({ err: cleanupErr, settlementId: newSettlementId }, 'Failed to clean up orphaned retry settlement');
+        }
         return reply.code(409).send(createErrorResponse(
           ErrorCodes.CONCURRENCY_EXCEEDED,
           'Settlement was modified concurrently; please retry',
@@ -886,7 +881,7 @@ export { computeReconciliationDiff, type ReconcileDiffResult, type ReconcileReco
  * between local (engine) and gateway records, returning per-field mismatches.
  * Capped at 100 diffs; a `truncated` flag indicates if more exist.
  */
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1226,7 +1221,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile', async
 // ── Reconciliation Report Endpoint (#490) ──────────────────────────────────────
 // Returns a summary of reconciliation status without full detail records.
 // Useful for monitoring dashboards and alerts.
-fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', async (request, reply) => {
+fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report', { preValidation: [fastify.serviceAuth] }, async (request, reply) => {
   const merchantIdLabel = request.query.merchantId || 'all';
   
   try {
@@ -1447,6 +1442,7 @@ fastify.get<{ Querystring: ReconcileQuery }>('/api/settlements/reconcile/report'
 fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
   '/api/settlements',
   {
+    preValidation: [fastify.serviceAuth],
     config: {
       rateLimit: {
         max: 60,
@@ -1477,8 +1473,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
     if (!merchant) {
       return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
       return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
@@ -1528,6 +1524,8 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
         feeBps,
         monthlyVolume,
         discountTiers,
+        d.asset,
+        { maxFeeBps, maxFeeThreshold },
       );
     } catch (error) {
       if (error instanceof SettlementAmountError) {
@@ -1552,10 +1550,23 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
 
     const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
-    if (idempotencyKey) {
+    const payloadHash = idempotencyKey
+      ? computeSettlementPayloadHash({ merchantId: d.merchantId, amount: d.amount, asset: d.asset })
+      : null;
+    const payloadMismatch = () =>
+      reply.code(409).send(createErrorResponse(
+        'IDEMPOTENCY_PAYLOAD_MISMATCH',
+        'Idempotency-Key was already used with different request parameters',
+      ));
+
+    if (idempotencyKey && payloadHash) {
       let claimed: string | null = null;
       try {
         claimed = await redis.set(`idempotency:${idempotencyKey}`, settlementId, 'EX', 86400, 'NX');
+        if (claimed !== null) {
+          // Store the canonical payload hash alongside the idempotency record.
+          await redis.set(idempotencyHashKey(idempotencyKey), payloadHash, 'EX', 86400).catch(() => undefined);
+        }
       } catch {
         // Redis unavailable — fall through to DB @unique constraint
       }
@@ -1568,6 +1579,11 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
             where: { id: existingId },
           });
           if (existingSettlement) {
+            // Prefer the stored hash; fall back to the persisted settlement
+            // when it is missing (e.g. Redis evicted it).
+            const storedHash = await redis.get(idempotencyHashKey(idempotencyKey)).catch(() => null);
+            const originalHash = storedHash ?? settlementPayloadHash(existingSettlement);
+            if (originalHash !== payloadHash) return payloadMismatch();
             return reply.code(200).send({ data: existingSettlement });
           }
         }
@@ -1590,6 +1606,13 @@ fastify.post<{ Body: z.infer<typeof CreateSettlementBody> }>(
       idempotencyKey: idempotencyKey ?? undefined,
       idempotencyKeyExpiresAt: idempotencyKey ? new Date(Date.now() + 86400_000) : undefined,
     });
+
+    // The DB unique guard returned a pre-existing settlement for this key
+    // (Redis was unavailable or lost the claim): verify it is a true replay.
+    if (idempotencyKey && payloadHash && settlement.id !== settlementId) {
+      if (settlementPayloadHash(settlement) !== payloadHash) return payloadMismatch();
+      return reply.code(200).send({ data: settlement });
+    }
 
     const traceId = (request as unknown as { traceId?: string }).traceId;
 
@@ -1624,9 +1647,23 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     const idempotencyKey = Array.isArray(rawIdempotencyKey) ? rawIdempotencyKey[0] : rawIdempotencyKey;
     const payloadHash = idempotencyKey ? crypto.createHash('sha256').update(JSON.stringify(d)).digest('hex') : null;
 
+    // True once THIS request holds the idempotency lock, so a 4xx rejection can
+    // release it and let the caller retry the corrected request immediately.
+    let idempotencyLockHeld = false;
+    const rejectBulk = async (statusCode: number, payload: unknown) => {
+      if (idempotencyKey && idempotencyLockHeld) {
+        idempotencyLockHeld = false;
+        await redis.del(`idempotency:bulk:${idempotencyKey}`).catch((err) => {
+          request.log.error({ err }, 'Redis error releasing bulk idempotency lock');
+        });
+      }
+      return reply.code(statusCode).send(payload);
+    };
+
     if (idempotencyKey && payloadHash) {
       try {
         const claimed = await redis.set(`idempotency:bulk:${idempotencyKey}`, payloadHash, 'EX', 86400, 'NX');
+        idempotencyLockHeld = claimed !== null;
         if (claimed === null) {
           const existingHash = await redis.get(`idempotency:bulk:${idempotencyKey}`);
           if (existingHash && existingHash !== payloadHash) {
@@ -1646,11 +1683,11 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
     }
 
     if (d.settlements.length === 0) {
-      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch must contain at least one settlement'));
+      return rejectBulk(400, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch must contain at least one settlement'));
     }
 
     if (d.settlements.length > 100) {
-      return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
+      return rejectBulk(400, createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Batch size exceeds maximum limit of 100 settlements'));
     }
 
     const merchant = await getCachedMerchant(
@@ -1659,13 +1696,13 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       (id) => prisma.merchant.findUnique({ where: { id } }),
     );
     if (!merchant) {
-      return reply.code(404).send(createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
+      return rejectBulk(404, createErrorResponse(ErrorCodes.NOT_FOUND, 'Merchant not found'));
     }
-    if (merchant.deletedAt) {
-      return reply.code(422).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Merchant is deleted'));
+    if (isMerchantBlocked(merchant)) {
+      return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
     if (merchant.kycStatus === 'rejected') {
-      return reply.code(403).send(createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
+      return rejectBulk(403, createErrorResponse("MERCHANT_SUSPENDED", 'Merchant is suspended'));
     }
 
     const settings = merchant.settings as {
@@ -1699,25 +1736,27 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       AND "initiatedAt" >= ${todayStart}
     `;
 
-    const currentDailyTotal = aggregateResult?.[0]?.sum ? parseFloat(aggregateResult[0].sum) : 0;
+    // Exact decimal math for limit checks — floats lose precision on large or
+    // high-scale amounts (e.g. 0.1 + 0.2, 7-decimal Stellar amounts).
+    const currentDailyTotal = new BigNumber(aggregateResult?.[0]?.sum ?? 0);
 
-    let runningBatchTotal = 0;
-    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number }> = [];
+    let runningBatchTotal = new BigNumber(0);
+    const validItems: Array<{ amount: string; asset: string; id: string; grossAmount: string; feeAmount: string; netAmount: string; feeBps: number; feeSnapshot: FeeAuditSnapshot }> = [];
     const errors: Array<{ index: number; reason: string }> = [];
 
     for (let i = 0; i < d.settlements.length; i++) {
       const item = d.settlements[i];
-      const amount = parseFloat(item.amount);
+      const amount = new BigNumber(item.amount);
 
-      if (isNaN(amount) || amount <= 0) {
+      if (!amount.isFinite() || amount.isLessThanOrEqualTo(0)) {
         errors.push({ index: i, reason: 'amount must be greater than zero' });
         continue;
       }
 
       // Check min/max amount limits
       if (settings?.minSettlementAmount) {
-        const minAmount = parseFloat(settings.minSettlementAmount);
-        if (amount < minAmount) {
+        const minAmount = new BigNumber(settings.minSettlementAmount);
+        if (amount.isLessThan(minAmount)) {
           errors.push({
             index: i,
             reason: `Settlement amount ${item.amount} is below minimum ${settings.minSettlementAmount}`
@@ -1727,8 +1766,8 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
       }
 
       if (settings?.maxSettlementAmount) {
-        const maxAmount = parseFloat(settings.maxSettlementAmount);
-        if (amount > maxAmount) {
+        const maxAmount = new BigNumber(settings.maxSettlementAmount);
+        if (amount.isGreaterThan(maxAmount)) {
           errors.push({
             index: i,
             reason: `Settlement amount ${item.amount} exceeds maximum ${settings.maxSettlementAmount}`
@@ -1739,11 +1778,12 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       // Check daily settlement limits
       if (settings?.dailySettlementLimit) {
-        const dailyLimit = parseFloat(settings.dailySettlementLimit);
-        if (currentDailyTotal + runningBatchTotal + amount > dailyLimit) {
+        const dailyLimit = new BigNumber(settings.dailySettlementLimit);
+        const projectedTotal = currentDailyTotal.plus(runningBatchTotal).plus(amount);
+        if (projectedTotal.isGreaterThan(dailyLimit)) {
           errors.push({
             index: i,
-            reason: `Daily settlement limit exceeded. Current: ${currentDailyTotal + runningBatchTotal}, Requested: ${amount}, Limit: ${settings.dailySettlementLimit}`
+            reason: `Daily settlement limit exceeded. Current: ${currentDailyTotal.plus(runningBatchTotal).toFixed()}, Requested: ${amount.toFixed()}, Limit: ${settings.dailySettlementLimit}`
           });
           continue;
         }
@@ -1751,7 +1791,14 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
 
       let itemResult;
       try {
-        itemResult = computeSettlementAmounts(item.amount as Amount, feeBps, monthlyVolume, discountTiers);
+        itemResult = computeSettlementAmounts(
+          item.amount as Amount,
+          feeBps,
+          monthlyVolume,
+          discountTiers,
+          item.asset,
+          { maxFeeBps, maxFeeThreshold },
+        );
       } catch (error) {
         if (error instanceof SettlementAmountError) {
           errors.push({ index: i, reason: error.message });
@@ -1769,15 +1816,29 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         grossAmount,
         feeAmount,
         netAmount,
-        feeBps: feeSnapshot.feeBpsApplied
+        feeBps: feeSnapshot.feeBpsApplied,
+        feeSnapshot,
       });
-      runningBatchTotal += amount;
+      runningBatchTotal = runningBatchTotal.plus(amount);
     }
 
     const batchId = 'batch_' + crypto.randomUUID().replace(/-/g, '');
 
     if (validItems.length > 0) {
       await prisma.$transaction(async (tx) => {
+        // Settlement.batchId is a FK to SettlementBatch (#1096), so the batch
+        // row must exist before its settlements are created.
+        const assets = new Set(validItems.map((item) => item.asset));
+        await tx.settlementBatch.create({
+          data: {
+            id: batchId,
+            asset: assets.size === 1 ? validItems[0].asset : 'MIXED',
+            totalCount: validItems.length,
+            totalGross: validItems.reduce((sum, item) => sum.plus(item.grossAmount), new BigNumber(0)).toFixed(),
+            totalFees: validItems.reduce((sum, item) => sum.plus(item.feeAmount), new BigNumber(0)).toFixed(),
+            totalNet: validItems.reduce((sum, item) => sum.plus(item.netAmount), new BigNumber(0)).toFixed(),
+          },
+        });
         for (const item of validItems) {
           await createSettlementWithUniqueGuard(tx, {
             id: item.id,
@@ -1791,6 +1852,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
             status: 'pending',
             webhookUrl,
             webhookHeaders: webhookHeaders as any,
+            feeSnapshot: item.feeSnapshot as any,
             batchId,
           });
         }
@@ -1838,6 +1900,10 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
   }
 );
 
+// Batch ids are generated as `batch_<32 hex chars>`; accept only a bounded
+// `batch_` + [A-Za-z0-9_] token so malformed identifiers never reach the DB.
+const BatchIdParam = z.string().regex(/^batch_[A-Za-z0-9_]{1,64}$/);
+
 fastify.get<{ Params: { batchId: string } }>(
   '/api/settlements/batch/:batchId/status',
   {
@@ -1850,11 +1916,11 @@ fastify.get<{ Params: { batchId: string } }>(
     },
   },
   async (request, reply) => {
-    const { batchId } = request.params;
-
-    if (!batchId || !batchId.startsWith('batch_')) {
+    const parsedBatchId = BatchIdParam.safeParse(request.params.batchId);
+    if (!parsedBatchId.success) {
       return reply.code(400).send(createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'Invalid batchId format'));
     }
+    const batchId = parsedBatchId.data;
 
     const settlements = await prisma.settlement.findMany({
       where: { batchId },
@@ -1869,18 +1935,26 @@ fastify.get<{ Params: { batchId: string } }>(
     let processing = 0;
     let completed = 0;
     let failed = 0;
+    let superseded = 0;
 
     for (const s of settlements) {
-      if (s.status === 'pending') pending++;
+      // A settlement replaced by a retry is reported under `superseded` only,
+      // so its stale status (typically `failed`) doesn't skew the batch counts.
+      if (s.supersededById != null) superseded++;
+      else if (s.status === 'pending') pending++;
       else if (s.status === 'processing') processing++;
       else if (s.status === 'completed') completed++;
       else if (s.status === 'failed') failed++;
     }
 
+    // Overall status is judged against the settlements that are still live.
+    const active = total - superseded;
     let overallStatus = 'processing';
-    if (completed === total) overallStatus = 'completed';
-    else if (failed === total) overallStatus = 'failed';
-    else if (pending === total) overallStatus = 'pending';
+    if (active > 0) {
+      if (completed === active) overallStatus = 'completed';
+      else if (failed === active) overallStatus = 'failed';
+      else if (pending === active) overallStatus = 'pending';
+    }
 
     return {
       data: {
@@ -1890,6 +1964,7 @@ fastify.get<{ Params: { batchId: string } }>(
         processing,
         completed,
         failed,
+        superseded,
         status: overallStatus,
       },
     };
@@ -1943,6 +2018,7 @@ const batchWorker = new Worker(
           minCount: env.BATCH_MIN_COUNT,
           volumeThreshold: env.BATCH_VOLUME_THRESHOLD,
           maxBatchSize: env.BATCH_MAX_SIZE,
+          redis,
         },
         lastBatchCompletedAt,
         fastify.log,
@@ -1967,6 +2043,36 @@ const batchWorker = new Worker(
   },
   { connection: redis, concurrency: 1 }
 );
+
+// Fastify `onClose` (runs on fastify.close()): await in-flight reaper ticks,
+// then close BullMQ workers/queues and Redis so nothing is left open or
+// touching the DB after shutdown. Idempotent and shared with gracefulShutdown.
+let stopSettlementReaper: (() => Promise<void>) | undefined;
+
+const closeBackgroundResources = createShutdownCleanup({
+  stopReapers: [() => stopReaper(), () => stopSettlementReaper?.()],
+  closeWorkers: [
+    () => closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob),
+    () => closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => []),
+    () => closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => []),
+    () => closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob),
+  ],
+  closeQueues: [
+    () => settlementQueue.close(),
+    () => settlementDLQ.close(),
+    () => batchQueue.close(),
+    () => webhookQueue.close(),
+  ],
+  redis,
+  log: {
+    info: (obj, msg) => fastify.log.info(obj, msg),
+    error: (obj, msg) => fastify.log.error(obj, msg),
+  },
+});
+
+fastify.addHook('onClose', async () => {
+  await closeBackgroundResources();
+});
 
 // Schedule the batching job to run every BATCH_INTERVAL_SECONDS
 await batchQueue.add(
@@ -1994,7 +2100,6 @@ batchWorker.on('failed', (job, err) => {
 // ============================================================================
 
 let isShuttingDown = false;
-let stopSettlementReaper: (() => Promise<void>) | undefined;
 
 async function gracefulShutdown(signal: string): Promise<void> {
   // Prevent multiple shutdown attempts
@@ -2013,9 +2118,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }, 30000);
 
   try {
-    await stopSettlementReaper?.();
-
-    // 1. Close Fastify server (stops accepting new connections)
+    // 1. Close Fastify server (stops accepting new connections). Its onClose
+    //    hook awaits the reaper(s), then closes the BullMQ workers/queues and
+    //    Redis, in that order (see closeBackgroundResources).
     fastify.log.info('Closing Fastify server...');
     await fastify.close();
     fastify.log.info('Fastify server closed');
@@ -2023,26 +2128,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // 1b. Close the metrics server
     await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
 
-    // 2. Close BullMQ workers (drain and close gracefully, force-stop after 10s)
-    fastify.log.info('Closing BullMQ workers...');
-    await closeWorkerWithTimeout(worker, 'settlements', fastify.log, getActiveSettlementJob);
-    await closeWorkerWithTimeout(batchWorker, 'batching', fastify.log, () => undefined);
-    await closeWorkerWithTimeout(domainWorker, DOMAIN_EVENTS_QUEUE, fastify.log, () => undefined);
-    fastify.log.info('BullMQ workers closed');
-
-    // 3. Close BullMQ queues
-    fastify.log.info('Closing BullMQ queues...');
-    await settlementQueue.close();
-    await settlementDLQ.close();
-    await batchQueue.close();
-    await closeWorkerWithTimeout(webhookWorker, 'settlement-webhooks', fastify.log, getActiveWebhookJob);
-    await webhookQueue.close();
-    fastify.log.info('BullMQ queues closed');
-
-    // 4. Close Redis connection
-    fastify.log.info('Closing Redis connection...');
-    await redis.quit();
-    fastify.log.info('Redis connection closed');
+    // 2-4. Reaper, BullMQ workers/queues and Redis are closed by the onClose
+    //      hook above; this is a memoized no-op safety net if it was skipped.
+    await closeBackgroundResources();
 
     // 5. Disconnect Prisma
     fastify.log.info('Disconnecting Prisma...');

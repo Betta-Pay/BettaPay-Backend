@@ -165,6 +165,40 @@ test('CORS Origins Schema - Production mode - accepts HTTPS origins', () => {
   assert.strictEqual(result.success, true);
 });
 
+test('CORS Origins Schema - Production mode - rejects malformed origin "https://"', () => {
+  const schema = createCorsOriginsSchema('production');
+  const result = schema.safeParse(['https://']);
+  assert.strictEqual(result.success, false);
+});
+
+test('CORS Origins Schema - Production mode - rejects origins with paths like "https://a.com/path"', () => {
+  const schema = createCorsOriginsSchema('production');
+  const result = schema.safeParse(['https://a.com/path']);
+  assert.strictEqual(result.success, false);
+});
+
+test('CORS Origins Schema - Production mode - rejects origins with trailing slash', () => {
+  const schema = createCorsOriginsSchema('production');
+  const result = schema.safeParse(['https://example.com/']);
+  assert.strictEqual(result.success, false);
+});
+
+test('CORS Origins Schema - Production mode - rejects origins with query or hash fragments', () => {
+  const schema = createCorsOriginsSchema('production');
+  assert.strictEqual(schema.safeParse(['https://example.com?foo=bar']).success, false);
+  assert.strictEqual(schema.safeParse(['https://example.com#section']).success, false);
+});
+
+test('CORS Origins Schema - Production mode - rejects origins with wildcard hostnames', () => {
+  const schema = createCorsOriginsSchema('production');
+  assert.strictEqual(schema.safeParse(['https://*.example.com']).success, false);
+});
+
+test('CORS Origins Schema - Production mode - accepts valid origin with port', () => {
+  const schema = createCorsOriginsSchema('production');
+  assert.strictEqual(schema.safeParse(['https://app.example.com:8443']).success, true);
+});
+
 test('CORS Origins Schema - rejects wildcard origin (*) in all environments', () => {
   const schema = createCorsOriginsSchema('development');
   const result = schema.safeParse(['*']);

@@ -38,14 +38,15 @@ test('DLQ replay: re-enqueued job carries the original custom headers', (t) => {
   t.end();
 });
 
-test('DLQ replay: re-enqueued job still carries url, event, and signingSecret', (t) => {
+test('DLQ replay: re-enqueued job carries url, event, and re-fetched signingSecret (#1064)', (t) => {
   const replayEnqueueCall = extractReplayRouteBody(content);
 
   t.ok(/url:\s*job\.data\.url/.test(replayEnqueueCall), 'url is forwarded');
-  t.ok(/event:\s*job\.data\.event/.test(replayEnqueueCall), 'event is forwarded');
+  t.ok(/event:\s*\(?job\.data\.event/.test(replayEnqueueCall), 'event is forwarded');
   t.ok(
-    /signingSecret:\s*job\.data\.signingSecret/.test(replayEnqueueCall),
-    'signingSecret is forwarded',
+    /\bsigningSecret\b/.test(replayEnqueueCall) &&
+      !/signingSecret:\s*job\.data\.signingSecret/.test(replayEnqueueCall),
+    'signingSecret is resolved from subscription rather than read from DLQ job.data',
   );
   t.end();
 });

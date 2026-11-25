@@ -7,8 +7,9 @@ interface FakeRedis {
   store: Map<string, string>;
   setCalls: Array<{ key: string; value: string; args: unknown[] }>;
   get(key: string): Promise<string | null>;
-  set(key: string, value: string, ...args: unknown[]): Promise<'OK'>;
+  set(key: string, value: string, ...args: unknown[]): Promise<'OK' | null>;
   del(key: string): Promise<number>;
+  eval(script: string, numKeys: number, ...args: string[]): Promise<number>;
   incr(key: string): Promise<number>;
   decr(key: string): Promise<number>;
   expire(key: string, ttl: number): Promise<number>;
@@ -29,11 +30,25 @@ function createFakeRedis(): FakeRedis {
     },
     async set(key, value, ...args) {
       setCalls.push({ key, value, args });
+      const hasNX = args.some((a) => a === 'NX');
+      if (hasNX && store.has(key)) return null;
       store.set(key, value);
       return 'OK';
     },
     async del(key) {
       return store.delete(key) ? 1 : 0;
+    },
+    async eval(_script, numKeys, ...args) {
+      if (numKeys >= 1) {
+        const key = args[0];
+        const val = args[1];
+        if (store.get(key) === val) {
+          store.delete(key);
+          return 1;
+        }
+        return 0;
+      }
+      return 0;
     },
     async incr(key) {
       const next = (counters.get(key) ?? 0) + 1;
@@ -171,6 +186,48 @@ test('bulk-cancel: request without an Idempotency-Key still works and does not w
     0,
     'no summary is stored without a key',
   );
+
+  await app.close();
+  t.end();
+});
+
+test('bulk-cancel: Redis lock is released when DB error occurs and immediate retry acquires lock', async (t) => {
+  const { app, mockPrisma, redis, token } = await setup([payment('pay_err', 'initiated')]);
+
+  // Make Prisma fail during transaction
+  let dbFailed = false;
+  const originalTransaction = mockPrisma.$transaction;
+  mockPrisma.$transaction = async () => {
+    dbFailed = true;
+    throw new Error('Database connection dropped');
+  };
+
+  const idempotencyKey = 'bulk-fail-and-retry';
+  const request = {
+    method: 'POST' as const,
+    url: '/api/payments/bulk-cancel',
+    headers: { authorization: `Bearer ${token}`, 'idempotency-key': idempotencyKey, 'x-csrf-check': '1' },
+    payload: { paymentIds: ['pay_err'] },
+  };
+
+  // First request fails because of DB error
+  const res1 = await app.inject(request);
+  t.equal(res1.statusCode, 500, 'first call fails with 500 due to DB error');
+  t.equal(dbFailed, true, 'simulated DB failure occurred');
+
+  // Verify that the lock was released in finally
+  const lockKey = `lock:bulk-cancel:${idempotencyKey}:lock`;
+  t.equal(redis.store.has(lockKey), false, 'Redis lock is released even when Prisma throws an error');
+
+  // Restore DB function so retry succeeds
+  mockPrisma.$transaction = originalTransaction;
+
+  // Immediate retry after DB failure can acquire the lock
+  const res2 = await app.inject(request);
+  t.equal(res2.statusCode, 200, 'immediate retry after DB failure can acquire the lock and succeeds');
+  const summary = JSON.parse(res2.body);
+  t.equal(summary.cancelled, 1, 'payment was cancelled on retry');
+  t.equal(redis.store.has(lockKey), false, 'lock was released after successful retry too');
 
   await app.close();
   t.end();
