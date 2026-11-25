@@ -1,4 +1,5 @@
 import test from 'tape';
+import { Networks } from '@stellar/stellar-sdk';
 import {
   buildDeploymentsResponse,
   computeDeploymentsEtag,
@@ -8,6 +9,91 @@ import {
   paymentsListRouteSchema,
 } from './index.js';
 import { createTestApp } from './test-utils.js';
+
+test('buildDeploymentsResponse accurately distinguishes mainnet, testnet, and custom networks (#978)', (t) => {
+  // Mainnet exact passphrase match
+  const mainnet = buildDeploymentsResponse({
+    networkPassphrase: Networks.PUBLIC,
+    settlementContractId: 'CA_SETTLE_MAIN',
+    governanceContractId: 'CA_GOV_MAIN',
+  });
+  t.equal(
+    mainnet.data.contracts[0].explorerUrl,
+    'https://stellar.expert/explorer/public/contract/CA_SETTLE_MAIN',
+    'mainnet uses stellar.expert public contract URL',
+  );
+  t.equal(
+    mainnet.data.contracts[1].explorerUrl,
+    'https://stellar.expert/explorer/public/contract/CA_GOV_MAIN',
+    'mainnet governance contract uses stellar.expert public contract URL',
+  );
+
+  // Testnet exact passphrase match
+  const testnet = buildDeploymentsResponse({
+    networkPassphrase: Networks.TESTNET,
+    settlementContractId: 'CA_SETTLE_TEST',
+    governanceContractId: 'CA_GOV_TEST',
+  });
+  t.equal(
+    testnet.data.contracts[0].explorerUrl,
+    'https://lab.stellar.org/r/testnet/contract/CA_SETTLE_TEST',
+    'testnet uses stellar lab testnet contract URL',
+  );
+  t.equal(
+    testnet.data.contracts[1].explorerUrl,
+    'https://lab.stellar.org/r/testnet/contract/CA_GOV_TEST',
+    'testnet governance contract uses stellar lab testnet contract URL',
+  );
+
+  // Custom network with substring containing "public global"
+  const customWithSubstring = buildDeploymentsResponse({
+    networkPassphrase: 'Private Network - not public global - custom',
+    settlementContractId: 'CA_SETTLE_CUSTOM',
+    governanceContractId: 'CA_GOV_CUSTOM',
+  });
+  t.equal(
+    customWithSubstring.data.contracts[0].explorerUrl,
+    null,
+    'custom network containing "public global" substring does not misclassify as mainnet',
+  );
+  t.equal(
+    customWithSubstring.data.contracts[1].explorerUrl,
+    null,
+    'custom network sets explorerUrl to null',
+  );
+
+  // Generic custom network
+  const custom = buildDeploymentsResponse({
+    networkPassphrase: 'Standalone Network ; February 2017',
+    settlementContractId: 'CA_SETTLE_STANDALONE',
+    governanceContractId: 'CA_GOV_STANDALONE',
+  });
+  t.equal(custom.data.contracts[0].explorerUrl, null, 'standalone custom network sets explorerUrl to null');
+  t.equal(custom.data.contracts[1].explorerUrl, null, 'standalone custom network sets explorerUrl to null');
+
+  // Empty contract IDs produce null explorerUrl, never malformed URL strings
+  const emptyContractsMainnet = buildDeploymentsResponse({
+    networkPassphrase: Networks.PUBLIC,
+    settlementContractId: '',
+    governanceContractId: '   ',
+  });
+  t.equal(emptyContractsMainnet.data.contracts[0].explorerUrl, null, 'empty settlement contract ID produces null explorerUrl');
+  t.equal(emptyContractsMainnet.data.contracts[1].explorerUrl, null, 'whitespace governance contract ID produces null explorerUrl');
+
+  const emptyContractsTestnet = buildDeploymentsResponse({
+    networkPassphrase: Networks.TESTNET,
+    settlementContractId: '',
+    governanceContractId: 'CA_GOV_TEST',
+  });
+  t.equal(emptyContractsTestnet.data.contracts[0].explorerUrl, null, 'empty settlement contract ID on testnet produces null');
+  t.equal(
+    emptyContractsTestnet.data.contracts[1].explorerUrl,
+    'https://lab.stellar.org/r/testnet/contract/CA_GOV_TEST',
+    'configured governance contract on testnet has valid explorerUrl',
+  );
+
+  t.end();
+});
 
 test('GET /api/deployments returns a stable ETag derived from the payload (#918)', async (t) => {
   const { app } = await createTestApp();

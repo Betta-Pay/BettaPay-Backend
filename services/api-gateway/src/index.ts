@@ -211,9 +211,9 @@ const AuditLogQuery = PaginationQuery.extend({
 
 // OpenAPI/querystring schema for GET /api/payments. Kept as one object so the
 // route validator, the swagger document and the docs endpoint cannot drift.
-const PAYMENT_LIST_QUERY_SCHEMA = {
+export const PAYMENT_LIST_QUERY_SCHEMA = {
   type: "object",
-  additionalProperties: true,
+  additionalProperties: false,
   properties: {
     merchantId: {
       type: "string",
@@ -232,8 +232,18 @@ const PAYMENT_LIST_QUERY_SCHEMA = {
       type: "string",
       enum: ["initiated", "completed", "failed", "cancelled"],
     },
-    from: { type: "string", format: "date-time" },
-    to: { type: "string", format: "date-time" },
+    from: {
+      type: "string",
+      format: "date-time",
+      description:
+        "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
+    },
+    to: {
+      type: "string",
+      format: "date-time",
+      description:
+        "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
+    },
     includeEvents: {
       type: "boolean",
       default: false,
@@ -284,7 +294,7 @@ const PAYMENT_LIST_OPENAPI_PATH = {
   },
 };
 
-const IDEMPOTENCY_KEY_MAX_LEN = 255;
+export const IDEMPOTENCY_KEY_MAX_LEN = 255;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_TTL_SECONDS = IDEMPOTENCY_TTL_MS / 1000;
 // Bulk-cancel summaries share the existing Redis idempotency store. The key is
@@ -353,11 +363,60 @@ function createLimitedGunzipStream(maxBytes: number): {
   return { input: gunzip, output: limiter };
 }
 
-function readIdempotencyKey(request: FastifyRequest): string | null {
+export class IdempotencyKeyValidationError extends Error {
+  statusCode = 400;
+  code = ErrorCodes.VALIDATION_ERROR;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyKeyValidationError";
+  }
+}
+
+export function readIdempotencyKey(
+  request: FastifyRequest | { headers: Record<string, unknown>; raw?: { rawHeaders?: string[] } },
+): string | null {
   const raw = request.headers["idempotency-key"];
-  if (!raw) return null;
-  const key = Array.isArray(raw) ? raw[0] : raw;
-  return (key as string).trim() || null;
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (Array.isArray(raw)) {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  if (typeof raw !== "string") {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  // When duplicate headers are received in HTTP/1.1, Node joins them with commas.
+  // Also check rawHeaders if available on the underlying HTTP request.
+  const rawHeaders = (request as any).raw?.rawHeaders;
+  if (Array.isArray(rawHeaders)) {
+    let count = 0;
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      if (rawHeaders[i].toLowerCase() === "idempotency-key") {
+        count++;
+        if (count > 1) {
+          throw new IdempotencyKeyValidationError(
+            "Idempotency-Key header must be a single string, multiple values are not allowed",
+          );
+        }
+      }
+    }
+  }
+  if (raw.includes(",")) {
+    throw new IdempotencyKeyValidationError(
+      "Idempotency-Key header must be a single string, multiple values are not allowed",
+    );
+  }
+  const key = raw.trim();
+  if (!key) return null;
+  if (key.length > IDEMPOTENCY_KEY_MAX_LEN) {
+    throw new IdempotencyKeyValidationError(
+      `Idempotency-Key must not exceed ${IDEMPOTENCY_KEY_MAX_LEN} characters`,
+    );
+  }
+  return key;
 }
 
 // ── Conditional requests (#918) ──────────────────────────────────────────────
@@ -395,7 +454,7 @@ export function isEtagMatch(
 export interface DeploymentsResponsePayload {
   data: {
     network: string;
-    contracts: { name: string; contractId: string; explorerUrl: string }[];
+    contracts: { name: string; contractId: string; explorerUrl: string | null }[];
     updatedAt: string;
   };
 }
@@ -411,15 +470,21 @@ export function buildDeploymentsResponse(input: {
   governanceContractId: string;
   updatedAt?: string;
 }): DeploymentsResponsePayload {
-  // #761 — explorer links must follow the configured network, not assume
-  // testnet, or a mainnet receipt points a member at the wrong ledger viewer
-  // during an incident.
-  const isMainnet = input.networkPassphrase
-    .toLowerCase()
-    .includes("public global");
-  const explorerContractBase = isMainnet
-    ? "https://stellar.expert/explorer/public/contract"
-    : "https://lab.stellar.org/r/testnet/contract";
+  // #761, #978 — explorer links must follow the configured network via exact
+  // passphrase matching, and omit or guard explorerUrl when contract IDs are empty
+  // or on custom networks.
+  let explorerContractBase: string | null = null;
+  if (input.networkPassphrase === Networks.PUBLIC) {
+    explorerContractBase = "https://stellar.expert/explorer/public/contract";
+  } else if (input.networkPassphrase === Networks.TESTNET) {
+    explorerContractBase = "https://lab.stellar.org/r/testnet/contract";
+  }
+
+  const getExplorerUrl = (contractId: string | null | undefined): string | null => {
+    const trimmed = contractId?.trim();
+    if (!trimmed || !explorerContractBase) return null;
+    return `${explorerContractBase}/${trimmed}`;
+  };
 
   return {
     data: {
@@ -428,12 +493,12 @@ export function buildDeploymentsResponse(input: {
         {
           name: "Settlement contract",
           contractId: input.settlementContractId,
-          explorerUrl: `${explorerContractBase}/${input.settlementContractId}`,
+          explorerUrl: getExplorerUrl(input.settlementContractId),
         },
         {
           name: "Governance contract",
           contractId: input.governanceContractId,
-          explorerUrl: `${explorerContractBase}/${input.governanceContractId}`,
+          explorerUrl: getExplorerUrl(input.governanceContractId),
         },
       ],
       updatedAt: input.updatedAt ?? new Date().toISOString(),
@@ -530,22 +595,7 @@ export const paymentsListRouteSchema = {
     "and `to` bounds filter on `createdAt`; both boundaries are " +
     "inclusive (createdAt >= from and createdAt <= to) and interpreted " +
     "as UTC instants. `from` must not be after `to`.",
-  querystring: {
-    type: "object",
-    additionalProperties: true,
-    properties: {
-      from: {
-        type: "string",
-        description:
-          "Inclusive lower bound on createdAt (ISO-8601, interpreted as UTC).",
-      },
-      to: {
-        type: "string",
-        description:
-          "Inclusive upper bound on createdAt (ISO-8601, interpreted as UTC).",
-      },
-    },
-  },
+  querystring: PAYMENT_LIST_QUERY_SCHEMA,
 };
 
 export const paymentEventsRouteSchema = {
@@ -795,6 +845,11 @@ export function buildApp(opts: AppOptions = {}) {
     requestTimeout: REQUEST_TIMEOUT_MS,
     connectionTimeout: CONNECTION_TIMEOUT_MS,
     bodyLimit: 1_048_576,
+    ajv: {
+      customOptions: {
+        removeAdditional: false,
+      },
+    },
   });
 
   registerRequestId(fastify);
@@ -3377,6 +3432,18 @@ fastify.get('/api/admin/auth/ip-score', {
       schema: paymentsListRouteSchema,
     },
     async (request, reply) => {
+      if (request.validationError) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ErrorCodes.VALIDATION_ERROR,
+              request.validationError.message,
+              request.validationError.validation,
+              request.id,
+            ),
+          );
+      }
       const query = PaymentListQuery.parse(request.query);
       const { status, from, to, limit, page, includeEvents, includeDeleted } = query;
       const eventPage = parseInt((request.query as any)?.eventPage ?? "1", 10) || 1;
